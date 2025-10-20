@@ -1,0 +1,29 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+*.venv
+
+# Env files
+*.env
+
+# MacOS
+.DS_Store
+
+
+# SWE-Bench
+logs/
+
+# Platform cache
+subnet_hotkeys_cache.json
+
+# Local test workspaces
+result/
+
+# Adam's stuff
+gui/
