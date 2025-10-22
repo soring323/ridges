@@ -30,13 +30,15 @@ console = Console()
 DEFAULT_TEST_PROBLEMS = [
     # "affine-cipher",
     # "beer-song", 
-    #"react",
-    #"robot-name",
+    # "react", #todo
+    # "robot-name",
     #"rest-api",      # Test: JSON string format detection
-    #"book-store",    # Test: Unit conversion (cents vs dollars)
+    # "book-store",    # Test: Unit conversion (cents vs dollars)
     #"scale-generator",
-    #"grep",
-    "pov",
+    # "grep", #todo
+    # "pov",
+    # "list-ops",
+    "sympy__sympy-12489"
 ]
 
 

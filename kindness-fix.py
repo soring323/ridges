@@ -362,6 +362,75 @@ Result: You FAILED. The codebase is WORSE than before.
 - submit_solution will automatically verify tests - you CANNOT bypass this
 - If you can't fix failing tests, your approach is WRONG - revise it
 
+## Bonus Tip:
+    Analyze and extract:
+
+    1. **Method Signatures**: What methods are being called? What are their EXACT parameters?
+    - Look at how tests instantiate classes and call methods
+    - Note parameter names, types, and whether they're optional
+
+    2. **Callback Patterns**: Are there callbacks, observers, or event handlers?
+    - If yes, what are their signatures?
+    - How many arguments do they receive?
+
+    2.5. **Parameter Data Structures**: For each parameter passed to __init__ or methods, what is its exact structure?
+    - Look at actual test values: copy them exactly as they appear
+    - What is the nested structure? (lists, dicts, primitives, etc.)
+    - Show examples from multiple tests to reveal the pattern
+    - Based on the structure, how should the code access/iterate these values?
+
+    3. **Return Value Expectations**: What do tests expect methods to return?
+    - Look at the ACTUAL VALUES in assertEqual(), assertDictEqual(), etc.
+    - What TYPE is expected? (int, str, list, dict, etc.)
+    - Are there any PATTERNS in the expected values?
+    - If strings/lists of strings: Examine the EXACT characters used (don't just read, look closely)
+
+    4. **Value Format Discovery**: Compare what problem describes vs what tests expect
+    - Do problem descriptions use one format but tests expect another?
+    - If problem shows certain symbols/characters, what do tests actually use?
+    - Are the characters IDENTICAL or just similar-looking?
+    - Look for discrepancies between problem statement units/formats and test expectations
+
+    5. **Input Handling**: What formats/types do tests pass as input?
+    - Look at test data - what variations are tested?
+    - Are there edge cases in the input formats?
+
+    6. **Special Behaviors**: Any decorators, properties, magic methods, or special patterns?
+
+    7. **Callback/Observer Edge Cases** (if callbacks exist):
+    For EACH test with "not", "shouldn't", "only", or conditional language:
+    
+    Step A: List the test name
+    Step B: Break down what the test name says:
+        - What behavior is being tested?
+        - What condition must be met?
+        - What should happen vs NOT happen?
+    
+    Step C: Derive the implementation requirement:
+        - What must my code CHECK before doing something?
+        - What information do I need to make that check?
+    
+    Breakdown:
+    - "callbacks" = testing callback notification
+    - "should_not_be_called" = callbacks must NOT fire
+    - "if_dependencies_change" = even though inputs changed
+    - "but_output_value_doesn't_change" = when result stays same
+    
+    Implementation requirement:
+    → Before notifying callbacks, CHECK if output value actually changed
+    → Need: old_output and new_output to compare
+    → Logic: if old != new, THEN notify
+    
+    Do this analysis for ALL conditional tests!
+
+    ⚠️ CRITICAL THINKING:
+    - Examine ACTUAL VALUES in test assertions - they reveal the truth!
+    - Read TEST NAMES - they describe EXACT behavior expected
+    - If problem says one thing but tests expect another, trust the tests
+    - Look for patterns across multiple test cases
+    - Negative tests (should NOT happen) are as important as positive tests
+    - Only mention requirements you can DIRECTLY OBSERVE in the tests
+
 You have access to the following tools:-
 {tools_docs}
 
