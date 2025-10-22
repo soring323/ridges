@@ -1,6 +1,5 @@
 from __future__ import annotations
 import ast
-import json
 import os
 import requests
 import subprocess
@@ -9,7 +8,7 @@ import textwrap
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from json import JSONDecodeError
 import re
 import inspect
@@ -20,11 +19,94 @@ import csv
 import logging
 from uuid import uuid4
 
+PROBLEM_TYPE_CREATE = "CREATE"
+PROBLEM_TYPE_FIX = "FIX"
+
+DEFAULT_PROXY_URL = os.getenv("SANDBOX_PROXY_URL", "http://sandbox_proxy")
+DEFAULT_TIMEOUT = int(os.getenv("AGENT_TIMEOUT", "2000"))
+MAX_TEST_PATCH_TIMEOUT = int(os.getenv("MAX_STEPS_TEST_PATCH_FIND", "400"))
+
+GLM_MODEL_NAME = "zai-org/GLM-4.6-FP8"
+DEEPSEEK_MODEL_NAME = "deepseek-ai/DeepSeek-V3-0324"
+QWEN_MODEL_NAME = "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"
+AGENT_MODELS=[GLM_MODEL_NAME, DEEPSEEK_MODEL_NAME, QWEN_MODEL_NAME]
+libraries = [
+    "aiohttp",
+    "ast",
+    "asyncio",
+    "catboost",
+    "collections",
+    "collections.abc",
+    "concurrent.futures",
+    "copy",
+    "cv2",
+    "datasets",
+    "difflib",
+    "dill",
+    "django",
+    "gensim",
+    "glob",
+    "inspect",
+    "io",
+    "joblib",
+    "json",
+    "keras",
+    "lightgbm",
+    "math",
+    "matplotlib",
+    "mlflow",
+    "nltk",
+    "numpy",
+    "optuna",
+    "os",
+    "pandas",
+    "pathlib",
+    "pickle_mixin",
+    "pydantic",
+    "pytest",
+    "random",
+    "re",
+    "requests",
+    "scikit-learn",
+    "scipy",
+    "seaborn",
+    "sentence_transformers",
+    "sklearn",
+    "sklearn.feature_extraction.text",
+    "sklearn.feature_extraction.text.TfidfVectorizer",
+    "socket",
+    "spacy",
+    "statsmodels",
+    "subprocess",
+    "sys",
+    "tensorflow",
+    "textwrap",
+    "time",
+    "tokenize",
+    "tqdm",
+    "torch",
+    "torchaudio",
+    "torchvision",
+    "traceback",
+    "transformers",
+    "typing",
+    "urllib.error",
+    "urllib.parse",
+    "urllib.request",
+    "urllib3",
+    "xgboost",
+    "autogen",
+    "autogen_ext",
+    "autogen_agentchat"
+]
+MAX_FIX_TASK_STEPS = 400
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
 for h in list(logger.handlers):
     logger.removeHandler(h)
+
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 stream_handler = logging.StreamHandler(sys.stdout)
@@ -33,17 +115,11 @@ stream_handler.setFormatter(formatter)
 logger.addHandler(stream_handler)
 run_id=None
 
-PROBLEM_TYPE_CHECK_PROMPT = textwrap.dedent(
-'''
-You are the problem type checker that will categories problem type into:
-
-1. CREATE: If the problem statement is about creating a new functionality from scratch.
-2. FIX: If the problem statement is about fixing a bug, creating a new functionality or improving the existing codebase.
-
-Only respond with the "FIX" or "CREATE".
-'''
-)
-
+STOP_INSTRUCTION=textwrap.dedent("""
+# 🎨 
+DO NOT generate `observation:` in your response. It will be provided by user for you.
+Generate only SINGLE triplet of `next_thought`, `next_tool_name`, `next_tool_args` in your response.
+""")
 
 FORMAT_PROMPT_V0=textwrap.dedent("""
 **📝 Response Format Requirements**
@@ -83,24 +159,16 @@ FORMAT_PROMPT_V0=textwrap.dedent("""
    - Not quoting special characters properly
 """)
 
-STOP_INSTRUCTION=textwrap.dedent("""
-# 🎨 
-DO NOT generate `observation:` in your response. It will be provided by user for you.
-Generate only SINGLE triplet of `next_thought`, `next_tool_name`, `next_tool_args` in your response.
-""")
+PROBLEM_TYPE_CHECK_PROMPT = textwrap.dedent(
+'''
+You are the problem type checker that will categories problem type into:
 
-DEFAULT_PROXY_URL = os.getenv("SANDBOX_PROXY_URL", "http://localhost:8000")
-DEFAULT_TIMEOUT = int(os.getenv("AGENT_TIMEOUT", "2000"))
+1. CREATE: If the problem statement is about creating a new functionality from scratch.
+2. FIX: If the problem statement is about fixing a bug, creating a new functionality or improving the existing codebase.
 
-PROBLEM_TYPE_CREATE = "CREATE"
-PROBLEM_TYPE_FIX = "FIX"
-
-GLM_MODEL_NAME = "zai-org/GLM-4.5-FP8"
-KIMI_MODEL_NAME = "moonshotai/Kimi-K2-Instruct"
-DEEPSEEK_MODEL_NAME = "deepseek-ai/DeepSeek-V3-0324"
-QWEN_MODEL_NAME = "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"
-AGENT_MODELS=[GLM_MODEL_NAME, KIMI_MODEL_NAME, DEEPSEEK_MODEL_NAME, QWEN_MODEL_NAME]
-MAX_FIX_TASK_STEPS = 400
+Only respond with the "FIX" or "CREATE".
+'''
+)
 
 DO_NOT_REPEAT_TOOL_CALLS=textwrap.dedent("""
 You're not allowed to repeat the same tool call with the same arguments.
@@ -110,27 +178,27 @@ Your previous response:
 Try to use something different!
 """)
 
-GENERATE_INITIAL_TESTCASES_PROMPT = textwrap.dedent("""
-You are an expert Python testcase developer. Your task is to generate a complete testcases for the given problem statement.
-
-Important things:
-1. Test functions declared in code skeleton, don't customized those prototypes.
-2. Read the problem statement carefully and deeply and generate testcases that exactly match the rules, mathmatical fomulas, algorithms, data, and workflow in it.
-3. Do not generate testcases that are not mentioned in problem statement
-4. Minimize all testcases as you have context and generation limit
+GENERATE_INITIAL_SOLUTION_PROMPT = textwrap.dedent("""
+You are an expert Python developer. Your task is to generate a complete, working Python solution for the given problem statement.
 
 Strict Requirements:
-1. Output the full content of Python test files along with their file names. You **MUST** output the **file name** along with file content.
+1. Output the full content of Python files along with their file names.
 2. Do not include explanations, comments, or markdown formatting.
 3. Use only standard Python (no external libraries).
+4. Implement all required classes and functions exactly with the same names as in the initial code stub.
+5. You may add helper functions or classes if needed, but do not remove or rename the original ones.
+6. Ensure the solution handles all edge cases, validates inputs, and produces correct outputs.
+7. The solution must be executable as-is with no placeholders or TODOs.
+
+Return only the final python files code.
 
 Response Examples:
 ```python
-test_a.py
-contents of test_a.py
+a.py
+{content}
 
-test_b.py
-contents of test_b.py
+b.py
+{content}
 ```
 """
 )
@@ -167,31 +235,205 @@ contents of b.py
 """
 )
 
-GENERATE_INITIAL_SOLUTION_PROMPT = textwrap.dedent("""
+GENERATE_SOLUTION_WITH_MULTI_STEP_REASONING_PROMPT = textwrap.dedent(
+"""
 You are an expert Python developer. Your task is to generate a complete, working Python solution for the given problem statement.
-
 Strict Requirements:
-1. Output the full content of Python files along with their file names.
+1. Output the full content of Python files along with their file names. You **MUST** output the **file name** along with file content.
 2. Do not include explanations, comments, or markdown formatting.
-3. Use only standard Python (no external libraries).
+3. **CRITICAL LIBRARY CONSTRAINT**: You can ONLY import libraries from this EXACT list: {libraries}
+   - Before writing ANY import statement, verify the module is in the allowed list
+   - If a library is NOT in the list, you MUST implement the functionality yourself or use an alternative approach
+   - NEVER import a library that is not explicitly listed
 4. Implement all required classes and functions exactly with the same names as in the initial code stub.
 5. You may add helper functions or classes if needed, but do not remove or rename the original ones.
 6. Ensure the solution handles all edge cases, validates inputs, and produces correct outputs.
 7. The solution must be executable as-is with no placeholders or TODOs.
-
-Return only the final python files code.
-
+8. If problem statement doesn't explicitely requires a list of strings as a response, do not use list of strings for multiline text problems, just use raw string format.
+Return only the final Python code.
 Response Examples:
 ```python
 a.py
-{content}
-
+content
 b.py
-{content}
+content
 ```
 """
 )
 
+LIBRARY_CHECK_PROMPT = textwrap.dedent(
+"""
+You are an expert code reviewer specializing in library constraint validation. Your task is to analyze the generated Python code and verify that ALL import statements only use libraries from the allowed list.
+**CRITICAL LIBRARY CONSTRAINT (HIGHEST PRIORITY):**
+You can ONLY import libraries from this EXACT list: {libraries}
+**Your Tasks:**
+1. Analyze ALL import statements in the code (both 'import module' and 'from module import ...' statements)
+2. Verify each imported module is in the allowed list
+3. If ANY import uses a disallowed library:
+   - You MUST rewrite that part using ONLY allowed libraries
+   - Implement missing functionality manually using only allowed libraries
+   - Use alternative allowed modules where possible
+   - If needed, implement algorithms from scratch using only standard allowed libraries
+**If you find library violations:**
+- Provide a corrected version of the code
+- Remove ALL disallowed library imports
+- Replace with implementations using only allowed libraries
+- Ensure functionality is preserved
+**If no library violations are detected:**
+- Return the original code unchanged
+**STRICT REQUIREMENT:** Return the final Python code along with file names. Do not include any explanations, comments, or additional text.
+example:
+```python
+a.py
+contents of a.py
+b.py
+contents of b.py
+```
+"""
+)
+
+PROTOCOL_PATTERN_CHECK_PROMPT = textwrap.dedent(
+"""
+You are a top-tier developer focused on protocol excellence and performance optimization. Review generated code to fix protocol violations, performance bottlenecks, and ensure optimal resource utilization across any programming language or system.
+
+PROTOCOL ESSENTIAL CHECKS:
+
+1. ITERATION & TRAVERSAL PROTOCOLS:
+   - Ensure iteration mechanisms work correctly and efficiently
+   - Verify proper termination conditions and state advancement
+   - Check that all elements are visited without skips or repeats
+   - Optimize traversal algorithms for performance
+   - Validate iterator state management and cleanup
+
+2. EVENT & CALLBACK MANAGEMENT:
+   - Fire events/callbacks only on actual state changes
+   - Ensure proper event registration and deregistration
+   - Provide callbacks with correct parameters and context
+   - Prevent memory leaks from event handler references
+   - Optimize callback execution performance
+
+3. STATE MANAGEMENT & CONSISTENCY:
+   - Initialize and maintain internal state correctly
+   - Ensure all operations update relevant state variables
+   - Maintain consistent state across all operations
+   - Prevent orphaned objects or memory leaks
+   - Optimize state update operations for performance
+
+4. RESOURCE MANAGEMENT:
+   - Proper allocation and deallocation of resources
+   - Efficient memory usage and garbage collection
+   - Connection pooling and resource reuse
+   - Prevent resource leaks and exhaustion
+   - Optimize resource access patterns
+
+5. PERFORMANCE OPTIMIZATION:
+   - Minimize unnecessary computations and operations
+   - Optimize data structure access patterns
+   - Reduce algorithmic complexity where possible
+   - Cache frequently accessed data appropriately
+   - Eliminate redundant operations and checks
+
+DETAILED FIXES:
+- If iteration is incomplete: Ensure all elements are processed
+- If state updates are missing: Verify all operations update relevant state
+- If resource cleanup is missing: Add proper cleanup mechanisms
+- If performance is suboptimal: Optimize algorithms and data access
+- If protocols are violated: Implement proper interface compliance
+
+VERIFICATION DETAILS:
+✓ Check all interfaces implement required methods correctly
+✓ Verify state updates occur in every relevant operation
+✓ Ensure proper resource cleanup and memory management
+✓ Validate performance characteristics and optimization opportunities
+✓ Confirm protocol compliance and interface adherence
+
+If no issues: Return code unchanged.
+
+STRICT and MANDATORY: Only return the final corrected code. Don't elaborate or provide explanations.
+"""
+)
+
+FINAL_CORRECTNESS_CHECK_PROMPT = textwrap.dedent(
+"""
+You are an ultimate code expert focusing on absolute correctness validation. Detect and fix algorithmic, semantic, edge-case, and specification compliance issues across any programming language or problem domain.
+
+CORRECTNESS MASTER CHECKS:
+
+1. ALGORITHM CHECKS:
+   - Verify all operations produce mathematically/logically correct results
+   - Ensure data transformations maintain integrity
+   - Validate sorting, filtering, and mapping operations
+   - Check arithmetic and computational accuracy
+   - Verify search and retrieval operations
+   - Ensure proper data structure manipulations
+
+2. SEMANTIC VALIDATION:
+   - Functions/methods do exactly what their names and documentation promise
+   - Return types match expected interfaces and contracts
+   - Side effects are consistent and documented
+   - API contracts are strictly honored
+   - Behavior matches specifications and requirements
+
+3. EDGE CASES & BOUNDARY CONDITIONS:
+   - Handle empty/null inputs gracefully
+   - Manage single element and minimal cases
+   - Test boundary values and limits
+   - Detect off-by-one and boundary errors
+   - Prevent division by zero and overflow errors
+   - Handle extreme values and edge conditions
+
+4. STRICT SPECIFICATION ADHERENCE:
+   - Review problem statement and requirements meticulously
+   - Implement every required behavior and feature
+   - Ensure all examples and test cases work correctly
+   - Avoid missing or misunderstanding any requirements
+   - Validate against all given constraints
+
+5. STRUCTURAL & LOGICAL INVARIANTS:
+   - Maintain data structure integrity throughout operations
+   - Ensure proper object relationships and references
+   - Validate state transitions and lifecycle management
+   - Check resource management and cleanup
+   - Verify concurrency and thread safety where applicable
+
+MASTER FIX INSTRUCTIONS:
+1. Build comprehensive mental models of expected outcomes
+2. Validate semantics: Code does exactly what it promises
+3. Test ALL corner cases: Empty inputs, boundary values, error conditions
+4. Examine logic validity: Ensure conditions, loops, and invariants are correct
+5. Confirm structural integrity during all operations
+6. Verify performance characteristics and resource usage
+
+If no problems are found: Return the code unchanged.
+
+STRICT and MANDATORY: Only return the final corrected code. Don't elaborate or provide explanations.
+"""
+)
+
+GENERATE_INITIAL_TESTCASES_PROMPT = textwrap.dedent("""
+You are an expert Python testcase developer. Your task is to generate a complete testcases for the given problem statement.
+
+Important things:
+1. Test functions declared in code skeleton, don't customized those prototypes.
+2. Read the problem statement carefully and deeply and generate testcases that exactly match the rules, mathmatical fomulas, algorithms, data, and workflow in it.
+3. Do not generate testcases that are not mentioned in problem statement
+4. Minimize all testcases as you have context and generation limit
+
+Strict Requirements:
+1. Output the full content of Python test files along with their file names. You **MUST** output the **file name** along with file content.
+2. Do not include explanations, comments, or markdown formatting.
+3. Use only standard Python (no external libraries).
+
+Response Examples:
+```python
+test_a.py
+contents of test_a.py
+
+test_b.py
+contents of test_b.py
+```
+"""
+)
 
 GENERATE_TESTCASES_WITH_MULTI_STEP_REASONING_PROMPT = textwrap.dedent(
 """
@@ -219,31 +461,151 @@ contents of test_b.py
 """
 )
 
-GENERATE_SOLUTION_WITH_MULTI_STEP_REASONING_PROMPT = textwrap.dedent(
+TESTCASES_CHECK_PROMPT = textwrap.dedent(
 """
-You are an expert Python developer. Your task is to generate a complete, working Python solution for the given problem statement.
+You are an expert testcases reviewer specializing in invalid testcases detection and prevention. Your task is to analyze the generated test code if it's all valid for the problem statement.
 
-Strict Requirements:
-1. Output the full content of Python files along with their file names. You **MUST** output the **file name** along with file content.
-2. Do not include explanations, comments, or markdown formatting.
-3. Use only standard Python (no external libraries).
-4. Implement all required classes and functions exactly with the same names as in the initial code stub.
-5. You may add helper functions or classes if needed, but do not remove or rename the original ones.
-6. Ensure the solution handles all edge cases, validates inputs, and produces correct outputs.
-7. The solution must be executable as-is with no placeholders or TODOs.
-8. If problem statement doesn't explicitely requires a list of strings as a response, do not use list of strings for multiline text problems, just use raw string format.
-Return only the final Python code.
+Important:
+1. Check for incorrect/invalid intput/output pair based on the problem statement and fix them or remove if it's impossible to fix
+2. Check if testcases are not covering critical edgecases for the problem statement and add missing testcases
+3. Minimize all testcases as you have context and generation limit
 
-Response Examples:
+If no invalid testcases are detected and covered all critical edge cases:
+- Return the original code unchanged
+
+STRICT REQUIREMENT: Return the final Python test code along with their file names. Do not include any explanations, comments, or additional text.
+
+example:
 ```python
-a.py
-{content}
+test_a.py
+contents of test_a.py
 
-b.py
-{content}
+test_b.py
+contents of test_b.py
 ```
 """
 )
+
+SOLUTION_VALIDATION_PROMPT = textwrap.dedent('''
+You are an expert code validator. Analyze the generated solution code for potential issues before running tests.
+
+# Validation Categories:
+
+1. **Syntax & Import Issues**
+   - Check for syntax errors (missing colons, parentheses, brackets)
+   - Verify all imports are valid and necessary
+   - Check for incorrect function signatures
+   - Detect invalid variable names or keywords misuse
+
+2. **Logic & Algorithm Errors**
+   - Off-by-one errors in loops/indices
+   - Wrong operators (using + instead of *, == instead of =, etc.)
+   - Infinite loops or missing termination conditions
+   - Incorrect return types or missing returns
+   - Wrong algorithm implementation for the problem
+
+3. **Edge Case Handling**
+   - Missing boundary checks (negative numbers, zero, empty collections)
+   - No null/None handling where needed
+   - Missing input validation
+   - No handling for extreme values (very large/small numbers)
+
+4. **Common Anti-patterns**
+   - Mutable default arguments (def func(x=[]):)
+   - Wrong equality checks (using 'is' instead of '==')
+   - Missing base cases in recursion
+   - Unnecessary complexity or over-engineering
+
+# Response Format (JSON):
+{
+    "has_issues": true,
+    "severity": "high",
+    "issues": [
+        {
+            "category": "Logic & Algorithm Errors",
+            "description": "Off-by-one error in loop: range(len(arr)) should be range(len(arr)-1)",
+            "location": "line 15, function process_data",
+            "severity": "high"
+        }
+    ],
+    "recommendations": [
+        "Fix loop boundary in process_data function",
+        "Add input validation for negative numbers"
+    ]
+}
+
+# Severity Levels:
+- "high": Will cause tests to fail or produce wrong results
+- "medium": May cause issues in edge cases
+- "low": Code quality issues but functionally correct
+- "none": No issues detected
+
+# Important:
+- Only report real issues, don't be overly cautious
+- Focus on issues that would cause test failures
+- Provide specific line numbers and locations when possible
+- If no issues found, return has_issues=false and severity="none"
+''')
+
+TEST_COVERAGE_ANALYSIS_PROMPT = textwrap.dedent('''
+You are a test coverage analyzer. Your task is to analyze if the generated test code adequately covers all requirements from the problem statement.
+
+# Analysis Framework:
+
+1. **Requirement Extraction**
+   - Parse the problem statement to identify all explicit requirements
+   - Include functional requirements, constraints, edge cases, and error conditions
+   
+2. **Test Coverage Mapping**
+   - For each requirement, identify which test case(s) cover it
+   - Mark requirements as: "covered", "partially_covered", or "missing"
+   
+3. **Edge Case Analysis**
+   - Identify critical edge cases mentioned in requirements
+   - Check if tests include: boundary values, empty inputs, invalid inputs, extreme values
+   
+4. **Gap Detection**
+   - Find requirements with no corresponding tests
+   - Find edge cases that should be tested but aren't
+
+# Response Format (JSON):
+{
+    "coverage_score": 0.85,
+    "total_requirements": 10,
+    "covered_requirements": [
+        {
+            "requirement": "Function must handle empty input",
+            "test_cases": ["test_empty_input"],
+            "coverage": "full"
+        }
+    ],
+    "missing_requirements": [
+        {
+            "requirement": "Function must validate input is positive",
+            "severity": "high",
+            "suggested_test": "def test_negative_input():\\n    with self.assertRaises(ValueError):\\n        func(-1)"
+        }
+    ],
+    "missing_edge_cases": [
+        {
+            "edge_case": "Maximum integer value",
+            "severity": "medium",
+            "reason": "Problem mentions handling large numbers",
+            "suggested_test": "def test_max_int():\\n    import sys\\n    result = func(sys.maxsize)\\n    self.assertIsNotNone(result)"
+        }
+    ],
+    "recommendations": [
+        "Add boundary value tests for width parameter",
+        "Test behavior with Unicode characters"
+    ]
+}
+
+# Important:
+- Be conservative: if unsure whether a requirement is covered, mark as "partially_covered"
+- Focus on explicit requirements in problem statement, not implied ones
+- Suggest concrete, runnable test code
+- Severity levels: "high" (critical functionality), "medium" (edge cases), "low" (nice-to-have)
+''')
 
 FIX_TASK_SYSTEM_PROMPT = textwrap.dedent("""
 # Hey there! You're a Coding Assistant 🚀. I have uploaded all files of a python repository. Your current working directory is at the root of that repo. You will be provided with a problem statement and you need to make the necessary changes to fix the issue.
@@ -303,33 +665,7 @@ Output should be one of MODULE or FILE, No other texts are allowed.
 - MODULE: When the test runner requires a module path to run the test.
 - FILE: When the test runner requires a file path to run the test (e.g. pytest, unittest, py.test, etc.).
 """)
-
-TESTCASES_CHECK_PROMPT = textwrap.dedent(
-"""
-You are an expert testcases reviewer specializing in invalid testcases detection and prevention. Your task is to analyze the generated test code if it's all valid for the problem statement.
-
-Important:
-1. Check for incorrect/invalid intput/output pair based on the problem statement and fix them or remove if it's impossible to fix
-2. Check if testcases are not covering critical edgecases for the problem statement and add missing testcases
-3. Minimize all testcases as you have context and generation limit
-
-If no invalid testcases are detected and covered all critical edge cases:
-- Return the original code unchanged
-
-STRICT REQUIREMENT: Return the final Python test code along with their file names. Do not include any explanations, comments, or additional text.
-
-example:
-```python
-test_a.py
-contents of test_a.py
-
-test_b.py
-contents of test_b.py
-```
-"""
-)
-
-
+  
 class EnhancedCOT:
     class Action:
             
@@ -353,8 +689,6 @@ class EnhancedCOT:
         return True
         
     def is_thought_repeated(self)->bool:
-        # Check if the last thought is the same as the previous thought.
-        # If there are less than 2 thoughts, skip (return False).
         if len(self.thoughts) < 2:
             return False
         last = self.thoughts[-1]
@@ -373,7 +707,6 @@ class EnhancedCOT:
                     f"next_tool_name:{thought.next_tool_name}\n"
                     f"next_tool_args:{thought.next_tool_args}\n"
                 )
-                # Compute observation summary length safely for str/list/None
                 if thought.observation is None:
                     _obs_len = 0
                 elif isinstance(thought.observation, (list, tuple)):
@@ -386,7 +719,6 @@ class EnhancedCOT:
             else:
                 if thought.is_error is None or i==len(self.thoughts)-1:
                     assistant_str=f"next_thought:{thought.next_thought}\nnext_tool_name:{thought.next_tool_name}\nnext_tool_args:{thought.next_tool_args}"
-                    # Render list observations as JSON array for the model
                     if isinstance(thought.observation, (list, tuple)):
                         try:
                             obs_render=json.dumps(list(thought.observation), ensure_ascii=False)
@@ -425,6 +757,411 @@ class EnhancedCOT:
             messages.append({"role":"user","content":user_str})
         return messages
 
+class Utils:
+    @classmethod
+    def limit_strings(cls,strings: str, n=1000)->str:
+        '''
+        Limit the number of strings to 1000
+        '''
+        strings_list=strings.split("\n")
+        if len(strings_list)>n:
+            return "\n".join(strings_list[:n])+"\n..." + f"({len(strings_list)-n} more lines)"
+        else:
+            return strings
+    @classmethod
+    def load_json(cls,json_string:str)->dict:
+        try:
+            return json.loads(json_string)
+        except Exception as e:
+            try:
+                return eval(json_string)
+            except Exception as e:
+                logger.info(f"unable to fix manually, trying with llm")
+                fixed_json=EnhancedNetwork.fix_json_string_with_llm(json_string)
+                if fixed_json:
+                    return fixed_json
+                else:
+                    raise JSONDecodeError(f"Invalid JSON: {json_string}")
+    @classmethod
+    def log_to_failed_messages(cls,text_resp:str):
+        with open("../failed_messages.csv","a") as f:
+                writer=csv.writer(f)
+                writer.writerow([text_resp])
+
+class FunctionVisitor(ast.NodeVisitor):
+    def __init__(self, file_content: str):
+        self.functions = {}
+        self.current_class = None
+        self.class_hierarchy = []
+        self.file_content = file_content
+
+    def visit_ClassDef(self, node):
+        self.class_hierarchy.append(node.name)
+        self.current_class = "::".join(self.class_hierarchy)
+        self.generic_visit(node)
+        self.class_hierarchy.pop()
+        self.current_class = "::".join(self.class_hierarchy) if self.class_hierarchy else None
+
+    def _process_function(self, node):
+        full_function_name = f"{self.current_class}::{node.name}" if self.current_class else node.name
+        line_number = node.lineno
+        if isinstance(node.decorator_list, list) and len(node.decorator_list) > 0:
+            line_number = node.decorator_list[0].lineno
+        
+        end_line_number = line_number
+        if isinstance(node.body, list) and len(node.body) > 0:
+            end_line_number = node.body[-1].lineno
+        
+        lines = self.file_content.split("\n")
+        body = "\n".join(lines[line_number-1:end_line_number])
+        
+        self.functions[full_function_name] = {
+            "class": self.current_class,
+            "body": body,
+            "line_number": line_number
+        }
+        self.generic_visit(node)
+
+    def visit_FunctionDef(self, node):
+        self._process_function(node)
+
+    def visit_AsyncFunctionDef(self, node):
+        self._process_function(node)
+
+    def visit_Module(self, node):
+        self.current_class = None
+        self.generic_visit(node)
+        self.current_class = None
+
+class ClassVisitor(ast.NodeVisitor):
+    def __init__(self, file_content: str):
+        self.classes = {}
+        self.file_content = file_content
+
+    def visit_ClassDef(self, node):
+        line_number = node.lineno
+        if isinstance(node.decorator_list, list) and len(node.decorator_list) > 0:
+            line_number = node.decorator_list[0].lineno
+        end_line_number = line_number
+        if isinstance(node.body, list) and len(node.body) > 0:
+            end_line_number = node.body[-1].lineno
+        lines = self.file_content.split("\n")
+        body = "\n".join(lines[line_number-1:end_line_number])
+        self.classes[node.name] = {
+            "body": body,
+            "line_number": line_number
+        }
+        self.generic_visit(node)
+
+class EnhancedNetwork:
+    class ErrorType(Enum):
+        EMPTY_RESPONSE=1
+        RESERVED_TOKEN_PRESENT=2
+        RATE_LIMIT_EXCEEDED=3
+        INVALID_RESPONSE_FORMAT=4
+        TIMEOUT=5
+        UNKNOWN=6
+        NETWORK_ERROR=7
+        AUTHENTICATION_ERROR=8
+        RESOURCE_EXHAUSTED=9
+    
+    @classmethod
+    def is_valid_response(cls,raw_text:str)->bool:
+        if type(raw_text) is dict and raw_text.get("error",None) is not None and raw_text.get("error")!="":
+            return False,cls.ErrorType.EMPTY_RESPONSE.name
+        if not raw_text.strip().endswith("}") and not raw_text.strip().endswith("}]"):
+            return False, "Incomplete response, your response must be shorter to fit within context limit"
+        if len(raw_text)==0:
+            return False, cls.ErrorType.EMPTY_RESPONSE.name
+        if "<|reserved_token_" in raw_text:
+            return False, cls.ErrorType.RESERVED_TOKEN_PRESENT.name
+        if 'API request failed with status 429' in raw_text:
+            return False, cls.ErrorType.RATE_LIMIT_EXCEEDED.name
+        if 'Read timed out' in raw_text:
+            return False, cls.ErrorType.TIMEOUT.name
+        if 'Network unreachable' in raw_text or 'Connection refused' in raw_text:
+            return False, cls.ErrorType.NETWORK_ERROR.name
+        return True, None
+
+    @classmethod
+    def get_error_counter(cls)->dict[str,int]:
+        return {
+            k:0 for k in cls.ErrorType.__members__
+        }   
+
+    @classmethod
+    def fix_json_string_with_llm(cls,json_string:str,attempt:int=0)->dict:
+        messages=[
+            {"role":"system", "content":"Fix the json string sent by the user.  Reply only with the json string and nothing else."},
+            {"role":"user", "content":json_string}
+        ]
+        response=cls.make_request(messages, model=DEEPSEEK_MODEL_NAME)
+        try:
+            response=response.replace('```json','').strip('```')
+            response=json.loads(response)
+            return response
+        except JSONDecodeError as e:
+            logger.error(f"Error fixing json string: {e},trying again..")
+            logger.error(f"json string is :{json_string}")
+            logger.error(f"LLM response is :{response}")
+            return None
+    
+    @classmethod
+    def make_request(cls,messages:list,model:str,attempt:int=0, temperature:float=0.0, max_retries:int=5)->str:
+        global run_id
+        url = f"{DEFAULT_PROXY_URL.rstrip('/')}/api/inference"
+
+        # Cache miss - make the actual request
+        request_data = {
+                "run_id": run_id if run_id else str(uuid4()),
+                "messages": messages,
+                "temperature": temperature,
+            }
+
+        headers = {
+            "Content-Type": "application/json"
+        }
+        request_data['model'] = model
+        
+        for retry_attempt in range(max_retries + 1):
+            try:
+                response = requests.post(url, data=json.dumps(request_data), timeout=120, headers=headers)
+                response.raise_for_status()
+            except requests.exceptions.Timeout:
+                return f"ERROR: Request timeout for model {model}"
+            except requests.exceptions.ConnectionError as e:
+                return f"ERROR: Connection failed for model {model}"
+            except requests.exceptions.HTTPError as e:
+                status_code = e.response.status_code
+                # Retry for 500 (Internal Server Error) or 504 (Gateway Timeout)
+                if status_code in [500, 504] and retry_attempt < max_retries:
+                    sleep_time = 2 ** retry_attempt  # Exponential backoff: 1s, 2s, 4s
+                    time.sleep(sleep_time)
+                    continue  # Retry the request
+                return f"ERROR: HTTP error {status_code} for model {model}"
+            except requests.exceptions.RequestException as e:
+                return f"ERROR: Request failed for model {model}"
+            
+            try:
+                response_json = response.json()
+            except JSONDecodeError as e:
+                return f"ERROR: Invalid JSON response for model {model}"
+            
+            try:
+                is_oai_interface= type(response_json) is dict and response_json.get('choices') is not None and len(response_json.get('choices'))>0 and response_json.get('choices')[0].get('message') is not None
+                if is_oai_interface:
+                    raw_text=response_json['choices'][0]['message']['content']
+                else:
+                    if type(response_json) is str:
+                        raw_text=response_json.strip("\n").strip()
+                    else:
+                        raw_text=response_json
+                if type(raw_text) is not dict:
+                    raw_text=raw_text.lstrip()
+                return raw_text
+            except (KeyError, IndexError, TypeError) as e:
+                return f"ERROR: Invalid response structure for model {model}"
+            except Exception as e:
+                return f"ERROR: Unexpected error for model {model}"
+        
+        # If we exhausted all retries
+        return f"ERROR: Max retries exceeded for model {model}"
+
+    @classmethod
+    def _request_next_action_with_retry(cls, messages: dict, 
+                            model: str,
+                            max_retries: int = 5, 
+                            base_delay: float = 1.0,
+                            temperature: float = 0.0) -> str:
+        
+        raw_text='not defined'
+        error_counter=cls.get_error_counter()
+        next_thought, next_tool_name, next_tool_args = None, None, None
+        total_attempts=0
+        for attempt in range(max_retries):
+            try:
+                total_attempts+=1
+                # index = AGENT_MODELS.index(model) if model in AGENT_MODELS else -1
+                raw_text=cls.make_request(messages,model=model, temperature=temperature)
+                # index = AGENT_MODELS.index(model) if model in AGENT_MODELS else -1
+                # raw_text=cls.make_request(messages,model=AGENT_MODELS[(index + attempt)%len(AGENT_MODELS)], temperature=temperature)
+                is_valid,error_msg=cls.is_valid_response(raw_text)
+                if not(is_valid):
+                    raise Exception(error_msg)
+                    
+                next_thought, next_tool_name, next_tool_args,error_msg = cls.parse_response(raw_text)
+                if error_msg:
+                    raise Exception(error_msg)
+                break
+            except Exception as e:
+                error_body = str(e)
+                logger.error(f"Error: {error_body}")
+                if attempt < max_retries:
+                    delay = base_delay
+                    logger.info(error_body)
+                    logger.error("--------------------------------")
+                    logger.error(f"response: {raw_text}")
+                    logger.error("--------------------------------")
+                    logger.info(f"[agent] Retrying in {delay} seconds... (attempt {attempt + 1}/{max_retries})") 
+                    if "RATE_LIMIT_EXCEEDED" in error_body:
+                        error_counter[cls.ErrorType.RATE_LIMIT_EXCEEDED.name]+=1
+                    elif "RESERVED_TOKEN_PRESENT" in error_body:
+                        error_counter[cls.ErrorType.RESERVED_TOKEN_PRESENT.name]+=1
+                    elif "EMPTY_RESPONSE" in error_body:
+                        error_counter[cls.ErrorType.EMPTY_RESPONSE.name]+=1
+                    elif "TIMEOUT" in error_body:
+                        error_counter[cls.ErrorType.TIMEOUT.name]+=1
+                    elif "Invalid JSON" in error_body:
+                        error_counter[cls.ErrorType.INVALID_RESPONSE_FORMAT.name]+=1
+                    elif "Invalid response" in error_body:
+                        error_counter[cls.ErrorType.INVALID_RESPONSE_FORMAT.name]+=1
+                    else:
+                        error_counter[cls.ErrorType.UNKNOWN.name]+=1
+                    if "RATE_LIMIT_EXCEEDED" not in error_body and "RESERVED_TOKEN_PRESENT" not in error_body and "EMPTY_RESPONSE" not in error_body and  "TIMEOUT" not in error_body:
+                        messages.append({"role":"assistant","content":raw_text})
+                        messages.append({"role":"user","content":"observation: "+error_body})
+                    time.sleep(random.uniform(1.2*delay, 1.5*delay))
+                    continue
+                else:
+                    error_counter[cls.ErrorType.TIMEOUT.name]+=1
+                    raise RuntimeError(error_body)
+        
+        return next_thought, next_tool_name, next_tool_args,raw_text,total_attempts,error_counter,messages
+    
+    
+    @classmethod
+    def parse_malformed_json(cls,arguments:list[str], json_string:str)->dict | str:    
+        # pattern of general json string with unescaped " in values keys from keys list
+        pattern = ''
+        for i, k in enumerate(arguments):
+            pattern += f'"{k}": (.*)'
+            if i != len(arguments) - 1:
+                pattern += r',\s*'
+
+        match=re.search(pattern, json_string)
+
+        if not match:
+            return f"Error: {json_string} can not match pattern {pattern}"
+        
+        result_json={}
+        for i in range(len(arguments)):
+            value=match.group(i+1)
+            value=value.strip()
+            if value.startswith('"') and value.endswith('"'):
+                value=value[1:-1]
+            #value=value.replace('"', '\\"')
+            value=value.replace('\\n','\n')
+            result_json[arguments[i]]=value
+        return result_json
+    
+    @classmethod
+    def parse_next_tool_args(cls,tool_name:str, next_tool_args: str)->dict | str:
+        '''
+        parse string to json, fix unecaped " in values like this: '{"a": "text "text2" text3 "text4"", "b": "text3"}'
+        returns json or error message
+        '''
+
+        next_tool_args=next_tool_args.replace('```json','').strip('```')
+        error_msg=''
+
+        try:
+            next_tool_args = Utils.load_json(next_tool_args.strip())
+        except JSONDecodeError as e:
+            error_msg=f"Invalid JSON: {next_tool_args}"    
+            try:
+                next_tool_args = cls.parse_malformed_json(EnhancedToolManager.get_tool_args_for_tool(tool_name,required=True), next_tool_args)
+            except EnhancedToolManager.Error as e:
+                raise Exception(e.message)
+            except Exception as e:
+                raise Exception(error_msg)
+        return next_tool_args
+
+    @classmethod
+    def inference(cls, messages: List[Dict[str, Any]], model: str, run_id: str = str(uuid4()),return_json:bool=False, temperature:float=0.0) -> dict:
+        """Prod inference with caching"""
+        cleaned_msgs: List[Dict[str, Any]] = []
+        for m in messages:
+            role = m.get("role")
+            if role not in {"system", "user", "assistant", "tool"}:
+                continue
+            content = m.get("content", "")
+
+            if role == "assistant" and not content.strip():
+                continue
+
+            cleaned_msgs.append({"role": role, "content": content})
+
+        if not cleaned_msgs:
+            raise RuntimeError("No valid messages to send to proxy.")
+
+        next_thought,next_tool_name,next_tool_args,raw_text,total_attempts,error_counter,messages = cls._request_next_action_with_retry(cleaned_msgs, model=model, temperature=temperature)
+        
+        return next_thought,next_tool_name,next_tool_args,raw_text,total_attempts,error_counter,messages
+    
+    @classmethod
+    def sanitise_text_resp(cls,text_resp:str)->str:
+        # remove all leading and trailing quotes
+        text_resp=re.sub("[\'\"]*next_thought[\'\"]*:","next_thought:",text_resp)
+        text_resp=re.sub("[\'\"]*next_tool_name[\'\"]*:","next_tool_name:",text_resp)
+        text_resp=re.sub("[\'\"]*next_tool_args[\'\"]*:","next_tool_args:",text_resp)
+        text_resp=re.sub("[\'\"]*observation[\'\"]*:","observation:",text_resp)
+        if "next_thought" not in text_resp and "next_tool_name:" in text_resp and "next_tool_args:" in text_resp and text_resp.find("next_tool_name:")<text_resp.find("next_tool_args:") and text_resp.find("next_tool_name:")>10:
+            logger.info(f"next_thought not found in {text_resp[:50]}, adding it")
+            text_resp="next_thought: "+text_resp
+        if "next_tool_name:" in text_resp and "next_tool_args:" in text_resp and text_resp.find("next_tool_name:")<text_resp.find("next_tool_args:"):
+            # remove all leading and trailing quotes in tool_name
+            next_tool_name=text_resp.split("next_tool_name:")[1].split("next_tool_args:")[0].strip().strip("\n").strip("\'").strip("\"").strip()
+            text_resp=re.sub(f"next_tool_name:[\'\" ]*{next_tool_name}[\'\" ]*","next_tool_name: "+next_tool_name,text_resp)
+        
+        return text_resp
+
+    @classmethod
+    def parse_response(cls,text_resp: str)->tuple[str, Any, Any]:
+        error_msg=None
+        text_resp = text_resp.strip()
+        text_resp=text_resp.split("observation:")[0]
+        text_resp=text_resp.strip().strip("\n")
+        text_resp=cls.sanitise_text_resp(text_resp)
+        if "next_thought:" in text_resp and "next_tool_name:" in text_resp and "next_tool_args:" in text_resp and text_resp.find("next_thought:")<text_resp.find("next_tool_name:") and text_resp.find("next_tool_name:")<text_resp.find("next_tool_args:"):
+            next_thought=text_resp.split("next_thought:")[1].split("next_tool_name:")[0].strip().strip("\n")
+            next_tool_name_raw=text_resp.split("next_tool_name:")[1].split("next_tool_args:")[0].strip().strip("\n")
+            next_tool_args_raw=text_resp.split("next_tool_args:")[1].strip().split("next_thought:")[0].strip().strip("\n")
+            try:
+                # Enforce arrays per new contract: if single string/object, wrap as arrays
+                if next_tool_name_raw.startswith("["):
+                    next_tool_name = Utils.load_json(next_tool_name_raw)
+                else:
+                    next_tool_name = [next_tool_name_raw]
+                parsed_args = cls.parse_next_tool_args(next_tool_name, next_tool_args_raw)
+                if isinstance(parsed_args, list):
+                    next_tool_args = parsed_args
+                else:
+                    next_tool_args = [parsed_args for _ in next_tool_name]
+            except JSONDecodeError as e:
+                error_msg=f"Invalid JSON: {str(e)}"
+                Utils.log_to_failed_messages(text_resp)
+                
+        else:
+            if "next_thought:" not in text_resp:
+                error_msg="Invalid response. next_thought not found"
+            elif "next_tool_name:" not in text_resp:
+                error_msg="Invalid response. next_tool_name not found"
+            elif "next_tool_args:" not in text_resp:
+                error_msg="Invalid response. next_tool_args not found"
+            elif text_resp.find("next_thought:")>text_resp.find("next_tool_name:"):
+                error_msg="Invalid response. next_thought is after next_tool_name"
+            elif text_resp.find("next_tool_name:")>text_resp.find("next_tool_args:"):
+                error_msg="Invalid response. next_tool_name is after next_tool_args"
+            else:
+                logger.error(f"We have no clue why parsing failed. Please check this \n{text_resp}\n")
+            Utils.log_to_failed_messages(text_resp)
+            return None,None,None,error_msg
+
+        if len(next_tool_name) == 1:
+            return next_thought, next_tool_name[0], next_tool_args[0], error_msg
+            
+        return next_thought, next_tool_name, next_tool_args,error_msg
+
 class EnhancedToolManager:
     logs = []
     TOOL_LIST = {}
@@ -445,6 +1182,19 @@ class EnhancedToolManager:
             INVALID_FILE_PATH=12
             INVALID_TOOL_CALL=13
             IMPORT_ERROR=14
+            GIT_OPERATION_FAILED=15
+            GIT_CONFIG_ERROR=16
+            GIT_STATE_ERROR=17
+            GIT_MERGE_CONFLICT=18
+            GIT_BRANCH_ERROR=19
+            TEST_COVERAGE_ERROR = 20
+            DEPENDENCY_ANALYSIS_ERROR = 21
+            CODE_SMELL_DETECTION_ERROR = 22
+            GIT_HISTORY_ERROR = 23
+            CODE_QUALITY_ERROR = 24
+            SOLUTION_VALIDATION_ERROR = 25
+            CODE_STYLE_ERROR = 26
+            SOLUTION_COMPARISON_ERROR = 27
             
         def __init__(self,error_type:ErrorType,message:str):    
             self.error_type=error_type
@@ -580,6 +1330,8 @@ class EnhancedToolManager:
         Useful for capturing comprehensive change summary before finalization
         '''
         try:
+            # Update to include cfg, txt, and toml files along with py files
+            # Check whether ignore_files is a property of this clas
             command = f"""
             shopt -s globstar
 
@@ -605,412 +1357,6 @@ class EnhancedToolManager:
         except Exception as e:
             logger.error(f"Error generating git patch: {e}")
             return f"Error generating git patch: {e}"
-
-
-class EnhancedNetwork:
-    class ErrorType(Enum):
-        EMPTY_RESPONSE=1
-        RESERVED_TOKEN_PRESENT=2
-        RATE_LIMIT_EXCEEDED=3
-        INVALID_RESPONSE_FORMAT=4
-        TIMEOUT=5
-        UNKNOWN=6
-        NETWORK_ERROR=7
-        AUTHENTICATION_ERROR=8
-        RESOURCE_EXHAUSTED=9
-    
-    @classmethod
-    def is_valid_response(cls,raw_text:str)->bool:
-        if type(raw_text) is dict and raw_text.get("error",None) is not None and raw_text.get("error")!="":
-            return False,cls.ErrorType.EMPTY_RESPONSE.name
-        if not raw_text.strip().endswith("}") and not raw_text.strip().endswith("}]"):
-            return False, "Incomplete response, your response must be shorter to fit within context limit"
-        if len(raw_text)==0:
-            return False, cls.ErrorType.EMPTY_RESPONSE.name
-        if "<|reserved_token_" in raw_text:
-            return False, cls.ErrorType.RESERVED_TOKEN_PRESENT.name
-        if 'API request failed with status 429' in raw_text:
-            return False, cls.ErrorType.RATE_LIMIT_EXCEEDED.name
-        if 'Read timed out' in raw_text:
-            return False, cls.ErrorType.TIMEOUT.name
-        if 'Network unreachable' in raw_text or 'Connection refused' in raw_text:
-            return False, cls.ErrorType.NETWORK_ERROR.name
-        return True, None
-
-    @classmethod
-    def get_error_counter(cls)->dict[str,int]:
-        return {
-            k:0 for k in cls.ErrorType.__members__
-        }   
-
-    @classmethod
-    def fix_json_string_with_llm(cls,json_string:str,attempt:int=0)->dict:
-        messages=[
-            {"role":"system", "content":"Fix the json string sent by the user.  Reply only with the json string and nothing else."},
-            {"role":"user", "content":json_string}
-        ]
-        response=cls.make_request(messages, model=DEEPSEEK_MODEL_NAME)
-        try:
-            response=response.replace('```json','').strip('```')
-            response=json.loads(response)
-            return response
-        except JSONDecodeError as e:
-            logger.error(f"Error fixing json string: {e},trying again..")
-            logger.error(f"json string is :{json_string}")
-            logger.error(f"LLM response is :{response}")
-            return None
-    
-    @classmethod
-    def make_request(cls,messages:list,model:str,attempt:int=0, temperature:float=0.0)->str:
-        global run_id
-        url = f"{DEFAULT_PROXY_URL.rstrip('/')}/api/inference"
-        print("[REQUEST] run_id:", run_id)
-
-        # Cache miss - make the actual request
-        request_data = {
-                "run_id": run_id if run_id else str(uuid4()),
-                "messages": messages,
-                "temperature": temperature,
-            }
-
-        headers = {
-            "Content-Type": "application/json"
-        }
-        request_data['model'] = model
-        
-        try:
-            response = requests.post(url, json=request_data, timeout=120, headers=headers)
-            response.raise_for_status()
-        except requests.exceptions.Timeout:
-            logger.error(f"Request timeout after 120 seconds for model {model}")
-            return f"ERROR: Request timeout for model {model}"
-        except requests.exceptions.ConnectionError as e:
-            logger.error(f"Connection error for model {model}: {e}")
-            return f"ERROR: Connection failed for model {model}"
-        except requests.exceptions.HTTPError as e:
-            logger.error(f"HTTP error for model {model}: {e}")
-            return f"ERROR: HTTP error {e.response.status_code} for model {model}"
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request error for model {model}: {e}")
-            return f"ERROR: Request failed for model {model}"
-        
-        try:
-            response_json = response.json()
-        except JSONDecodeError as e:
-            logger.error(f"Invalid JSON response for model {model}: {e}")
-            logger.error(f"Response content: {response.text[:500]}...")
-            return f"ERROR: Invalid JSON response for model {model}"
-        
-        try:
-            is_oai_interface= type(response_json) is dict and response_json.get('choices') is not None and len(response_json.get('choices'))>0 and response_json.get('choices')[0].get('message') is not None
-            if is_oai_interface:
-                raw_text=response_json['choices'][0]['message']['content']
-            else:
-                if type(response_json) is str:
-                    raw_text=response_json.strip("\n").strip()
-                else:
-                    raw_text=response_json
-            if type(raw_text) is not dict:
-                raw_text=raw_text.lstrip()
-            return raw_text
-        except (KeyError, IndexError, TypeError) as e:
-            logger.error(f"Error parsing response structure for model {model}: {e}")
-            logger.error(f"Response JSON: {response_json}")
-            return f"ERROR: Invalid response structure for model {model}"
-        except Exception as e:
-            logger.error(f"Unexpected error processing response for model {model}: {e}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            return f"ERROR: Unexpected error for model {model}"
-
-    @classmethod
-    def _request_next_action_with_retry(cls, messages: dict, 
-                            model: str,
-                            max_retries: int = 5, 
-                            base_delay: float = 1.0,
-                            temperature: float = 0.0) -> str:
-        
-        raw_text='not defined'
-        error_counter=cls.get_error_counter()
-        next_thought, next_tool_name, next_tool_args = None, None, None
-        total_attempts=0
-        for attempt in range(max_retries):
-            try:
-                total_attempts+=1
-                index = AGENT_MODELS.index(model) if model in AGENT_MODELS else -1
-                raw_text=cls.make_request(messages,model=AGENT_MODELS[(index + attempt)%len(AGENT_MODELS)], temperature=temperature)
-                is_valid,error_msg=cls.is_valid_response(raw_text)
-                if not(is_valid):
-                    raise Exception(error_msg)
-                    
-                next_thought, next_tool_name, next_tool_args,error_msg = cls.parse_response(raw_text)
-                if error_msg:
-                    raise Exception(error_msg)
-                break
-            except Exception as e:
-                error_body = str(e)
-                logger.error(f"Error: {error_body}")
-                if attempt < max_retries:
-                    delay = base_delay
-                    logger.info(error_body)
-                    logger.error("--------------------------------")
-                    logger.error(f"response: {raw_text}")
-                    logger.error("--------------------------------")
-                    logger.info(f"[agent] Retrying in {delay} seconds... (attempt {attempt + 1}/{max_retries})") 
-                    if "RATE_LIMIT_EXCEEDED" in error_body:
-                        error_counter[cls.ErrorType.RATE_LIMIT_EXCEEDED.name]+=1
-                    elif "RESERVED_TOKEN_PRESENT" in error_body:
-                        error_counter[cls.ErrorType.RESERVED_TOKEN_PRESENT.name]+=1
-                    elif "EMPTY_RESPONSE" in error_body:
-                        error_counter[cls.ErrorType.EMPTY_RESPONSE.name]+=1
-                    elif "TIMEOUT" in error_body:
-                        error_counter[cls.ErrorType.TIMEOUT.name]+=1
-                    elif "Invalid JSON" in error_body:
-                        error_counter[cls.ErrorType.INVALID_RESPONSE_FORMAT.name]+=1
-                    elif "Invalid response" in error_body:
-                        error_counter[cls.ErrorType.INVALID_RESPONSE_FORMAT.name]+=1
-                    else:
-                        error_counter[cls.ErrorType.UNKNOWN.name]+=1
-                    if "RATE_LIMIT_EXCEEDED" not in error_body and "RESERVED_TOKEN_PRESENT" not in error_body and "EMPTY_RESPONSE" not in error_body and  "TIMEOUT" not in error_body:
-                        messages.append({"role":"assistant","content":raw_text})
-                        messages.append({"role":"user","content":"observation: "+error_body})
-                    time.sleep(random.uniform(1.2*delay, 1.5*delay))
-                    continue
-                else:
-                    error_counter[cls.ErrorType.TIMEOUT.name]+=1
-                    raise RuntimeError(error_body)
-        
-        return next_thought, next_tool_name, next_tool_args,raw_text,total_attempts,error_counter,messages
-    
-    
-    @classmethod
-    def parse_malformed_json(cls,arguments:list[str], json_string:str)->dict | str:    
-        # pattern of general json string with unescaped " in values keys from keys list
-        pattern = ''
-        for i, k in enumerate(arguments):
-            pattern += f'"{k}": (.*)'
-            if i != len(arguments) - 1:
-                pattern += r',\s*'
-
-        match=re.search(pattern, json_string)
-
-        if not match:
-            return f"Error: {json_string} can not match pattern {pattern}"
-        
-        result_json={}
-        for i in range(len(arguments)):
-            value=match.group(i+1)
-            value=value.strip()
-            if value.startswith('"') and value.endswith('"'):
-                value=value[1:-1]
-            #value=value.replace('"', '\\"')
-            value=value.replace('\\n','\n')
-            result_json[arguments[i]]=value
-        return result_json
-    
-    @classmethod
-    def parse_next_tool_args(cls,tool_name:str, next_tool_args: str)->dict | str:
-        '''
-        parse string to json, fix unecaped " in values like this: '{"a": "text "text2" text3 "text4"", "b": "text3"}'
-        returns json or error message
-        '''
-
-        next_tool_args=next_tool_args.replace('```json','').strip('```')
-        error_msg=''
-
-        try:
-            next_tool_args = Utils.load_json(next_tool_args.strip())
-        except JSONDecodeError as e:
-            error_msg=f"Invalid JSON: {next_tool_args}"    
-            try:
-                next_tool_args = cls.parse_malformed_json(EnhancedToolManager.get_tool_args_for_tool(tool_name,required=True), next_tool_args)
-            except EnhancedToolManager.Error as e:
-                raise Exception(e.message)
-            except Exception as e:
-                raise Exception(error_msg)
-        return next_tool_args
-
-    @classmethod
-    def inference(cls, messages: List[Dict[str, Any]], model: str, run_id: str = str(uuid4()), temperature:float=0.0) -> dict:
-        """Prod inference with caching"""
-        cleaned_msgs: List[Dict[str, Any]] = []
-        for m in messages:
-            role = m.get("role")
-            if role not in {"system", "user", "assistant", "tool"}:
-                continue
-            content = m.get("content", "")
-
-            if role == "assistant" and not content.strip():
-                continue
-
-            cleaned_msgs.append({"role": role, "content": content})
-
-        if not cleaned_msgs:
-            raise RuntimeError("No valid messages to send to proxy.")
-
-        next_thought,next_tool_name,next_tool_args,raw_text,total_attempts,error_counter,messages = cls._request_next_action_with_retry(cleaned_msgs, model=model, temperature=temperature)
-        
-        return next_thought,next_tool_name,next_tool_args,raw_text,total_attempts,error_counter,messages
-    
-    @classmethod
-    def sanitise_text_resp(cls,text_resp:str)->str:
-        # remove all leading and trailing quotes
-        text_resp=re.sub("[\'\"]*next_thought[\'\"]*:","next_thought:",text_resp)
-        text_resp=re.sub("[\'\"]*next_tool_name[\'\"]*:","next_tool_name:",text_resp)
-        text_resp=re.sub("[\'\"]*next_tool_args[\'\"]*:","next_tool_args:",text_resp)
-        text_resp=re.sub("[\'\"]*observation[\'\"]*:","observation:",text_resp)
-        if "next_thought" not in text_resp and "next_tool_name:" in text_resp and "next_tool_args:" in text_resp and text_resp.find("next_tool_name:")<text_resp.find("next_tool_args:") and text_resp.find("next_tool_name:")>10:
-            logger.info(f"next_thought not found in {text_resp[:50]}, adding it")
-            text_resp="next_thought: "+text_resp
-        if "next_tool_name:" in text_resp and "next_tool_args:" in text_resp and text_resp.find("next_tool_name:")<text_resp.find("next_tool_args:"):
-            # remove all leading and trailing quotes in tool_name
-            next_tool_name=text_resp.split("next_tool_name:")[1].split("next_tool_args:")[0].strip().strip("\n").strip("\'").strip("\"").strip()
-            text_resp=re.sub(f"next_tool_name:[\'\" ]*{next_tool_name}[\'\" ]*","next_tool_name: "+next_tool_name,text_resp)
-        
-        return text_resp
-
-    @classmethod
-    def parse_response(cls,text_resp: str)->tuple[str, Any, Any]:
-        error_msg=None
-        text_resp = text_resp.strip()
-        text_resp=text_resp.split("observation:")[0]
-        text_resp=text_resp.strip().strip("\n")
-        text_resp=cls.sanitise_text_resp(text_resp)
-        if "next_thought:" in text_resp and "next_tool_name:" in text_resp and "next_tool_args:" in text_resp and text_resp.find("next_thought:")<text_resp.find("next_tool_name:") and text_resp.find("next_tool_name:")<text_resp.find("next_tool_args:"):
-            next_thought=text_resp.split("next_thought:")[1].split("next_tool_name:")[0].strip().strip("\n")
-            next_tool_name_raw=text_resp.split("next_tool_name:")[1].split("next_tool_args:")[0].strip().strip("\n")
-            next_tool_args_raw=text_resp.split("next_tool_args:")[1].strip().split("next_thought:")[0].strip().strip("\n")
-            try:
-                # Enforce arrays per new contract: if single string/object, wrap as arrays
-                if next_tool_name_raw.startswith("["):
-                    next_tool_name = Utils.load_json(next_tool_name_raw)
-                else:
-                    next_tool_name = [next_tool_name_raw]
-                parsed_args = cls.parse_next_tool_args(next_tool_name, next_tool_args_raw)
-                if isinstance(parsed_args, list):
-                    next_tool_args = parsed_args
-                else:
-                    next_tool_args = [parsed_args for _ in next_tool_name]
-            except JSONDecodeError as e:
-                error_msg=f"Invalid JSON: {str(e)}"
-                Utils.log_to_failed_messages(text_resp)
-                
-        else:
-            if "next_thought:" not in text_resp:
-                error_msg="Invalid response. next_thought not found"
-            elif "next_tool_name:" not in text_resp:
-                error_msg="Invalid response. next_tool_name not found"
-            elif "next_tool_args:" not in text_resp:
-                error_msg="Invalid response. next_tool_args not found"
-            elif text_resp.find("next_thought:")>text_resp.find("next_tool_name:"):
-                error_msg="Invalid response. next_thought is after next_tool_name"
-            elif text_resp.find("next_tool_name:")>text_resp.find("next_tool_args:"):
-                error_msg="Invalid response. next_tool_name is after next_tool_args"
-            else:
-                logger.error(f"We have no clue why parsing failed. Please check this \n{text_resp}\n")
-            Utils.log_to_failed_messages(text_resp)
-            return None,None,None,error_msg
-
-        if len(next_tool_name) == 1:
-            return next_thought, next_tool_name[0], next_tool_args[0], error_msg
-            
-        return next_thought, next_tool_name, next_tool_args,error_msg
-
-class FunctionVisitor(ast.NodeVisitor):
-    def __init__(self, file_content: str):
-        self.functions = {}
-        self.current_class = None
-        self.class_hierarchy = []
-        self.file_content = file_content
-
-    def visit_ClassDef(self, node):
-        self.class_hierarchy.append(node.name)
-        self.current_class = "::".join(self.class_hierarchy)
-        self.generic_visit(node)
-        self.class_hierarchy.pop()
-        self.current_class = "::".join(self.class_hierarchy) if self.class_hierarchy else None
-
-    def _process_function(self, node):
-        full_function_name = f"{self.current_class}::{node.name}" if self.current_class else node.name
-        line_number = node.lineno
-        if isinstance(node.decorator_list, list) and len(node.decorator_list) > 0:
-            line_number = node.decorator_list[0].lineno
-        
-        end_line_number = line_number
-        if isinstance(node.body, list) and len(node.body) > 0:
-            end_line_number = node.body[-1].lineno
-        
-        lines = self.file_content.split("\n")
-        body = "\n".join(lines[line_number-1:end_line_number])
-        
-        self.functions[full_function_name] = {
-            "class": self.current_class,
-            "body": body,
-            "line_number": line_number
-        }
-        self.generic_visit(node)
-
-    def visit_FunctionDef(self, node):
-        self._process_function(node)
-
-    def visit_AsyncFunctionDef(self, node):
-        self._process_function(node)
-
-    def visit_Module(self, node):
-        self.current_class = None
-        self.generic_visit(node)
-        self.current_class = None
-
-class ClassVisitor(ast.NodeVisitor):
-    def __init__(self, file_content: str):
-        self.classes = {}
-        self.file_content = file_content
-
-    def visit_ClassDef(self, node):
-        line_number = node.lineno
-        if isinstance(node.decorator_list, list) and len(node.decorator_list) > 0:
-            line_number = node.decorator_list[0].lineno
-        end_line_number = line_number
-        if isinstance(node.body, list) and len(node.body) > 0:
-            end_line_number = node.body[-1].lineno
-        lines = self.file_content.split("\n")
-        body = "\n".join(lines[line_number-1:end_line_number])
-        self.classes[node.name] = {
-            "body": body,
-            "line_number": line_number
-        }
-        self.generic_visit(node)
-
-class Utils:
-    @classmethod
-    def limit_strings(cls,strings: str, n=1000)->str:
-        '''
-        Limit the number of strings to 1000
-        '''
-        strings_list=strings.split("\n")
-        if len(strings_list)>n:
-            return "\n".join(strings_list[:n])+"\n..." + f"({len(strings_list)-n} more lines)"
-        else:
-            return strings
-    @classmethod
-    def load_json(cls,json_string:str)->dict:
-        try:
-            return json.loads(json_string)
-        except Exception as e:
-            try:
-                return eval(json_string)
-            except Exception as e:
-                logger.info(f"unable to fix manually, trying with llm")
-                fixed_json=EnhancedNetwork.fix_json_string_with_llm(json_string)
-                if fixed_json:
-                    return fixed_json
-                else:
-                    raise JSONDecodeError("Invalid JSON", json_string, 0)
-                
-    @classmethod
-    def log_to_failed_messages(cls,text_resp:str):
-        with open("../failed_messages.csv","a") as f:
-                writer=csv.writer(f)
-                writer.writerow([text_resp])
 
 class FixTaskEnhancedToolManager(EnhancedToolManager):
 
@@ -1347,7 +1693,7 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
         if not file_path.endswith(".py"):
             raise EnhancedToolManager.Error(EnhancedToolManager.Error.ErrorType.INVALID_FILE_PATH.name,f"Error: file '{file_path}' is not a python file.")
         return self._extract_function_matches(file_path, search_term)
-    
+
     @EnhancedToolManager.tool
     def start_over(self,problem_with_old_approach:str,new_apprach_to_try:str):
         '''
@@ -1530,18 +1876,6 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
             print("CMD: pytest ", file_paths)
             result = subprocess.run(["pytest"] + file_paths, shell=True, capture_output=True, text=True, timeout=90)
             output = (result.stdout or "") + (result.stderr or "")
-        elif self.test_runner == "unittest":
-            print("CMD: python ", file_paths)
-            output = ""
-            for file_path in file_paths:
-                result = subprocess.run(
-                    ["python", file_path],
-                    capture_output=True,
-                    text=True,
-                    timeout=60
-                )
-                current_output = (result.stdout or "") + (result.stderr or "")
-                output += current_output
         else:
             if self.test_runner_mode == "MODULE":
                 modules = [filepath_to_module(f, os.getcwd(), self.test_runner) for f in file_paths]
@@ -1700,6 +2034,80 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
         else: 
             raise EnhancedToolManager.Error(EnhancedToolManager.Error.ErrorType.BUG_REPORT_REQUIRED.name,qa_response.get("analysis",""))
 
+def determine_model_order(problem_statement: str) -> list:
+    """Determine model priority via LLM routing based on the problem statement.
+
+    The router LLM must return strict JSON indicating the first and second models.
+    Falls back to a safe default if parsing fails.
+    """
+    try:
+        system_prompt = (
+            "You are a model router. Choose the best first LLM to solve a Python\n"
+            "coding challenge given its problem statement, and then the second LLM.\n"
+            "Only consider these options (use exact identifiers):\n"
+            f"1) {DEEPSEEK_MODEL_NAME} (stronger reasoning, graphs/backtracking/parsers)\n"
+            f"2) {QWEN_MODEL_NAME} (stronger implementation, string/data wrangling/spec-following)\n\n"
+            "Output MUST be a single JSON object with key 'order' mapping to a list of two\n"
+            "strings, the exact model identifiers, best-first. No explanations."
+        )
+
+        user_prompt = (
+            "Problem statement to route:\n\n" + (problem_statement or "").strip()
+        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        raw = EnhancedNetwork.make_request(messages, model=DEEPSEEK_MODEL_NAME)
+
+        # Normalize potential fenced responses
+        cleaned = raw.strip()
+        cleaned = cleaned.replace('```json', '```')
+        if cleaned.startswith('```') and cleaned.endswith('```'):
+            cleaned = cleaned.strip('`').strip()
+
+        try:
+            data = json.loads(cleaned)
+        except Exception:
+            match = re.search(r"\{[\s\S]*\}", cleaned)
+            data = json.loads(match.group(0)) if match else {}
+
+        order = []
+        if isinstance(data, dict):
+            if isinstance(data.get('order'), list):
+                order = data['order']
+            elif 'first' in data and 'second' in data:
+                order = [data['first'], data['second']]
+
+        alias_map = {
+            DEEPSEEK_MODEL_NAME.lower(): DEEPSEEK_MODEL_NAME,
+            QWEN_MODEL_NAME.lower(): QWEN_MODEL_NAME,
+            'deepseek': DEEPSEEK_MODEL_NAME,
+            'qwen': QWEN_MODEL_NAME,
+        }
+
+        mapped = []
+        for item in order:
+            if not isinstance(item, str):
+                continue
+            key = item.strip().lower()
+            if key in alias_map and alias_map[key] not in mapped:
+                mapped.append(alias_map[key])
+
+        for candidate in [DEEPSEEK_MODEL_NAME, QWEN_MODEL_NAME]:
+            if candidate not in mapped:
+                mapped.append(candidate)
+            if len(mapped) == 2:
+                break
+
+        logger.info(f"[MODEL-ROUTER] Selected model order via LLM: {mapped}")
+        return mapped[:2]
+    except Exception as e:
+        logger.warning(f"[MODEL-ROUTER] Routing failed ({e}); using safe default order")
+        return [QWEN_MODEL_NAME, DEEPSEEK_MODEL_NAME]
+    
 def ensure_git_initialized():
     """Initialize git repository if not already initialized, with temporary config."""
     print("[DEBUG] Starting git initialization check...")
@@ -1758,65 +2166,38 @@ def set_env_for_agent():
     if Path(os.getcwd()+"/lib").exists() and os.getcwd()+"/lib" not in os.environ.get("PYTHONPATH",""):
         os.environ["PYTHONPATH"]=os.environ["PYTHONPATH"]+":"+os.getcwd()+"/lib"
 
-def process_fix_task(input_dict: Dict[str, Any]):
-    """Main entry point for task processing and code modification.
+def agent_main(input_dict: Dict[str, Any], repo_dir: str = "repo", test_mode: bool = False):
+    """Legacy interface wrapper for backwards compatibility."""
+    global DEFAULT_PROXY_URL, DEFAULT_TIMEOUT, MAX_TEST_PATCH_TIMEOUT, run_id
+    run_id = os.getenv("RUN_ID", "")
+    repo_dir = os.path.abspath(repo_dir)
+    if test_mode:
+        DEFAULT_TIMEOUT = 1000
+        MAX_TEST_PATCH_TIMEOUT = 400
 
-    Parameters
-    ----------
-    input_dict : dict
-        Configuration dictionary containing the task specification.
-        Required key: 'problem_statement' with task details.
-        Optional keys: 'run_id', 'instance_id' for tracking purposes.
-    """
-    global run_id
-    # setting environment to include current working directory and lib directory
-    problem_text = input_dict.get("problem_statement")
-    if not problem_text:
-        raise ValueError("input_dict must contain 'problem_statement'.")
-    timeout = int(os.getenv("AGENT_TIMEOUT", str(DEFAULT_TIMEOUT)))
-    
-    logs = []
-    patch_text = ""  # Initialize to avoid UnboundLocalError
-    
-    repo_path = os.getenv("REPO_PATH", "/sandbox/repo")
-    repod_dir = repo_path.split('/')[-1]
-    repod_path = repo_path[:-len(repod_dir)-1]
-    if os.path.exists(repod_dir):
-        os.chdir(repod_dir)
+    sys.path.insert(0, repo_dir)
+
+
+    if os.path.exists(repo_dir):
+        os.chdir(repo_dir)
+
+    ensure_git_initialized()
 
     set_env_for_agent()
-    cwd = os.getcwd()
-    logger.info(f"Current working directory: {cwd} and environ:{os.environ}")
-    
-    test_runner, test_runner_mode = get_test_runner_and_mode()
-    print(f"test_runner: {test_runner}, test_runner_mode: {test_runner_mode}")
 
     try:
-        logger.info(f"current files:{os.listdir()}")
-        logger.info(f"packages installed:{subprocess.check_output(['pip','list']).decode('utf-8')}")
-        logger.info(f"About to execute workflow...")
-        patch_text= fix_task_solve_workflow(
-            problem_text,
-            timeout=timeout,
-            run_id_1=run_id,
-            test_runner=test_runner,
-            test_runner_mode=test_runner_mode
-        )
-        logger.info(f"workflow execution completed, patch length: {len(patch_text)}")
+        problem_type = check_problem_type(input_dict.get("problem_statement"))
 
-        os.system("git reset --hard")
-
+        if problem_type == PROBLEM_TYPE_FIX:
+            result = process_fix_task(input_dict)
+        else:
+            result = process_create_task(input_dict)
     except Exception as e:
-        import traceback  # Ensure traceback is accessible
-        error_info = f"Error: {e}, {traceback.format_exc()}"
-        logger.error(f"[CRITICAL] Exception in task processing: {error_info}")
-        logs.append(error_info)
-    finally:
-        os.chdir(cwd)
+        result = process_fix_task(input_dict)
 
-    print(f"[CRITICAL] task processor returning patch length: {len(patch_text)}")
-    print(f"[CRITICAL] patch: {patch_text}")
-    return patch_text
+    os.system("git reset --hard")
+
+    return result
 
 def check_problem_type(problem_statement: str) -> str:
     retry = 0
@@ -1912,83 +2293,72 @@ def post_process_instruction(instruction: str) -> str:
     processed_instruction = re.sub(pattern, replace_text_block, instruction, flags=re.DOTALL)
     return processed_instruction
 
-def determine_model_order(problem_statement: str) -> list:
-    """Determine model priority via LLM routing based on the problem statement.
-
-    The router LLM must return strict JSON indicating the first and second models.
-    Falls back to a safe default if parsing fails.
-    """
-    try:
-        system_prompt = (
-            "You are a model router. Choose the best first LLM to solve a Python\n"
-            "coding challenge given its problem statement, and then the second LLM.\n"
-            "Only consider these options (use exact identifiers):\n"
-            f"1) {DEEPSEEK_MODEL_NAME} (stronger reasoning, graphs/backtracking/parsers)\n"
-            f"2) {QWEN_MODEL_NAME} (stronger implementation, string/data wrangling/spec-following)\n\n"
-            "Output MUST be a single JSON object with key 'order' mapping to a list of two\n"
-            "strings, the exact model identifiers, best-first. No explanations."
-        )
-
-        user_prompt = (
-            "Problem statement to route:\n\n" + (problem_statement or "").strip()
-        )
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-
-        raw = EnhancedNetwork.make_request(messages, model=DEEPSEEK_MODEL_NAME)
-
-        # Normalize potential fenced responses
-        cleaned = raw.strip()
-        cleaned = cleaned.replace('```json', '```')
-        if cleaned.startswith('```') and cleaned.endswith('```'):
-            cleaned = cleaned.strip('`').strip()
-
-        try:
-            data = json.loads(cleaned)
-        except Exception:
-            match = re.search(r"\{[\s\S]*\}", cleaned)
-            data = json.loads(match.group(0)) if match else {}
-
-        order = []
-        if isinstance(data, dict):
-            if isinstance(data.get('order'), list):
-                order = data['order']
-            elif 'first' in data and 'second' in data:
-                order = [data['first'], data['second']]
-
-        alias_map = {
-            DEEPSEEK_MODEL_NAME.lower(): DEEPSEEK_MODEL_NAME,
-            QWEN_MODEL_NAME.lower(): QWEN_MODEL_NAME,
-            'deepseek': DEEPSEEK_MODEL_NAME,
-            'qwen': QWEN_MODEL_NAME,
+def generate_solution_with_multi_step_reasoning(problem_statement: str, code_skeleton: str) -> str:
+    retry = 0
+    code_generation_messages = [
+        {
+            "role": "system",
+            "content": GENERATE_SOLUTION_WITH_MULTI_STEP_REASONING_PROMPT
+        },
+        {
+            "role": "user",
+            "content": f"Problem Statement:\n{problem_statement}\n\nInitial python files:\n{code_skeleton}\nGenerate the complete and correct implementation in python files.\n\nSTRICT REQUIREMENT: You **MUST** output the **file name** along with file content.\nexample:\n```python\na.py\ncontents of a.py\n\nb.py\ncontents of b.py\n```"
         }
+    ]
+    while retry < 10:
+        try:
+            code_response = EnhancedNetwork.make_request(code_generation_messages, model=QWEN_MODEL_NAME)
+            logger.info("Step 1 - Code Generation completed")
+            
+            # Step 5: Infinite Loop Check and Validation
+            loop_check_messages = [
+                {
+                    "role": "system",
+                    "content": INFINITE_LOOP_CHECK_PROMPT
+                },
+                {
+                    "role": "user",
+                    "content": f"Generated Code:\n{code_response}\n\nAnalyze this code for potential infinite loops and provide a corrected version if any issues are found. Return ONLY the final Python code."
+                }   
+            ]
+            
+            loop_check_response = EnhancedNetwork.make_request(loop_check_messages, model=QWEN_MODEL_NAME)
+            logger.info("Step 2 - Infinite Loop Check completed")
 
-        mapped = []
-        for item in order:
-            if not isinstance(item, str):
+            # Clean up the final response (use loop check response as it's the final validated version)
+            solution = loop_check_response.strip()
+            if solution.startswith('```python'):
+                solution = solution[9:]
+            if solution.startswith('```'):
+                solution = solution[3:]
+            if solution.endswith('```'):
+                solution = solution[:-3]
+            solution = solution.strip()
+            
+            lines = solution.split("\n")
+            if lines[0].endswith(".py") == False:
+                retry += 1
+                code_generation_messages.append({"role": "assistant", "content": code_response})
+                code_generation_messages.append({"role": "user", "content": f"Include file name in the response. example:\n```python\na.py\ncontents of a.py\n\nb.py\ncontents of b.py\n```"})
+                print(f"Retrying because the first line is not a python file name:\n {solution}")
                 continue
-            key = item.strip().lower()
-            if key in alias_map and alias_map[key] not in mapped:
-                mapped.append(alias_map[key])
 
-        for candidate in [DEEPSEEK_MODEL_NAME, QWEN_MODEL_NAME]:
-            if candidate not in mapped:
-                mapped.append(candidate)
-            if len(mapped) == 2:
-                break
-
-        logger.info(f"[MODEL-ROUTER] Selected model order via LLM: {mapped}")
-        return mapped[:2]
-    except Exception as e:
-        logger.warning(f"[MODEL-ROUTER] Routing failed ({e}); using safe default order")
-        return [QWEN_MODEL_NAME, DEEPSEEK_MODEL_NAME]
+            logger.info("Multi-step reasoning solution generation completed successfully with infinite loop validation")
+            return solution
+        except Exception as e:
+            retry += 1
+            print(f"Exception in generate_solution_with_multi_step_reasoning: {e}")
+            time.sleep(2)
+    
+    if retry >= 10:
+        logger.error("Multi-step reasoning solution generation failed")
+        return ""
+    
+    return ""
 
 def generate_initial_solution(problem_statement: str, code_skeleton: str) -> str:
     models = determine_model_order(problem_statement)
-
+    
     retry = 0
     while retry < 10:
         try:
@@ -2056,6 +2426,7 @@ def generate_testcases_with_multi_step_reasoning(problem_statement: str, files_t
             testcode_response = EnhancedNetwork.make_request(test_generation_messages, model=QWEN_MODEL_NAME)
             logger.info("Step 1 - Testcase Generation completed")
             
+            # Step 5: Infinite Loop Check and Validation
             testcases_check_messages = [
                 {
                     "role": "system",
@@ -2070,6 +2441,7 @@ def generate_testcases_with_multi_step_reasoning(problem_statement: str, files_t
             testcode_checked_response = EnhancedNetwork.make_request(testcases_check_messages, model=QWEN_MODEL_NAME)
             logger.info("Step 2 - Testcase check completed")
 
+            # Clean up the final response (use loop check response as it's the final validated version)
             testcases = testcode_checked_response.strip()
             if testcases.startswith('```python'):
                 testcases = testcases[9:]
@@ -2100,72 +2472,60 @@ def generate_testcases_with_multi_step_reasoning(problem_statement: str, files_t
     
     return ""
 
-def generate_solution_with_multi_step_reasoning(problem_statement: str, code_skeleton: str) -> str:
+def generate_test_files(problem_statement: str, files_to_test: str, code_skeleton: str) -> str:
     retry = 0
-    code_generation_messages = [
-        {
-            "role": "system",
-            "content": GENERATE_SOLUTION_WITH_MULTI_STEP_REASONING_PROMPT
-        },
-        {
-            "role": "user",
-            "content": f"Problem Statement:\n{problem_statement}\n\nInitial python files:\n{code_skeleton}\nGenerate the complete and correct implementation in python files.\n\nSTRICT REQUIREMENT: You **MUST** output the **file name** along with file content.\nexample:\n```python\na.py\ncontents of a.py\n\nb.py\ncontents of b.py\n```"
-        }
-    ]
     while retry < 10:
         try:
-            code_response = EnhancedNetwork.make_request(code_generation_messages, model=QWEN_MODEL_NAME)
-            logger.info("Step 1 - Code Generation completed")
+            logger.info("Starting test cases generation")
             
-            loop_check_messages = [
-                {
-                    "role": "system",
-                    "content": INFINITE_LOOP_CHECK_PROMPT
-                },
-                {
-                    "role": "user",
-                    "content": f"Generated Code:\n{code_response}\n\nAnalyze this code for potential infinite loops and provide a corrected version if any issues are found. Return ONLY the final Python code."
-                }   
-            ]
+            testcases = generate_testcases_with_multi_step_reasoning(problem_statement, files_to_test, code_skeleton)
             
-            loop_check_response = EnhancedNetwork.make_request(loop_check_messages, model=QWEN_MODEL_NAME)
-            logger.info("Step 2 - Infinite Loop Check completed")
-
-            # Clean up the final response (use loop check response as it's the final validated version)
-            solution = loop_check_response.strip()
-            if solution.startswith('```python'):
-                solution = solution[9:]
-            if solution.startswith('```'):
-                solution = solution[3:]
-            if solution.endswith('```'):
-                solution = solution[:-3]
-            solution = solution.strip()
+            if testcases:
+                logger.info("Generated testcases successfully using multi-step reasoning")
+                return testcases
+            else:
+                logger.warning("Multi-step reasoning failed, falling back to single-step approach")
+                
+                # Fallback to original single-step approach if multi-step fails
+                messages = [
+                    {
+                        "role": "system",
+                        "content": GENERATE_INITIAL_TESTCASES_PROMPT
+                    },
+                    {
+                        "role": "user",
+                        "content": f"""Problem Statement:\n{problem_statement}\n\nPython files to test:\n{files_to_test}\n\nCode skeleton: \n{code_skeleton}\n\nGenerate the ground truth and edge case coveraging testcases."""
+                    }
+                ]
+                
+                response = EnhancedNetwork.make_request(messages, model=QWEN_MODEL_NAME)
+                
+                # Clean up the response
+                testcases = response.strip()
+                if testcases.startswith('```python'):
+                    testcases = testcases[9:]
+                if testcases.startswith('```'):
+                    testcases = testcases[3:]
+                if testcases.endswith('```'):
+                    testcases = testcases[:-3]
+                testcases = testcases.strip()
+                
+                logger.info("Generated testcases successfully using fallback approach")
+                return testcases
             
-            lines = solution.split("\n")
-            if lines[0].endswith(".py") == False:
-                retry += 1
-                code_generation_messages.append({"role": "assistant", "content": code_response})
-                code_generation_messages.append({"role": "user", "content": f"Include file name in the response. example:\n```python\na.py\ncontents of a.py\n\nb.py\ncontents of b.py\n```"})
-                print(f"Retrying because the first line is not a python file name:\n {solution}")
-                continue
-
-            logger.info("Multi-step reasoning solution generation completed successfully with infinite loop validation")
-            return solution
         except Exception as e:
+            logger.error(f"Error generating initial solution: {str(e)}")
             retry += 1
-            print(f"Exception in generate_solution_with_multi_step_reasoning: {e}")
             time.sleep(2)
     
     if retry >= 10:
-        logger.error("Multi-step reasoning solution generation failed")
+        logger.error("Failed to generate initial solution")
         return ""
-    
     return ""
-
-
 
 def extract_and_write_files(initial_solution: str, base_dir: str = ".") -> list:
     import os
+    import re
     
     created_files = []
     
@@ -2227,27 +2587,391 @@ def extract_and_write_files(initial_solution: str, base_dir: str = ".") -> list:
     return created_files
 
 
+def validate_solution_syntax_and_logic(solution_code: str, problem_statement: str, created_files: list) -> dict:
+    """
+    Validates solution code for obvious issues before running tests.
+    
+    Args:
+        solution_code: The generated solution code
+        problem_statement: Original problem statement
+        created_files: List of files created from the solution
+        
+    Returns:
+        Dictionary with validation results including:
+        - has_issues: bool
+        - severity: str (high/medium/low/none)
+        - issues: list of detected issues
+        - recommendations: list of suggestions
+    """
+    
+    def check_response(response: dict) -> tuple[bool, str]:
+        """Validates the validation response structure."""
+        required_keys = ["has_issues", "severity", "issues", "recommendations"]
+        
+        for key in required_keys:
+            if key not in response:
+                return False, f"Missing required key: {key}"
+        
+        if not isinstance(response["has_issues"], bool):
+            return False, "has_issues must be a boolean"
+        
+        if response["severity"] not in ["high", "medium", "low", "none"]:
+            return False, f"Invalid severity: {response['severity']}"
+        
+        if not isinstance(response["issues"], list):
+            return False, "issues must be a list"
+        
+        for issue in response["issues"]:
+            if not isinstance(issue, dict):
+                return False, "Each issue must be a dict"
+            if "category" not in issue or "description" not in issue:
+                return False, "Issue missing required fields"
+        
+        return True, ""
+    
+    # Main logic
+    retry = 0
+    max_retries = 3
+    
+    user_content = f"""
+# Problem Statement:
+{problem_statement}
+
+# Generated Solution Code:
+{solution_code}
+
+# Created Files:
+{', '.join(created_files)}
+"""
+    
+    messages = [
+        {"role": "system", "content": SOLUTION_VALIDATION_PROMPT},
+        {"role": "user", "content": user_content}
+    ]
+    
+    while retry < max_retries:
+        try:
+            response_text = EnhancedNetwork.make_request(messages, model=QWEN_MODEL_NAME, temperature=0)
+            
+            # Clean and parse
+            response_text = response_text.replace('```json', '').strip('```').strip()
+            json_response = json.loads(response_text)
+            
+            is_valid, error_msg = check_response(json_response)
+            
+            if is_valid:
+                severity = json_response['severity']
+                issue_count = len(json_response['issues'])
+                print(f"Solution Validation: Severity={severity}, Issues={issue_count}")
+                return json_response
+            else:
+                messages.append({"role": "assistant", "content": response_text})
+                messages.append({"role": "user", "content": f"Error: {error_msg}. Please fix and try again."})
+                
+        except Exception as e:
+            print(f"Validation attempt {retry+1} failed: {e}")
+            if retry < max_retries - 1:
+                messages.append({"role": "assistant", "content": response_text if 'response_text' in locals() else ""})
+                messages.append({"role": "user", "content": f"Exception: {str(e)}"})
+        
+        retry += 1
+        time.sleep(1)
+    
+    # Graceful failure - return neutral validation
+    print("Solution validation failed after all retries, assuming no issues")
+    return {
+        "has_issues": False,
+        "severity": "none",
+        "issues": [],
+        "recommendations": ["Validation failed, manual review recommended"]
+    }
+
+def analyze_test_coverage(
+    problem_statement: str,
+    test_code: str,
+    function_metadata: dict = None
+) -> dict:
+    """
+    Analyzes test coverage and identifies gaps in test requirements.
+    
+    Args:
+        problem_statement: The problem description
+        test_code: Generated test code to analyze
+        function_metadata: Optional function metadata for enhanced analysis
+        
+    Returns:
+        Dictionary with coverage analysis including:
+        - coverage_score: float (0.0 to 1.0)
+        - missing_requirements: list of missing test requirements
+        - missing_edge_cases: list of missing edge case tests
+        - recommendations: list of suggested improvements
+    """
+    
+    def check_response(response: dict) -> tuple[bool, str]:
+        """Validates the coverage analysis structure."""
+        required_keys = [
+            "coverage_score", 
+            "total_requirements",
+            "covered_requirements",
+            "missing_requirements",
+            "missing_edge_cases",
+            "recommendations"
+        ]
+        
+        for key in required_keys:
+            if key not in response:
+                return False, f"Missing required key: {key}"
+        
+        # Validate coverage_score
+        if not isinstance(response["coverage_score"], (int, float)):
+            return False, "coverage_score must be a number"
+        if not 0.0 <= response["coverage_score"] <= 1.0:
+            return False, "coverage_score must be between 0.0 and 1.0"
+        
+        # Validate covered_requirements
+        if not isinstance(response["covered_requirements"], list):
+            return False, "covered_requirements must be a list"
+        
+        for req in response["covered_requirements"]:
+            if not isinstance(req, dict):
+                return False, "Each covered requirement must be a dict"
+            if "requirement" not in req or "test_cases" not in req or "coverage" not in req:
+                return False, "covered_requirements missing required fields"
+            if req["coverage"] not in ["full", "partial"]:
+                return False, f"Invalid coverage value: {req['coverage']}"
+        
+        # Validate missing_requirements
+        if not isinstance(response["missing_requirements"], list):
+            return False, "missing_requirements must be a list"
+        
+        for req in response["missing_requirements"]:
+            if not isinstance(req, dict):
+                return False, "Each missing requirement must be a dict"
+            if "requirement" not in req or "severity" not in req:
+                return False, "missing_requirements missing required fields"
+            if req["severity"] not in ["high", "medium", "low"]:
+                return False, f"Invalid severity: {req['severity']}"
+        
+        return True, ""
+    
+    def prioritize_gaps(response: dict) -> dict:
+        """Sorts gaps by severity and adds priority scores."""
+        # Sort missing requirements by severity
+        severity_order = {"high": 3, "medium": 2, "low": 1}
+        response["missing_requirements"].sort(
+            key=lambda x: severity_order.get(x.get("severity", "low"), 0),
+            reverse=True
+        )
+        
+        for edge_case in response["missing_edge_cases"]:
+            if "severity" not in edge_case:
+                edge_case["severity"] = "medium"
+        
+        return response
+    
+    # Main logic
+    retry = 0
+    max_retries = 3
+    
+    user_content = f"""
+# Problem Statement:
+{problem_statement}
+
+# Generated Test Code:
+{test_code}
+"""
+    
+    if function_metadata:
+        user_content += f"\n# Function Metadata:\n{json.dumps(function_metadata, indent=2)}"
+    
+    messages = [
+        {"role": "system", "content": TEST_COVERAGE_ANALYSIS_PROMPT},
+        {"role": "user", "content": user_content}
+    ]
+    
+    while retry < max_retries:
+        try:
+            response_text = EnhancedNetwork.make_request(messages, model=QWEN_MODEL_NAME, temperature=0)
+            
+            # Clean and parse
+            response_text = response_text.replace('```json', '').strip('```').strip()
+            json_response = json.loads(response_text)
+            
+            is_valid, error_msg = check_response(json_response)
+            
+            if is_valid:
+                print(f"Test Coverage Analysis: Score={json_response['coverage_score']:.2%}, Missing={len(json_response['missing_requirements'])} requirements, {len(json_response['missing_edge_cases'])} edge cases")
+                return prioritize_gaps(json_response)
+            else:
+                messages.append({"role": "assistant", "content": response_text})
+                messages.append({"role": "user", "content": f"Error: {error_msg}. Please fix and try again."})
+                
+        except Exception as e:
+            print(f"Coverage analysis attempt {retry+1} failed: {e}")
+            if retry < max_retries - 1:
+                messages.append({"role": "assistant", "content": response_text})
+                messages.append({"role": "user", "content": f"Exception: {str(e)}"})
+        
+        retry += 1
+        time.sleep(1)
+    
+    # Graceful failure - return neutral coverage
+    print("Coverage analysis failed after all retries, returning neutral assessment")
+    return {
+        "coverage_score": 0.5,
+        "total_requirements": 0,
+        "covered_requirements": [],
+        "missing_requirements": [],
+        "missing_edge_cases": [],
+        "recommendations": ["Coverage analysis failed, manual review recommended"]
+    }
+
+def generate_missing_tests(coverage_analysis: dict, test_code: str, problem_statement: str) -> str:
+    """
+    Generates additional test code for missing requirements.
+    
+    Args:
+        coverage_analysis: Coverage analysis dict from analyze_test_coverage
+        test_code: Existing test code
+        problem_statement: Original problem statement
+        
+    Returns:
+        Augmented test code with missing tests added
+    """
+    if coverage_analysis["coverage_score"] >= 0.85:
+        print("[COVERAGE] Coverage is good (>= 85%), no additional tests needed")
+        return test_code  # Good enough coverage
+    
+    missing_tests = []
+    
+    # Extract suggested tests from analysis (high priority first)
+    for req in coverage_analysis["missing_requirements"]:
+        if req.get("severity") == "high" and "suggested_test" in req:
+            missing_tests.append(req["suggested_test"])
+    
+    # Add medium priority edge cases
+    for edge_case in coverage_analysis["missing_edge_cases"]:
+        if edge_case.get("severity") in ["high", "medium"] and "suggested_test" in edge_case:
+            missing_tests.append(edge_case["suggested_test"])
+    
+    if not missing_tests:
+        print("[COVERAGE] No suggested tests found in coverage analysis")
+        return test_code
+    
+    print(f"[COVERAGE] Adding {len(missing_tests)} missing tests to improve coverage")
+    
+    augmented = test_code.rstrip()
+    augmented += "\n\n    # Auto-generated tests for missing coverage\n"
+    for i, test in enumerate(missing_tests, 1):
+        augmented += f"\n    # Missing test {i}\n"
+        augmented += test + "\n"
+    
+    return augmented
+
 
 def process_create_task(input_dict):
+    global run_id
+    start_time = time.time()
     problem_statement = input_dict.get("problem_statement", "")
     problem_statement = post_process_instruction(problem_statement)
-    print(problem_statement)
 
     code_skeleton = get_code_skeleton()
-    start_time = time.time()
-    initial_solution = generate_initial_solution(problem_statement, code_skeleton)
-    print(initial_solution)
-    
-    # Extract and write files from the solution
-    created_files = extract_and_write_files(initial_solution)
-    print(f"Created or Updated {len(created_files)} files: {created_files}")
 
+    initial_solution = generate_initial_solution(problem_statement, code_skeleton)
+    
+    created_files = extract_and_write_files(initial_solution)
+    
+    # SOLUTION VALIDATION FEATURE
+    logger.info("="*80)
+    logger.info("[VALIDATION] STARTING SOLUTION SELF-VALIDATION")
+    logger.info("="*80)
+    
+    try:
+        validation_result = validate_solution_syntax_and_logic(
+            initial_solution,
+            problem_statement,
+            created_files
+        )
+        
+        logger.info(f"[VALIDATION] Has Issues: {validation_result['has_issues']}")
+        logger.info(f"[VALIDATION] Severity: {validation_result['severity']}")
+        logger.info(f"[VALIDATION] Issues Found: {len(validation_result['issues'])}")
+        
+        # Log high severity issues
+        high_severity_issues = [
+            issue for issue in validation_result['issues']
+            if issue.get('severity') == 'high'
+        ]
+        
+        if high_severity_issues:
+            logger.warning(f"[VALIDATION] HIGH SEVERITY ISSUES: {len(high_severity_issues)} critical issues detected!")
+            for issue in high_severity_issues[:3]:  # Log first 3
+                logger.warning(f"  - [{issue.get('category', 'Unknown')}] {issue.get('description', 'No description')}")
+        
+        # If high severity issues detected, log recommendations
+        if validation_result['severity'] == 'high':
+            logger.warning("[VALIDATION] High severity issues detected in solution!")
+            if validation_result['recommendations']:
+                logger.info(f"[VALIDATION] Recommendations: {len(validation_result['recommendations'])}")
+                for rec in validation_result['recommendations'][:5]:
+                    logger.info(f"  - {rec}")
+        else:
+            logger.info(f"[VALIDATION] Solution validation passed (severity: {validation_result['severity']})")
+    
+    except Exception as e:
+        logger.error(f"[VALIDATION] Validation failed: {e}")
+        logger.info("[VALIDATION] Continuing with original solution")
+    
+    logger.info("="*80)
     
     test_cases = generate_test_files(problem_statement, created_files, code_skeleton)
-    print(test_cases)
-    # Extract and write files from test cases
+    
+    print("="*80)
+    print("[COVERAGE] ANALYZING TEST COVERAGE")
+    print("="*80)
+    
+    try:
+        coverage_analysis = analyze_test_coverage(
+            problem_statement, 
+            test_cases, 
+            function_metadata=None
+        )
+        
+        print(f"[COVERAGE] Coverage Score: {coverage_analysis['coverage_score']:.2%}")
+        print(f"[COVERAGE] Covered Requirements: {len(coverage_analysis['covered_requirements'])}")
+        print(f"[COVERAGE] Missing Requirements: {len(coverage_analysis['missing_requirements'])}")
+        print(f"[COVERAGE] Missing Edge Cases: {len(coverage_analysis['missing_edge_cases'])}")
+        
+        # Log high severity gaps
+        high_severity_gaps = [
+            req for req in coverage_analysis['missing_requirements'] 
+            if req.get('severity') == 'high'
+        ]
+        if high_severity_gaps:
+            print(f"[COVERAGE] HIGH SEVERITY GAPS: {len(high_severity_gaps)} critical requirements missing!")
+            for gap in high_severity_gaps[:3]:  # Log first 3
+                print(f"  - {gap['requirement']}")
+        
+        # If coverage is below threshold, augment with missing tests
+        COVERAGE_THRESHOLD = 0.75
+        if coverage_analysis['coverage_score'] < COVERAGE_THRESHOLD:
+            print(f"[COVERAGE] Coverage below threshold ({coverage_analysis['coverage_score']:.2%} < {COVERAGE_THRESHOLD:.0%})")
+            print("[COVERAGE] Augmenting test cases with missing tests...")
+            
+            augmented_tests = generate_missing_tests(coverage_analysis, test_cases, problem_statement)
+            test_cases = augmented_tests
+            print("[COVERAGE] Tests augmented successfully")
+        else:
+            print(f"[COVERAGE] Coverage is good ({coverage_analysis['coverage_score']:.2%} >= {COVERAGE_THRESHOLD:.0%})")
+        
+    except Exception as e:
+        print(f"[COVERAGE] Coverage analysis failed: {e}")
+        print("[COVERAGE] Continuing with original test cases")
+    
+    print("="*80)
+    # ===============================================
+    
     test_files = extract_and_write_files(test_cases)
-    print(f"Created or Updated {len(test_files)} files: {test_files}")
 
     timeout = DEFAULT_TIMEOUT - (time.time()-start_time) - 60
     
@@ -2255,10 +2979,13 @@ def process_create_task(input_dict):
         problem_statement,
         timeout=timeout,
         run_id_1=run_id,
+        instance_id="",
         test_runner=f"unittest",
         test_runner_mode="FILE",
-        n_max_steps=30
+        n_max_steps=150
     )
+    
+    print(f"🍎🍎🍎🍎🍎🍎🍎🍎🍎🍎🍎🍎🍎🍎🍎🍎🍎🍎🍎🍎🍎🍎patch: {patch}")
 
     if patch is None:
         extract_and_write_files(initial_solution)
@@ -2267,113 +2994,83 @@ def process_create_task(input_dict):
     patch = tool_manager.get_final_git_patch()
     return patch
 
-def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: str,\
-    test_runner: str = "pytest", test_runner_mode: str = "FILE", n_max_steps = MAX_FIX_TASK_STEPS) -> tuple[str, List[str], List[str]]:
-    global run_id
-    run_id=run_id_1
-    cot=EnhancedCOT(latest_observations_to_keep=30)
-    tool_manager=FixTaskEnhancedToolManager(
-        available_tools=[
-            "get_file_content",
-            "save_file",
-            "get_approval_for_solution",
-            "get_functions",
-            "get_classes",
-            "search_in_all_files_content",
-            "search_in_specified_file_v2",
-            "start_over",
-            "run_repo_tests",
-            "run_code",
-            "apply_code_edit",
-            "generate_test_function",
-            "finish"
-        ],
-        test_runner=test_runner,
-        test_runner_mode=test_runner_mode
-    )
-    logger.info(f"Starting main agent execution...")
-    system_prompt = FIX_TASK_SYSTEM_PROMPT.format(tools_docs=tool_manager.get_tool_docs(),format_prompt=FORMAT_PROMPT_V0)
-    instance_prompt = FIX_TASK_INSTANCE_PROMPT_TEMPLATE.format(problem_statement=problem_statement)
-    
-    start_time = time.time()
-    logs: List[str] = []
-    logs.append(f"cwd: {os.getcwd()}")
-    logger.info(f"Starting workflow execution with {n_max_steps} max steps: timeout: {timeout} seconds : run_id: {run_id}")
-    
-    for step in range(n_max_steps):
-        logger.info(f"Execution step {step + 1}/{n_max_steps}")
-        
-        if time.time() - start_time > timeout:
-            cot.add_action(EnhancedCOT.Action(next_thought="global timeout reached",next_tool_name="",next_tool_args={},observation="",is_error=True,inference_error_counter={},request_data=[]))
-            break
+def generate_initial_solution(problem_statement: str, code_skeleton: str) -> str:
+    global libraries
 
-        messages: List[Dict[str, Any]] = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": instance_prompt},
-            ]
-        
-        messages.extend(cot.to_str())
+    code_generation_messages = [
+        {
+            "role": "system",
+            "content": GENERATE_SOLUTION_WITH_MULTI_STEP_REASONING_PROMPT.format(libraries=libraries)
+        },
+        {
+            "role": "user",
+            "content": f"Problem Statement:\n{problem_statement}\n\nInitial python files:\n{code_skeleton}\n\nGenerate the complete and correct implementation in python files.\n\nSTRICT REQUIREMENT: You **MUST** output the **file name** along with file content.\nexample:\n```python\na.py\ncontents of a.py\n\nb.py\ncontents of b.py\n```"
+        }
+    ]
+    code_response = EnhancedNetwork.make_request(code_generation_messages, model=QWEN_MODEL_NAME, temperature=0.0)
 
-        messages.append({"role": "system", "content": STOP_INSTRUCTION})
-    
-        if cot.is_thought_repeated():
-            logger.info(f"[TEST_PATCH_FIND] Thought repeated, adding DO NOT REPEAT TOOL CALLS instruction")
-            last_thought = cot.thoughts[-1]
-            messages.append({"role": "user", "content": DO_NOT_REPEAT_TOOL_CALLS.format(previous_response=f"next_tool_name:{last_thought.next_tool_name}\n next_tool_args:{last_thought.next_tool_args}")})
-    
-        try:
-            next_thought, next_tool_name, next_tool_args,raw_text,total_attempts,error_counter,messages = EnhancedNetwork.inference(messages, model=GLM_MODEL_NAME, run_id=run_id)
-        except Exception as e:
-            import traceback  # Ensure traceback is accessible
-            error_msg=f"\n\nERROR: {repr(e)} {traceback.format_exc()}"
-            logger.error(f"Inference error: {error_msg}")
-            cot.add_action(EnhancedCOT.Action(next_thought=error_msg,next_tool_name="",next_tool_args={},observation="",is_error=True,raw_response=raw_text,total_attempts=total_attempts),inference_error_counter=error_counter,request_data=messages)
-            break
-        
-        logger.info(f"About to execute operation: {next_tool_name}")
-       
-        try:
-            logger.info(f"next_thought: {next_thought}\nnext_tool_name: {next_tool_name}\nnext_tool_args: {next_tool_args}\n")
-            if '"' in next_tool_name or "'" in next_tool_name:
-                next_tool_name=next_tool_name.replace('"','')
-                next_tool_name=next_tool_name.replace("'","")
-                
-            next_observation = tool_manager.get_tool(next_tool_name)(**next_tool_args) if next_tool_args else tool_manager.get_tool(next_tool_name)()
-            logger.info(f"next_observation: {next_observation}")
-            cot.add_action(EnhancedCOT.Action(next_thought=next_thought,next_tool_name=next_tool_name,next_tool_args=next_tool_args,observation=next_observation,is_error=False,raw_response=raw_text,total_attempts=total_attempts,inference_error_counter=error_counter,request_data=messages))
-        except EnhancedToolManager.Error as e:
-            import traceback  # Ensure traceback is accessible
-            error_msg=f"observation: {e.message}"
-            logger.error(f"Tool error: {error_msg}")
-            cot.add_action(EnhancedCOT.Action(next_thought=next_thought,next_tool_name=next_tool_name,next_tool_args=next_tool_args,observation=error_msg,is_error=True,raw_response=raw_text,total_attempts=total_attempts,inference_error_counter=error_counter,request_data=messages))
-            continue
-        except Exception as e:
-            import traceback  # Ensure traceback is accessible
-            error_traceback=traceback.format_exc()
-            if isinstance(e,TypeError):
-                error_msg=f"observation: {str(e)}"
-            else:
-                error_msg=f"observation: {repr(e)} {error_traceback}"
-            logger.error(f"Tool error: {error_msg}")
-            cot.add_action(EnhancedCOT.Action(next_thought=next_thought,next_tool_name=next_tool_name,next_tool_args=next_tool_args,observation=error_msg,is_error=True,raw_response=raw_text,total_attempts=total_attempts,inference_error_counter=error_counter,request_data=messages))
-            continue
-        
-        if next_tool_name == "finish":
-            logger.info('[CRITICAL] Workflow called finish operation')
-            break
-        print(f"[CRITICAL] Completed step {step + 1}, continuing to next step")
-    else:
-        cot.add_action(EnhancedCOT.Action(next_thought="global timeout reached",next_tool_name="",next_tool_args={},observation="",is_error=True))
-        logger.info(f"[CRITICAL] Workflow completed after reaching MAX_STEPS ({n_max_steps})")
-        if n_max_steps < MAX_FIX_TASK_STEPS:
-            return None
-    
-    logger.info(f"[CRITICAL] Workflow execution completed after {step + 1} steps")
-    logger.info(f"[CRITICAL] About to generate final patch...")
-    patch = tool_manager.get_final_git_patch()
-    logger.info(f"Final Patch Generated..: Length: {len(patch)}")
+    library_check_messages = [
+        {
+            "role": "system",
+            "content": LIBRARY_CHECK_PROMPT.format(libraries=libraries)
+        },
+        {
+            "role": "user",
+            "content": f"Generated Code:\n{code_response}\n\nAnalyze this code for library constraint violations. Verify that ALL imports only use libraries from the allowed list. Provide a corrected version if any issues are found. Return ONLY the final Python code."
+        }   
+    ]
+    library_check_response = EnhancedNetwork.make_request(library_check_messages, model=QWEN_MODEL_NAME, temperature=0.0)
 
-    return patch
+    loop_check_messages = [
+        {
+            "role": "system",
+            "content": INFINITE_LOOP_CHECK_PROMPT
+        },
+        {
+            "role": "user",
+            "content": f"Generated Code:\n{library_check_response}\n\nAnalyze this code for potential infinite loops and provide a corrected version if any issues are found. Return ONLY the final Python code."
+        }   
+    ]
+    loop_check_response = EnhancedNetwork.make_request(loop_check_messages, model=QWEN_MODEL_NAME, temperature=0.0)
+
+    protocol_check_messages = [
+        {
+            "role": "system",
+            "content": PROTOCOL_PATTERN_CHECK_PROMPT
+        },
+        {
+            "role": "user",
+            "content": f"Generated Code:\n{loop_check_response}\n\nProblem Context:\n{problem_statement}\n\nAnalyze this code for protocol correctness (iterators, callbacks, state management). Provide a corrected version if any issues are found. Return ONLY the final Python code with file names."
+        }
+    ]
+    protocol_check_response = EnhancedNetwork.make_request(protocol_check_messages, model=QWEN_MODEL_NAME, temperature=0.0)
+
+    final_check_messages = [
+        {
+            "role": "system",
+            "content": FINAL_CORRECTNESS_CHECK_PROMPT
+        },
+        {
+            "role": "user",
+            "content": f"Generated Code:\n{protocol_check_response}\n\nProblem Statement:\n{problem_statement}\n\nCode Skeleton:\n{code_skeleton}\n\nPerform final validation: check algorithm correctness, semantic alignment, edge cases, and specification compliance. Provide a corrected version if any issues are found. Return ONLY the final Python code with file names."
+        }
+    ]
+    final_check_response = EnhancedNetwork.make_request(final_check_messages, model=QWEN_MODEL_NAME, temperature=0.0)
+    
+    solution = final_check_response.strip()
+
+    # Clean up code fences
+    if solution.startswith('```python'):
+        solution = solution[9:]
+    if solution.startswith('```'):
+        solution = solution[3:]
+    if solution.endswith('```'):
+        solution = solution[:-3]
+    solution = solution.strip()
+    
+    logger.info("[VALIDATION COMPLETE] 5-stage validation finished")
+    return solution
+
 
 def get_code_skeleton() -> str:
     # Initialize the result string
@@ -2573,83 +3270,171 @@ def get_test_runner_and_mode():
 
     return test_runner, test_runner_mode
 
-def agent_main(input_dict: Dict[str, Any], repo_dir: str = "repo"):
-    """Legacy interface wrapper for backwards compatibility."""
-    global DEFAULT_PROXY_URL, DEFAULT_TIMEOUT, run_id
-    run_id = os.getenv("RUN_ID", "")
-    repo_dir = os.path.abspath(repo_dir)
+def process_fix_task(input_dict: Dict[str, Any]):
+    """Main entry point for task processing and code modification.
 
-    sys.path.insert(0, repo_dir)
-
-
-    if os.path.exists(repo_dir):
-        os.chdir(repo_dir)
-
-    ensure_git_initialized()
+    Parameters
+    ----------
+    input_dict : dict
+        Configuration dictionary containing the task specification.
+        Required key: 'problem_statement' with task details.
+        Optional keys: 'run_id', 'instance_id' for tracking purposes.
+    """
+    global run_id
+    # setting environment to include current working directory and lib directory
+    problem_text = input_dict.get("problem_statement")
+    if not problem_text:
+        raise ValueError("input_dict must contain 'problem_statement'.")
+    timeout = int(os.getenv("AGENT_TIMEOUT", str(DEFAULT_TIMEOUT)))
+    
+    logs = []
+    patch_text = ""  # Initialize to avoid UnboundLocalError
+    
+    repo_path = os.getenv("REPO_PATH", "/sandbox/repo")
+    repod_dir = repo_path.split('/')[-1]
+    repod_path = repo_path[:-len(repod_dir)-1]
+    if os.path.exists(repod_dir):
+        os.chdir(repod_dir)
 
     set_env_for_agent()
+    cwd = os.getcwd()
+    logger.info(f"Current working directory: {cwd} and environ:{os.environ}")
+    
+    test_runner, test_runner_mode = get_test_runner_and_mode()
+    print(f"test_runner: {test_runner}, test_runner_mode: {test_runner_mode}")
 
     try:
-        problem_type = check_problem_type(input_dict.get("problem_statement"))
+        logger.info(f"current files:{os.listdir()}")
+        logger.info(f"packages installed:{subprocess.check_output(['pip','list']).decode('utf-8')}")
+        logger.info(f"About to execute workflow...")
+        patch_text= fix_task_solve_workflow(
+            problem_text,
+            timeout=timeout,
+            run_id_1=run_id,
+            test_runner=test_runner,
+            test_runner_mode=test_runner_mode
+        )
+        logger.info(f"workflow execution completed, patch length: {len(patch_text)}")
 
-        if problem_type == PROBLEM_TYPE_FIX:
-            result = process_fix_task(input_dict)
-        else:
-            result = process_create_task(input_dict)
+        os.system("git reset --hard")
+
     except Exception as e:
-        result = process_fix_task(input_dict)
+        import traceback  # Ensure traceback is accessible
+        error_info = f"Error: {e}, {traceback.format_exc()}"
+        logger.error(f"[CRITICAL] Exception in task processing: {error_info}")
+        logs.append(error_info)
+    finally:
+        os.chdir(cwd)
 
-    os.system("git reset --hard")
+    print(f"[CRITICAL] task processor returning patch length: {len(patch_text)}")
+    print(f"[CRITICAL] patch: {patch_text}")
+    return patch_text
 
-    return result
-
-def generate_test_files(problem_statement: str, files_to_test: str, code_skeleton: str) -> str:
-    retry = 0
-    while retry < 10:
-        try:
-            logger.info("Starting test cases generation")
-            
-            testcases = generate_testcases_with_multi_step_reasoning(problem_statement, files_to_test, code_skeleton)
-            
-            if testcases:
-                logger.info("Generated testcases successfully using multi-step reasoning")
-                return testcases
-            else:
-                logger.warning("Multi-step reasoning failed, falling back to single-step approach")
-                
-                # Fallback to original single-step approach if multi-step fails
-                messages = [
-                    {
-                        "role": "system",
-                        "content": GENERATE_INITIAL_TESTCASES_PROMPT
-                    },
-                    {
-                        "role": "user",
-                        "content": f"""Problem Statement:\n{problem_statement}\n\nPython files to test:\n{files_to_test}\n\nCode skeleton: \n{code_skeleton}\n\nGenerate the ground truth and edge case coveraging testcases."""
-                    }
-                ]
-                
-                response = EnhancedNetwork.make_request(messages, model=QWEN_MODEL_NAME)
-                
-                # Clean up the response
-                testcases = response.strip()
-                if testcases.startswith('```python'):
-                    testcases = testcases[9:]
-                if testcases.startswith('```'):
-                    testcases = testcases[3:]
-                if testcases.endswith('```'):
-                    testcases = testcases[:-3]
-                testcases = testcases.strip()
-                
-                logger.info("Generated testcases successfully using fallback approach")
-                return testcases
-            
-        except Exception as e:
-            logger.error(f"Error generating initial solution: {str(e)}")
-            retry += 1
-            time.sleep(2)
+def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: str, instance_id: str = "", \
+    test_runner: str = "pytest", test_runner_mode: str = "FILE", n_max_steps = MAX_FIX_TASK_STEPS) -> tuple[str, List[str], List[str]]:
+    global run_id
+    run_id=run_id_1
+    cot=EnhancedCOT(latest_observations_to_keep=30)
+    tool_manager=FixTaskEnhancedToolManager(
+        available_tools=[
+            "get_file_content",
+            "save_file",
+            "get_approval_for_solution",
+            "get_functions",
+            "get_classes",
+            "search_in_all_files_content",
+            "search_in_specified_file_v2",
+            "start_over",
+            "run_repo_tests",
+            "run_code",
+            "apply_code_edit",
+            "generate_test_function",
+            "finish"
+        ],
+        test_runner=test_runner,
+        test_runner_mode=test_runner_mode
+    )
+    logger.info(f"Starting main agent execution...")
+    system_prompt = FIX_TASK_SYSTEM_PROMPT.format(tools_docs=tool_manager.get_tool_docs(),format_prompt=FORMAT_PROMPT_V0)
+    instance_prompt = FIX_TASK_INSTANCE_PROMPT_TEMPLATE.format(problem_statement=problem_statement)
     
-    if retry >= 10:
-        logger.error("Failed to generate initial solution")
-        return ""
-    return ""
+    start_time = time.time()
+    logs: List[str] = []
+    logs.append(f"cwd: {os.getcwd()}")
+    logger.info(f"Starting workflow execution with {n_max_steps} max steps: timeout: {timeout} seconds : run_id: {run_id}")
+    
+    for step in range(n_max_steps):
+        logger.info(f"Execution step {step + 1}/{n_max_steps}")
+        
+        if time.time() - start_time > timeout:
+            cot.add_action(EnhancedCOT.Action(next_thought="global timeout reached",next_tool_name="",next_tool_args={},observation="",is_error=True,inference_error_counter={},request_data=[]))
+            break
+
+        messages: List[Dict[str, Any]] = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": instance_prompt},
+            ]
+        
+        messages.extend(cot.to_str())
+
+        messages.append({"role": "system", "content": STOP_INSTRUCTION})
+    
+        if cot.is_thought_repeated():
+            logger.info(f"[TEST_PATCH_FIND] Thought repeated, adding DO NOT REPEAT TOOL CALLS instruction")
+            last_thought = cot.thoughts[-1]
+            messages.append({"role": "user", "content": DO_NOT_REPEAT_TOOL_CALLS.format(previous_response=f"next_tool_name:{last_thought.next_tool_name}\n next_tool_args:{last_thought.next_tool_args}")})
+    
+        try:
+            next_thought, next_tool_name, next_tool_args,raw_text,total_attempts,error_counter,messages = EnhancedNetwork.inference(messages, model=GLM_MODEL_NAME, run_id=run_id, temperature=0.0)
+        except Exception as e:
+            import traceback  # Ensure traceback is accessible
+            error_msg=f"\n\nERROR: {repr(e)} {traceback.format_exc()}"
+            logger.error(f"Inference error: {error_msg}")
+            cot.add_action(EnhancedCOT.Action(next_thought=error_msg,next_tool_name="",next_tool_args={},observation="",is_error=True,raw_response=raw_text,total_attempts=total_attempts),inference_error_counter=error_counter,request_data=messages)
+            break
+        
+        logger.info(f"About to execute operation: {next_tool_name}")
+       
+        try:
+            logger.info(f"next_thought: {next_thought}\nnext_tool_name: {next_tool_name}\nnext_tool_args: {next_tool_args}\n")
+            if '"' in next_tool_name or "'" in next_tool_name:
+                next_tool_name=next_tool_name.replace('"','')
+                next_tool_name=next_tool_name.replace("'","")
+                
+            next_observation = tool_manager.get_tool(next_tool_name)(**next_tool_args) if next_tool_args else tool_manager.get_tool(next_tool_name)()
+            logger.info(f"next_observation: {next_observation}")
+            cot.add_action(EnhancedCOT.Action(next_thought=next_thought,next_tool_name=next_tool_name,next_tool_args=next_tool_args,observation=next_observation,is_error=False,raw_response=raw_text,total_attempts=total_attempts,inference_error_counter=error_counter,request_data=messages))
+        except EnhancedToolManager.Error as e:
+            import traceback  # Ensure traceback is accessible
+            error_msg=f"observation: {e.message}"
+            logger.error(f"Tool error: {error_msg}")
+            cot.add_action(EnhancedCOT.Action(next_thought=next_thought,next_tool_name=next_tool_name,next_tool_args=next_tool_args,observation=error_msg,is_error=True,raw_response=raw_text,total_attempts=total_attempts,inference_error_counter=error_counter,request_data=messages))
+            continue
+        except Exception as e:
+            import traceback  # Ensure traceback is accessible
+            error_traceback=traceback.format_exc()
+            if isinstance(e,TypeError):
+                error_msg=f"observation: {str(e)}"
+            else:
+                error_msg=f"observation: {repr(e)} {error_traceback}"
+            logger.error(f"Tool error: {error_msg}")
+            cot.add_action(EnhancedCOT.Action(next_thought=next_thought,next_tool_name=next_tool_name,next_tool_args=next_tool_args,observation=error_msg,is_error=True,raw_response=raw_text,total_attempts=total_attempts,inference_error_counter=error_counter,request_data=messages))
+            continue
+        
+        if next_tool_name == "finish":
+            logger.info('[CRITICAL] Workflow called finish operation')
+            break
+        print(f"[CRITICAL] Completed step {step + 1}, continuing to next step")
+    else:
+        # This happens if we exit the loop without breaking (reached MAX_STEPS)
+        cot.add_action(EnhancedCOT.Action(next_thought="global timeout reached",next_tool_name="",next_tool_args={},observation="",is_error=True))
+        logger.info(f"[CRITICAL] Workflow completed after reaching MAX_STEPS ({n_max_steps})")
+        if n_max_steps < MAX_FIX_TASK_STEPS: # This is create task case and failed with smaller fix steps so try to use original solution supposing generated testcases are wrong
+            return None
+    
+    logger.info(f"[CRITICAL] Workflow execution completed after {step + 1} steps")
+    logger.info(f"[CRITICAL] About to generate final patch...")
+    patch = tool_manager.get_final_git_patch()
+    logger.info(f"Final Patch Generated..: Length: {len(patch)}")
+
+    return patch

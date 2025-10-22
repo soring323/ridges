@@ -20,6 +20,73 @@ import csv
 import logging
 from uuid import uuid4
 
+DEFAULT_PROXY_URL = os.getenv("SANDBOX_PROXY_URL", "http://localhost:8000")
+DEFAULT_TIMEOUT = int(os.getenv("AGENT_TIMEOUT", "2000"))
+
+PROBLEM_TYPE_CREATE = "CREATE"
+PROBLEM_TYPE_FIX = "FIX"
+
+GLM_MODEL_NAME = "zai-org/GLM-4.5-FP8"
+KIMI_MODEL_NAME = "moonshotai/Kimi-K2-Instruct"
+DEEPSEEK_MODEL_NAME = "deepseek-ai/DeepSeek-V3-0324"
+QWEN_MODEL_NAME = "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"
+AGENT_MODELS=[GLM_MODEL_NAME, KIMI_MODEL_NAME, DEEPSEEK_MODEL_NAME, QWEN_MODEL_NAME]
+MAX_FIX_TASK_STEPS = 400
+
+FIX_TASK_SYSTEM_PROMPT = textwrap.dedent("""
+# Hey there! You're a Coding Assistant 🚀. I have uploaded all files of a python repository. Your current working directory is at the root of that repo. You will be provided with a problem statement and you need to make the necessary changes to fix the issue.
+
+## Follow these steps to fix the issue:
+1. As a first step, find the relevant files in the repo to work on.
+2. Localise the code causing the issue.
+3. Edit the sourcecode of the repo to resolve the issue.
+4. Think about edgecases and make sure the fix handles them as well.
+5. Code must always be backward compatible unless explicitly mentioned otherwise in the problem statement.
+6. Thoroughly check the entire code base to ensure the changes made are exhaustive and does not break any other functionality.
+7. Thoroughly check the entire code base to ensure the changes user requested are only limited to the ones you have identified.
+8. Never edit/update the existing test files directly when validating a hypothesis. Instead, when you need a new or focused test to reproduce or protect the fix, use the dedicated test generation tool.
+9. Do not create any new files or directories unless absolutely necessary for the fix. Generated tests are allowed but are excluded from the final patch automatically.
+10. Always check all the test cases which will be impacted with your change and ensure they don't fail.
+11. You need to propose at least 2 meaningfully different and accurate solutions to the problem to the user for approval.
+12. You need to look at both expected output mentioned in the problem statement AND the output in the most relevant test case. This is very important.
+13. If you find that the error while running the run_code or run_repo_tests tool due to missing dependencies, do not try to solve it as you don't have any internet access.
+
+## Multi-file awareness (critical):
+- Tests and patch contexts may span multiple files. Do not stop after the first similar match or applied fix.
+- Keep searching the repository after each match and apply consistent changes to every relevant file before finishing.
+- Prefer using `search_in_all_files_content` to enumerate matches across the codebase and `search_in_specified_file_v2` to drill into each file; iterate until no applicable occurrences remain.
+- Re-run tests only after covering all discovered occurrences to avoid partial fixes.
+
+## Test generation guidance:
+- Use `generate_test_function(file_path, test_function_code, position)` after discovering the most relevant existing test file.
+- Prefer `position="auto"` which inserts after imports or before the `if __name__ == "__main__":` block when present, falling back to append.
+- Generated tests (new files or appended functions) are tracked and excluded from the final patch automatically, so they must not show up in the final diff.
+- Keep generated tests minimal and focused on the bug and its edge cases.
+- Note that current test functions should be passed originally and generated test function is FAIL_TO_PASS.
+
+You have access to the following tools:-
+{tools_docs}
+
+{format_prompt}
+""")
+
+STOP_INSTRUCTION=textwrap.dedent("""
+# 🎨 
+DO NOT generate `observation:` in your response. It will be provided by user for you.
+Generate only SINGLE triplet of `next_thought`, `next_tool_name`, `next_tool_args` in your response.
+""")
+
+PROBLEM_TYPE_CHECK_PROMPT = textwrap.dedent(
+'''
+You are the problem type checker that will categories problem type into:
+
+1. CREATE: If the problem statement is about creating a new functionality from scratch.
+2. FIX: If the problem statement is about fixing a bug, creating a new functionality or improving the existing codebase.
+
+Only respond with the "FIX" or "CREATE".
+'''
+)
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
@@ -33,74 +100,31 @@ stream_handler.setFormatter(formatter)
 logger.addHandler(stream_handler)
 run_id=None
 
-PROBLEM_TYPE_CHECK_PROMPT = textwrap.dedent(
-'''
-You are the problem type checker that will categories problem type into:
+TESTCASES_CHECK_PROMPT = textwrap.dedent(
+"""
+You are an expert testcases reviewer specializing in invalid testcases detection and prevention. Your task is to analyze the generated test code if it's all valid for the problem statement.
 
-1. CREATE: If the problem statement is about creating a new functionality from scratch.
-2. FIX: If the problem statement is about fixing a bug, creating a new functionality or improving the existing codebase.
+Important:
+1. Check for incorrect/invalid intput/output pair based on the problem statement and fix them or remove if it's impossible to fix
+2. Check if testcases are not covering critical edgecases for the problem statement and add missing testcases
+3. Minimize all testcases as you have context and generation limit
 
-Only respond with the "FIX" or "CREATE".
-'''
+If no invalid testcases are detected and covered all critical edge cases:
+- Return the original code unchanged
+
+STRICT REQUIREMENT: Return the final Python test code along with their file names. Do not include any explanations, comments, or additional text.
+
+example:
+```python
+test_a.py
+contents of test_a.py
+
+test_b.py
+contents of test_b.py
+```
+"""
 )
 
-
-FORMAT_PROMPT_V0=textwrap.dedent("""
-**📝 Response Format Requirements**
-
-1. **Strict Triplet Format**:
-   - `next_thought`: Detailed reasoning (include:
-     - Problem understanding
-     - Code analysis
-     - Solution justification
-     - Validation plan)
-   - `next_tool_name`: Must be an exact tool name from the tool list
-   - `next_tool_args`: Valid JSON with:
-     - Proper escaping
-     - No trailing commas
-     - Tool-specific parameters
-
-2. **Error Handling Format**:
-   - For errors: 
-     next_thought: "Error: [detailed explanation]"
-     next_tool_name: ""
-     next_tool_args: {}
-
-3. **Example Valid Format**:
-   next_thought: "I'll fix the JSON parsing issue by adding proper error handling and validation"
-   next_tool_name: "apply_code_edit"
-   next_tool_args: {
-     "file_path": "network.py",
-     "search": "return json.loads(response)",
-     "replace": "try:\n    return json.loads(response)\nexcept JSONDecodeError:\n    logger.error(f'Invalid JSON: {{response}}')\n    raise"
-   }
-
-4. **Invalid Format Examples** (Avoid These):
-   - Missing any of the three required fields
-   - JSON syntax errors in next_tool_args
-   - Extra text outside the triplet format
-   - Using incorrect tool names
-   - Not quoting special characters properly
-""")
-
-STOP_INSTRUCTION=textwrap.dedent("""
-# 🎨 
-DO NOT generate `observation:` in your response. It will be provided by user for you.
-Generate only SINGLE triplet of `next_thought`, `next_tool_name`, `next_tool_args` in your response.
-""")
-
-DEFAULT_PROXY_URL = os.getenv("SANDBOX_PROXY_URL", "http://localhost:8000")
-DEFAULT_TIMEOUT = int(os.getenv("AGENT_TIMEOUT", "2000"))
-
-PROBLEM_TYPE_CREATE = "CREATE"
-PROBLEM_TYPE_FIX = "FIX"
-
-GLM_MODEL_NAME = "zai-org/GLM-4.5-FP8"
-KIMI_MODEL_NAME = "moonshotai/Kimi-K2-Instruct"
-DEEPSEEK_MODEL_NAME = "deepseek-ai/DeepSeek-V3-0324"
-QWEN_MODEL_NAME = "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"
-AGENT_MODELS=[GLM_MODEL_NAME, KIMI_MODEL_NAME, DEEPSEEK_MODEL_NAME, QWEN_MODEL_NAME]
-MAX_FIX_TASK_STEPS = 400
 
 DO_NOT_REPEAT_TOOL_CALLS=textwrap.dedent("""
 You're not allowed to repeat the same tool call with the same arguments.
@@ -245,23 +269,71 @@ b.py
 """
 )
 
-FIX_TASK_SYSTEM_PROMPT = textwrap.dedent("""
-# Hey there! You're a Coding Assistant 🚀. I have uploaded all files of a python repository. Your current working directory is at the root of that repo. You will be provided with a problem statement and you need to make the necessary changes to fix the issue.
+FIX_TASK_FOR_FIXING_SYSTEM_PROMPT = textwrap.dedent("""
 
-## Follow these steps to fix the issue:
-1. As a first step, find the relevant files in the repo to work on.
-2. Localise the code causing the issue.
-3. Edit the sourcecode of the repo to resolve the issue.
-4. Think about edgecases and make sure the fix handles them as well.
-5. Code must always be backward compatible unless explicitly mentioned otherwise in the problem statement.
-6. Thoroughly check the entire code base to ensure the changes made are exhaustive and does not break any other functionality.
-7. Thoroughly check the entire code base to ensure the changes user requested are only limited to the ones you have identified.
-8. Never edit/update the existing test files directly when validating a hypothesis. Instead, when you need a new or focused test to reproduce or protect the fix, use the dedicated test generation tool.
-9. Do not create any new files or directories unless absolutely necessary for the fix. Generated tests are allowed but are excluded from the final patch automatically.
-10. Always check all the test cases which will be impacted with your change and ensure they don't fail.
-11. You need to propose at least 2 meaningfully different and accurate solutions to the problem to the user for approval.
-12. You need to look at both expected output mentioned in the problem statement AND the output in the most relevant test case. This is very important.
-13. If you find that the error while running the run_code or run_repo_tests tool due to missing dependencies, do not try to solve it as you don't have any internet access.
+# YOUR PRIMARY MISSION
+
+You are a CODEBASE CLEANER. Your goal: **ZERO FAILING TESTS in the repository**.
+The problem statement describes a bug - this is your **starting point**, not your only task.
+Your TRUE mission: Make the codebase clean with NO bugs (no failing tests).
+
+**FUNDAMENTAL PRINCIPLE: TEST CASES ARE THE SOURCE OF TRUTH**
+- Test cases define what is correct behavior
+- Your implementation must match test expectations
+- NEVER modify test cases to match your implementation
+- If tests fail, fix your code, not the tests
+
+## What "Success" Means
+
+✅ **SUCCESS** = ALL existing repository tests pass (ZERO failures)
+❌ **FAILURE** = ANY repository test fails
+
+The problem statement bug is just ONE bug. If your fix creates OTHER bugs (failing tests), you have FAILED.
+
+## Your Validation Method
+
+**PRIMARY (The Only Thing That Matters):**
+- `run_repo_tests_for_fixing(file_paths=['./tests/...'])` on existing test files
+- These tests were passing BEFORE you started
+- They MUST pass AFTER you finish
+- This is your SUCCESS CRITERIA
+
+**OPTIONAL (For Specific Cases Only):**
+- `generate_validation_test()` + `run_validation_test()` 
+- ONLY use if the problem statement bug has no existing test
+- This validates your specific fix works
+- BUT: Even if this passes, you're NOT done until run_repo_tests_for_fixing passes
+
+## The Critical Truth
+
+Imagine: You fix the problem statement bug ✓ BUT there is a failing tests ✗
+Result: You FAILED. The codebase is WORSE than before.
+
+## Your Workflow
+1. **Read problem statement** - understand the bug
+2. **Find and fix** the root cause
+3. **Run run_repo_tests_for_fixing()** - validate NO tests are broken
+4. **If ANY test fails** - you broke it, fix it or revise your approach
+5. **(Optional) Generate validation test** - only if problem statement has no test
+6. **Call submit_solution** - only when ALL tests pass
+
+## The Rules (No Exceptions)
+
+1. After code change → run run_repo_tests_for_fixing()
+2. If even ONE test fails → YOU broke it (no excuses about "unrelated")
+3. Cannot call submit_solution with failing tests → it will be REJECTED automatically
+4. "Problem statement fixed but tests fail" → YOU FAILED
+5. "My validation test passed" → IRRELEVANT if run_repo_tests_for_fixing fails
+
+## Common Wrong Excuses (DO NOT MAKE THESE)
+
+❌ "These failing tests don't directly involve what I was asked to fix"
+❌ "These tests are edge cases not in the problem statement"
+❌ "While there are X failing tests, these appear unrelated"
+❌ "The problem statement is fixed, so other failures don't matter"
+❌ "My validation test passed, so my fix is correct"
+❌ "I need to update the failing tests to match my implementation"
+❌ "The existing tests expect the old behavior, but the problem statement wants new behavior"
 
 ## Multi-file awareness (critical):
 - Tests and patch contexts may span multiple files. Do not stop after the first similar match or applied fix.
@@ -269,12 +341,26 @@ FIX_TASK_SYSTEM_PROMPT = textwrap.dedent("""
 - Prefer using `search_in_all_files_content` to enumerate matches across the codebase and `search_in_specified_file_v2` to drill into each file; iterate until no applicable occurrences remain.
 - Re-run tests only after covering all discovered occurrences to avoid partial fixes.
 
-## Test generation guidance:
-- Use `generate_test_function(file_path, test_function_code, position)` after discovering the most relevant existing test file.
-- Prefer `position="auto"` which inserts after imports or before the `if __name__ == "__main__":` block when present, falling back to append.
-- Generated tests (new files or appended functions) are tracked and excluded from the final patch automatically, so they must not show up in the final diff.
-- Keep generated tests minimal and focused on the bug and its edge cases.
-- Note that current test functions should be passed originally and generated test function is FAIL_TO_PASS.
+## CRITICAL RULE: TEST CASES ARE THE ABSOLUTE TRUTH
+
+🚨 **NEVER EDIT EXISTING TEST CASES** 🚨
+
+- Test cases are the SOURCE OF TRUTH - they define what is correct behavior
+- If your implementation doesn't match the test expectations, FIX YOUR IMPLEMENTATION
+- If test cases fail after your changes, you broke something - REVERT and try a different approach
+- The problem statement is just a starting point - test cases are the actual requirements
+- Even if the problem statement seems to contradict test cases, TRUST THE TEST CASES
+- Test cases were written by the original developers who understand the intended behavior
+- Your job is to make the code work according to the test cases, not to change the test cases
+
+## Important Guidelines
+
+- NEVER edit existing test files
+- Code must be backward compatible unless stated otherwise
+- Search entire codebase for similar patterns - fix ALL occurrences
+- Re-run tests after change
+- submit_solution will automatically verify tests - you CANNOT bypass this
+- If you can't fix failing tests, your approach is WRONG - revise it
 
 You have access to the following tools:-
 {tools_docs}
@@ -304,35 +390,46 @@ Output should be one of MODULE or FILE, No other texts are allowed.
 - FILE: When the test runner requires a file path to run the test (e.g. pytest, unittest, py.test, etc.).
 """)
 
-TESTCASES_CHECK_PROMPT = textwrap.dedent(
-"""
-You are an expert testcases reviewer specializing in invalid testcases detection and prevention. Your task is to analyze the generated test code if it's all valid for the problem statement.
+FORMAT_PROMPT_V0=textwrap.dedent("""
+**📝 Response Format Requirements**
 
-Important:
-1. Check for incorrect/invalid intput/output pair based on the problem statement and fix them or remove if it's impossible to fix
-2. Check if testcases are not covering critical edgecases for the problem statement and add missing testcases
-3. Minimize all testcases as you have context and generation limit
+1. **Strict Triplet Format**:
+   - `next_thought`: Detailed reasoning (include:
+     - Problem understanding
+     - Code analysis
+     - Solution justification
+     - Validation plan)
+   - `next_tool_name`: Must be an exact tool name from the tool list
+   - `next_tool_args`: Valid JSON with:
+     - Proper escaping
+     - No trailing commas
+     - Tool-specific parameters
 
-If no invalid testcases are detected and covered all critical edge cases:
-- Return the original code unchanged
+2. **Error Handling Format**:
+   - For errors: 
+     next_thought: "Error: [detailed explanation]"
+     next_tool_name: ""
+     next_tool_args: {}
 
-STRICT REQUIREMENT: Return the final Python test code along with their file names. Do not include any explanations, comments, or additional text.
+3. **Example Valid Format**:
+   next_thought: "I'll fix the JSON parsing issue by adding proper error handling and validation"
+   next_tool_name: "apply_code_edit"
+   next_tool_args: {
+     "file_path": "network.py",
+     "search": "return json.loads(response)",
+     "replace": "try:\n    return json.loads(response)\nexcept JSONDecodeError:\n    logger.error(f'Invalid JSON: {{response}}')\n    raise"
+   }
 
-example:
-```python
-test_a.py
-contents of test_a.py
-
-test_b.py
-contents of test_b.py
-```
-"""
-)
-
+4. **Invalid Format Examples** (Avoid These):
+   - Missing any of the three required fields
+   - JSON syntax errors in next_tool_args
+   - Extra text outside the triplet format
+   - Using incorrect tool names
+   - Not quoting special characters properly
+""")
 
 class EnhancedCOT:
-    class Action:
-            
+    class Action:            
         def __init__(self, next_thought: str, next_tool_name: str, next_tool_args: dict, observation: list|tuple|str,is_error:bool=False,raw_response:str=None,total_attempts:int=0,inference_error_counter:dict=None,request_data:list=None):
             self.next_thought=next_thought
             self.next_tool_name=next_tool_name
@@ -353,8 +450,6 @@ class EnhancedCOT:
         return True
         
     def is_thought_repeated(self)->bool:
-        # Check if the last thought is the same as the previous thought.
-        # If there are less than 2 thoughts, skip (return False).
         if len(self.thoughts) < 2:
             return False
         last = self.thoughts[-1]
@@ -362,6 +457,7 @@ class EnhancedCOT:
         if last.next_tool_name == prev.next_tool_name and last.next_tool_args == prev.next_tool_args:
             return True
         return False
+    
     def to_str(self):
         messages=[]
         for i,thought in enumerate(self.thoughts):
@@ -373,7 +469,6 @@ class EnhancedCOT:
                     f"next_tool_name:{thought.next_tool_name}\n"
                     f"next_tool_args:{thought.next_tool_args}\n"
                 )
-                # Compute observation summary length safely for str/list/None
                 if thought.observation is None:
                     _obs_len = 0
                 elif isinstance(thought.observation, (list, tuple)):
@@ -382,11 +477,9 @@ class EnhancedCOT:
                     _obs_len = len(str(thought.observation).splitlines())
                 user_str=( f"observation: {'error ocurred.' if thought.is_error else ''} "
                     f"output omitted ({_obs_len}) lines\n")
-                
             else:
                 if thought.is_error is None or i==len(self.thoughts)-1:
                     assistant_str=f"next_thought:{thought.next_thought}\nnext_tool_name:{thought.next_tool_name}\nnext_tool_args:{thought.next_tool_args}"
-                    # Render list observations as JSON array for the model
                     if isinstance(thought.observation, (list, tuple)):
                         try:
                             obs_render=json.dumps(list(thought.observation), ensure_ascii=False)
@@ -459,14 +552,11 @@ class EnhancedToolManager:
                 self.tool_failure[fn.__name__][e.error_type]+=1
                 return e.message
 
-        # Preserve original function metadata
-       
         wrapper.__name__ = fn.__name__
         wrapper.__doc__ = fn.__doc__
         wrapper.__signature__ = inspect.signature(fn)
         wrapper.__annotations__ = fn.__annotations__.copy()
         wrapper.is_tool=True
-
         return wrapper
 
     def __init__(self, **kwargs):
@@ -477,7 +567,6 @@ class EnhancedToolManager:
         tool_schemas = None
         name = fn.__name__
         doc_fn = fn.__doc__ or ""
-        # remove parameters section from here to be put in args section
         doc=doc_fn.split("Arguments:")[0]
         output_description=doc_fn.split("Output:")
         if len(output_description)>1:
@@ -497,8 +586,6 @@ class EnhancedToolManager:
                 param_description=param_description.group(1)
             else:
                 raise ValueError(f"Parameter description not found for {param.name} in {doc_fn}: tool name: {name}")
-            # Special handling for list[str] / List[str] annotations so that the
-            # generated JSON schema correctly represents an array of strings.
             if ("list" in type_hint.lower()) and ("str" in type_hint):
                 properties[param.name] = {
                     "type": "array",
@@ -530,7 +617,6 @@ class EnhancedToolManager:
             "description": doc.strip(),
             "input_schema": parameters
         }
-        
         return tool_schemas
 
     @classmethod
@@ -551,7 +637,6 @@ class EnhancedToolManager:
         tool_method = getattr(self, tool_name, None)
         if tool_method is None or not callable(tool_method):
             return f"Error: tool '{tool_name}' does not exist. Please use one of the following tools: {', '.join(self.TOOL_LIST.keys())}"
-        
         return tool_method
     
     def _check_syntax_error(self,content:str,file_path:str="<unknown>")->bool:
@@ -567,7 +652,6 @@ class EnhancedToolManager:
         if not is_syntax_error:
             with open(file_path, "w") as file:
                 file.write(content)
-            # self.new_files_created.append(file_path)
             return f"File {file_path} saved successfully"
         else:
             logger.error(f"Error saving file: {error.message}")
@@ -600,12 +684,10 @@ class EnhancedToolManager:
             print("Generating git patch...")
             output = subprocess.run(["bash", "-c", command], timeout=30, capture_output=True, text=True)
             
-            # output = output.stdout.decode("utf-8") + '\n' + output.stderr.decode("utf-8")
             return output.stdout
         except Exception as e:
             logger.error(f"Error generating git patch: {e}")
             return f"Error generating git patch: {e}"
-
 
 class EnhancedNetwork:
     class ErrorType(Enum):
@@ -666,7 +748,6 @@ class EnhancedNetwork:
         url = f"{DEFAULT_PROXY_URL.rstrip('/')}/api/inference"
         print("[REQUEST] run_id:", run_id)
 
-        # Cache miss - make the actual request
         request_data = {
                 "run_id": run_id if run_id else str(uuid4()),
                 "messages": messages,
@@ -781,10 +862,8 @@ class EnhancedNetwork:
         
         return next_thought, next_tool_name, next_tool_args,raw_text,total_attempts,error_counter,messages
     
-    
     @classmethod
     def parse_malformed_json(cls,arguments:list[str], json_string:str)->dict | str:    
-        # pattern of general json string with unescaped " in values keys from keys list
         pattern = ''
         for i, k in enumerate(arguments):
             pattern += f'"{k}": (.*)'
@@ -813,7 +892,6 @@ class EnhancedNetwork:
         parse string to json, fix unecaped " in values like this: '{"a": "text "text2" text3 "text4"", "b": "text3"}'
         returns json or error message
         '''
-
         next_tool_args=next_tool_args.replace('```json','').strip('```')
         error_msg=''
 
@@ -847,13 +925,11 @@ class EnhancedNetwork:
         if not cleaned_msgs:
             raise RuntimeError("No valid messages to send to proxy.")
 
-        next_thought,next_tool_name,next_tool_args,raw_text,total_attempts,error_counter,messages = cls._request_next_action_with_retry(cleaned_msgs, model=model, temperature=temperature)
-        
+        next_thought,next_tool_name,next_tool_args,raw_text,total_attempts,error_counter,messages = cls._request_next_action_with_retry(cleaned_msgs, model=model, temperature=temperature)    
         return next_thought,next_tool_name,next_tool_args,raw_text,total_attempts,error_counter,messages
     
     @classmethod
     def sanitise_text_resp(cls,text_resp:str)->str:
-        # remove all leading and trailing quotes
         text_resp=re.sub("[\'\"]*next_thought[\'\"]*:","next_thought:",text_resp)
         text_resp=re.sub("[\'\"]*next_tool_name[\'\"]*:","next_tool_name:",text_resp)
         text_resp=re.sub("[\'\"]*next_tool_args[\'\"]*:","next_tool_args:",text_resp)
@@ -862,10 +938,8 @@ class EnhancedNetwork:
             logger.info(f"next_thought not found in {text_resp[:50]}, adding it")
             text_resp="next_thought: "+text_resp
         if "next_tool_name:" in text_resp and "next_tool_args:" in text_resp and text_resp.find("next_tool_name:")<text_resp.find("next_tool_args:"):
-            # remove all leading and trailing quotes in tool_name
             next_tool_name=text_resp.split("next_tool_name:")[1].split("next_tool_args:")[0].strip().strip("\n").strip("\'").strip("\"").strip()
-            text_resp=re.sub(f"next_tool_name:[\'\" ]*{next_tool_name}[\'\" ]*","next_tool_name: "+next_tool_name,text_resp)
-        
+            text_resp=re.sub(f"next_tool_name:[\'\" ]*{next_tool_name}[\'\" ]*","next_tool_name: "+next_tool_name,text_resp)    
         return text_resp
 
     @classmethod
@@ -880,7 +954,6 @@ class EnhancedNetwork:
             next_tool_name_raw=text_resp.split("next_tool_name:")[1].split("next_tool_args:")[0].strip().strip("\n")
             next_tool_args_raw=text_resp.split("next_tool_args:")[1].strip().split("next_thought:")[0].strip().strip("\n")
             try:
-                # Enforce arrays per new contract: if single string/object, wrap as arrays
                 if next_tool_name_raw.startswith("["):
                     next_tool_name = Utils.load_json(next_tool_name_raw)
                 else:
@@ -1021,7 +1094,6 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
         self.test_runner_mode=test_runner_mode
         self.generated_test_files=[]
 
-        # Check all classes in the method resolution order (MRO) to include inherited tools
         for cls in self.__class__.__mro__:
             for name, attr in cls.__dict__.items():
                 if getattr(attr, "is_tool", False) and name not in self.TOOL_LIST:
@@ -1045,12 +1117,36 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
             logger.error(f"Syntax error: {e}")
             return True, EnhancedToolManager.Error(EnhancedToolManager.Error.ErrorType.SYNTAX_ERROR.name,f"Syntax error. {str(e)}")
 
+    def _extract_test_file_paths_from_output(self, test_output: str) -> List[str]:
+        file_paths = []
+        seen = set()
+        
+        pattern = r'File "([^"]+\.py)", line \d+'
+        
+        for match in re.finditer(pattern, test_output):
+            file_path = match.group(1)
+            if file_path.startswith('/'):
+                try:
+                    rel_path = os.path.relpath(file_path)
+                    if rel_path not in seen and os.path.exists(rel_path):
+                        file_paths.append(rel_path)
+                        seen.add(rel_path)
+                except ValueError:
+                    if file_path not in seen and os.path.exists(file_path):
+                        file_paths.append(file_path)
+                        seen.add(file_path)
+            else:
+                if file_path not in seen and os.path.exists(file_path):
+                    file_paths.append(file_path)
+                    seen.add(file_path)
+        
+        return file_paths
+    
     def _get_file_content(self,file_path: str, search_start_line: int = None, search_end_line: int = None, search_term: str = None,limit:int=5000)->str:
         if search_term is not None and search_term!="":
             logger.debug(f"search_term specified: {search_term}, searching in v2")
             return self.search_in_specified_file_v2(file_path, search_term)
             
-        # check if start and end line are not between a function..
         func_ranges=self.get_function_ranges(file_path)
         if search_start_line!=None:
             for start, end, name in func_ranges:
@@ -1077,6 +1173,76 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
 
         return Utils.limit_strings(content, n=limit) if limit!=-1  else content
     
+    @EnhancedToolManager.tool
+    def generate_validation_test(self, test_code: str, description: str = "validation test") -> str:
+        '''
+        [OPTIONAL] Generate MINIMAL test - just import the function you fixed and call it directly.
+        
+        RULES - Keep it SIMPLE:
+        1. Import the specific function/method you modified
+        2. Call it with test inputs
+        3. Print or assert the result
+        4. That's it!
+        DO NOT use TestCase classes
+        
+        WARNING: This is NOT your success criteria! You MUST run run_repo_tests_for_fixing() and pass ALL existing tests.
+        Arguments:
+            test_code: MINIMAL Python code (imports + direct function calls + print/assert)
+            description: what you're testing
+        Output:
+            File path of the test.
+        '''
+        import hashlib
+        
+        # Validate test_code
+        test_code = (test_code or "").strip()
+        if not test_code:
+            raise EnhancedToolManager.Error(
+                EnhancedToolManager.Error.ErrorType.INVALID_TOOL_CALL.name,
+                "Error: test_code cannot be empty."
+            )
+        
+        # Check syntax
+        is_err, err = self.check_syntax_error(test_code)
+        if is_err:
+            error_msg = err.message if isinstance(err, EnhancedToolManager.Error) else str(err)
+            raise EnhancedToolManager.Error(
+                EnhancedToolManager.Error.ErrorType.SYNTAX_ERROR.name,
+                f"Error: validation test has syntax error: {error_msg}"
+            )
+        
+        import time
+        timestamp = int(time.time())
+        desc_hash = hashlib.md5(description.encode()).hexdigest()[:8]
+        filename = f"validation_test_{timestamp}_{desc_hash}.py"
+        
+        validation_dir = "/tmp/agent_validation_tests"
+        os.makedirs(validation_dir, exist_ok=True)
+        file_path = os.path.join(validation_dir, filename)
+        
+        # Write the test file
+        with open(file_path, 'w') as f:
+            f.write(test_code)
+        
+        if not hasattr(self, 'validation_test_files'):
+            self.validation_test_files = []
+        self.validation_test_files.append(file_path)
+        
+        return f"""✅ Validation test created: {file_path}
+Description: {description}
+
+To run this validation test, use:
+    run_validation_test(file_path='{file_path}')
+
+⚠️ CRITICAL REMINDERS:
+1. This test is for YOUR debugging only - NOT your success criteria
+2. Passing this test does NOT mean you're done!
+3. You MUST still run run_repo_tests_for_fixing() on existing tests
+4. You MUST pass ALL existing repository tests before calling finish_for_fixing
+5. This test will NOT be included in the final patch
+
+Think of this as "scratch paper" - helpful for debugging, but the real test is run_repo_tests_for_fixing()!"""
+
     @EnhancedToolManager.tool
     def get_file_content(self,file_path: str, search_start_line: int = None, search_end_line: int = None, search_term: str = None)->str:
        
@@ -1209,6 +1375,78 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
         return classes
 
     @EnhancedToolManager.tool
+    def run_repo_tests_for_fixing(self,file_paths:List[str])->str:
+        '''
+        Runs the tests for the repository. This tool will only run the tests for the files provided.
+        Arguments:
+            file_paths: path of the files to run the tests for.
+        Output:
+            Returns the stdout/stderr from the executed files.
+        '''
+        if self.test_runner == "pytest":
+            print("CMD: pytest ", file_paths)
+            result = subprocess.run(["pytest"] + file_paths, shell=True, capture_output=True, text=True, timeout=90)
+            output = (result.stdout or "") + (result.stderr or "")
+        elif self.test_runner == "unittest":
+            print("CMD: python ", file_paths)
+            output = ""
+            for file_path in file_paths:
+                result = subprocess.run(
+                    ["python", file_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=60
+                )
+                current_output = (result.stdout or "") + (result.stderr or "")
+                output += current_output
+        else:
+            if self.test_runner_mode == "MODULE":
+                modules = [filepath_to_module(f, os.getcwd(), self.test_runner) for f in file_paths]
+                # cmd = f"{self.test_runner} {' '.join(modules)}"
+                cmd = f"{self.test_runner} {' '.join(modules)} -v 2"
+                print("CMD: ", cmd)
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=90)
+                output = (result.stdout or "") + (result.stderr or "")
+            else:
+                files_to_test = [clean_filepath(f, os.getcwd(), self.test_runner) for f in file_paths]
+                # cmd = f"{self.test_runner} {' '.join(files_to_test)}"
+                cmd = f"{self.test_runner} {' '.join(files_to_test)} -v 2"
+                print("CMD: ", cmd)
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=90)
+                output = (result.stdout or "") + (result.stderr or "")
+        
+        enhanced_output = self._enhance_test_output(output, file_paths)
+        has_failures = any(indicator in output for indicator in ["FAIL:", "expected failures"])
+        failure_count = 0
+        if has_failures:
+            import re
+            
+            fail_patterns = [
+                r'(\d+)\s+failed',
+                r'FAILED.*\(failures=(\d+)\)',
+            ]
+            for pattern in fail_patterns:
+                match = re.search(pattern, output, re.IGNORECASE)
+                if match:
+                    failure_count = int(match.group(1))
+                    break
+            
+            if failure_count == 0:
+                failure_count = output.count("FAIL:")
+            
+            expected_failure_match = re.search(r'expected failures[=\s]+(\d+)', output, re.IGNORECASE)
+            if expected_failure_match:
+                failure_count += int(expected_failure_match.group(1))
+        
+        self.last_test_results = {
+            'has_failures': has_failures,
+            'failure_count': failure_count,
+            'file_paths': file_paths
+        }
+        
+        return enhanced_output
+    
+    @EnhancedToolManager.tool
     def search_in_all_files_content(self, search_term: str, case_sensitive: bool = False) -> str:
         '''
         Search for a text pattern across all .py files in the project, excluding any file with "test" in its path.
@@ -1224,7 +1462,6 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
         output = []
         search_flags = 0 if case_sensitive else re.IGNORECASE
 
-        # Walk through all directories and find Python files
         for root, _, files in os.walk("."):
             # Skip .git and docs directories
             if ".git" in root or "docs" in root:
@@ -1234,7 +1471,6 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
                 if file.endswith('.py'):
                     file_path = os.path.join(root, file)
 
-                    # Always check if search term is in the file name
                     if re.search(search_term, file_path, search_flags):
                         output.append(f"{file_path} | Filename match")
 
@@ -1245,7 +1481,6 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
                         if not re.search(search_term, content, search_flags):
                             continue
 
-                        # Parse the file content using AST
                         tree = ast.parse(content, filename=file_path)
                         visitor = FunctionVisitor(content)
                         visitor.visit(tree)
@@ -1266,8 +1501,41 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
             raise EnhancedToolManager.Error(EnhancedToolManager.Error.ErrorType.SEARCH_TERM_NOT_FOUND.name, f"'{search_term}' not found in the codebase.")
         return output
 
+    @EnhancedToolManager.tool
+    def submit_solution(self, investigation_summary: str):
+        '''
+        Submit your solution after ALL repository tests pass. This is the ONLY way to finish.
+        This tool will automatically verify that all tests pass before accepting your solution.
+        Arguments:
+            investigation_summary: Detailed summary of your investigation and solution. Format:
+                Problem: <problem_statement>
+                Investigation: <investigation_summary>
+                Solution: <your solution>
+        Output:
+            Success message if all tests pass, or error if tests are still failing.
+        '''
+        # Check if we have recent test results stored
+        if not hasattr(self, 'last_test_results'):
+            raise EnhancedToolManager.Error(
+                EnhancedToolManager.Error.ErrorType.INVALID_TOOL_CALL.name,
+                "❌ ERROR: You must run run_repo_tests_for_fixing() before submitting your solution!\n\n"
+                "You cannot submit without verifying that all repository tests pass."
+            )
+        
+        if self.last_test_results.get('has_failures', True):
+            failing_count = self.last_test_results.get('failure_count', 'unknown')
+            raise EnhancedToolManager.Error(
+                EnhancedToolManager.Error.ErrorType.INVALID_TOOL_CALL.name,
+                f"❌ ERROR: Cannot submit solution - {failing_count} test(s) are still FAILING!\n\n"
+                f"Last test run showed failures. You MUST fix all failing tests before submitting.\n"
+                f"Run run_repo_tests_for_fixing() again after fixing the issues to verify all tests pass.\n\n"
+                f"DO NOT try to submit with failing tests - this will always be rejected!"
+            )
+        
+        # All tests passed! Allow submission
+        return "finish_for_fixing"
+    
     def get_function_ranges(self,file_path: str)->list[tuple[int, int, str]]:
-        # Try to parse the file to map lines to their enclosing functions.
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 source_lines = f.read().splitlines()
@@ -1302,7 +1570,6 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
             logger.error(f"Error reading '{file_path}': {e}")
             raise EnhancedToolManager.Error(EnhancedToolManager.Error.ErrorType.FILE_NOT_FOUND.name,f"Error reading '{file_path}': {e}")
 
-        # Identify all lines that contain the search term.
         match_lines = [idx + 1 for idx, line in enumerate(source_lines) if search_term in line]
         if not match_lines:
             raise EnhancedToolManager.Error(EnhancedToolManager.Error.ErrorType.SEARCH_TERM_NOT_FOUND.name,f"'{search_term}' not found in file '{file_path}'")
@@ -1334,6 +1601,25 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
 
         return Utils.limit_strings("\n\n".join(chunks), n=max_output_lines)
 
+    def _extract_failing_test_names(self, test_output: str) -> List[Dict[str, str]]:
+        failing_tests = []
+        seen = set()
+        
+        patterns = [
+            r'FAIL:\s+(\w+)',      
+            r'ERROR:\s+(\w+)',     
+            r'FAILED.*::(\w+)',    
+        ]
+        
+        for pattern in patterns:
+            for match in re.finditer(pattern, test_output):
+                test_name = match.group(1)
+                if test_name and test_name not in seen:
+                    failing_tests.append({'name': test_name})
+                    seen.add(test_name)
+        
+        return failing_tests
+    
     @EnhancedToolManager.tool
     def search_in_specified_file_v2(self,file_path: str, search_term: str)->str:
         '''
@@ -1369,18 +1655,14 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
         or `git apply` can consume.
         """
         try:
-            # Stage modified/untracked files with desired extensions, excluding agent files.
             exts = (".py", ".ini", ".cfg", ".toml")
             exclude = {"src/agent.py", "src/agent_runner.py"}
-            # Exclude any generated test files or files modified via test generation tool
             try:
                 for _p in getattr(self, "generated_test_files", []):
-                    # store as relative paths similar to git ls-files output
                     exclude.add(os.path.relpath(_p))
             except Exception:
                 pass
 
-            # Discover modified + untracked files
             ls = subprocess.run(
                 ["git", "ls-files", "-m", "-o", "--exclude-standard"],
                 capture_output=True, text=True, timeout=30, check=True
@@ -1390,13 +1672,11 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
             if to_add:
                 subprocess.run(["git", "add", "--"] + to_add, check=True, timeout=30)
 
-            # Produce a clean, parseable patch (no colors; standard unified diff).
             diff = subprocess.run(
                 ["git", "diff", "--cached", "--no-color", "--unified=3"],
                 capture_output=True, text=True, timeout=30, check=True
             )
 
-            # Log stderr separately so it never pollutes the patch.
             if diff.stderr:
                 logger.warning("git diff (stderr): %s", diff.stderr.strip())
 
@@ -1406,6 +1686,27 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
             logger.exception("Error generating git patch")
             return f"Error generating git patch: {e}"
     
+    def _extract_class_attributes(self, class_node, lines: List[str]) -> Optional[str]:
+        try:
+            attrs = []
+            for item in class_node.body:
+                if isinstance(item, ast.Assign):
+                    line_num = item.lineno - 1
+                    if line_num < len(lines):
+                        line_content = lines[line_num].strip()
+                        if len(line_content) < 200:
+                            attrs.append(line_content)
+                elif isinstance(item, ast.AnnAssign):
+                    line_num = item.lineno - 1
+                    if line_num < len(lines):
+                        line_content = lines[line_num].strip()
+                        if len(line_content) < 200:
+                            attrs.append(line_content)
+            
+            return '\n'.join(attrs) if attrs else None
+        except Exception:
+            return None
+        
     @EnhancedToolManager.tool
     def generate_test_function(self, file_path: str, test_function_code: str, position: str = "append") -> str:
         '''
@@ -1420,12 +1721,10 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
         if not file_path.endswith('.py'):
             raise EnhancedToolManager.Error(EnhancedToolManager.Error.ErrorType.INVALID_FILE_PATH.name,f"Error: file '{file_path}' is not a python file.")
 
-        # Ensure directory exists
         dir_name = os.path.dirname(file_path)
         if dir_name and not os.path.exists(dir_name):
             os.makedirs(dir_name, exist_ok=True)
 
-        # Normalize newline handling
         test_fn = (test_function_code or "").strip()
         if not test_fn:
             raise EnhancedToolManager.Error(EnhancedToolManager.Error.ErrorType.INVALID_TOOL_CALL.name,"Error: test_function_code cannot be empty.")
@@ -1440,7 +1739,6 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
                 if stripped.startswith("import ") or stripped.startswith("from "):
                     insert_idx = i + 1
                 elif stripped == "" or stripped.startswith("#"):
-                    # allow header comments/blank lines before imports
                     insert_idx = max(insert_idx, i + 1)
                 else:
                     break
@@ -1456,20 +1754,17 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
 
         if is_new_file:
             new_content = test_fn + "\n"
-            # Validate standalone content before writing
             is_err, err = self.check_syntax_error(new_content)
             if is_err:
                 raise EnhancedToolManager.Error(EnhancedToolManager.Error.ErrorType.SYNTAX_ERROR.name,f"Error: generated test function has syntax error: {err}")
         else:
             original = self._get_file_content(file_path, limit=-1)
-            # Avoid duplicating exact same function text
             if test_fn in original:
                 rel = os.path.relpath(file_path)
                 if rel not in self.generated_test_files:
                     self.generated_test_files.append(rel)
                 return f"Test already present in '{rel}', no changes made."
 
-            # Build candidate insertion strategies in order
             candidates = []
             if position == "append":
                 candidates = [lambda src: src.rstrip() + "\n\n" + test_fn + "\n"]
@@ -1488,7 +1783,6 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
             else:
                 raise EnhancedToolManager.Error(EnhancedToolManager.Error.ErrorType.INVALID_TOOL_CALL.name,f"Error: invalid position '{position}'. Use 'append', 'top', 'after_imports', 'before_main', or 'auto'.")
 
-            # Try each candidate until one passes syntax check
             new_content = None
             first_error = None
             for builder in candidates:
@@ -1510,13 +1804,50 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
 
         self._save(file_path, new_content)
 
-        # Track for exclusion from final patch
         rel = os.path.relpath(file_path)
         if rel not in self.generated_test_files:
             self.generated_test_files.append(rel)
 
         return f"Test {'created' if is_new_file else 'updated'} in '{rel}' (position={position})."
 
+    def _extract_test_data(self, file_path: str, test_name: str) -> Optional[str]:
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            tree = ast.parse(content, filename=file_path)
+            lines = content.splitlines()
+            
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef):
+                    has_test = any(
+                        isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == test_name
+                        for item in node.body
+                    )
+                    
+                    if has_test:
+                        setup_methods = []
+                        for item in node.body:
+                            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                                if item.name in ['setUp', 'setUpTestData', 'setUpClass', 'setup_method', 'setup_class']:
+                                    start_line = item.lineno - 1
+                                    end_line = self._get_function_end_line(item, lines)
+                                    setup_code = '\n'.join(lines[start_line:end_line])
+                                    setup_methods.append(f"# {item.name}\n{setup_code}")
+                        
+                        class_attrs = self._extract_class_attributes(node, lines)
+                        if class_attrs:
+                            setup_methods.insert(0, f"# Class attributes\n{class_attrs}")
+                        
+                        if setup_methods:
+                            return '\n\n'.join(setup_methods)
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error extracting test data: {e}")
+            return None
+        
     @EnhancedToolManager.tool
     def run_repo_tests(self,file_paths:List[str])->str:
         '''
@@ -1557,6 +1888,102 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
                 output = (result.stdout or "") + (result.stderr or "")
         return output
 
+    def _enhance_test_output(self, test_output: str, file_paths: List[str]) -> str:
+        try:
+            has_failures = any(indicator in test_output for indicator in 
+                             ["FAIL:", "expected failures"])
+            if not has_failures:
+                return test_output
+            failing_tests = self._extract_failing_test_names(test_output)
+            logger.info(f'failing_tests: {failing_tests}')
+            if not failing_tests:
+                return test_output
+            enhanced_parts = [
+                "=" * 80,
+                "TEST RESULTS:",
+                "=" * 80,
+                test_output,
+                "",
+                "=" * 80,
+                "ENHANCED FAILURE INFORMATION:",
+                "=" * 80,
+                ""
+            ]
+            
+            actual_file_paths = file_paths.copy()
+            for file_path in file_paths:
+                if os.path.isdir(file_path):
+                    logger.info(f"Directory path detected: {file_path}, extracting actual file paths from test output")
+                    extracted_paths = self._extract_test_file_paths_from_output(test_output)
+                    if extracted_paths:
+                        actual_file_paths.extend(extracted_paths)
+                        logger.info(f"Extracted file paths from test output: {extracted_paths}")
+            
+            for test_info in failing_tests:
+                logger.info(f'test_info: {test_info}')
+                test_name = test_info.get('name')
+                is_expected_failure = test_info.get('expected_failure', False)
+                if not test_name:
+                    continue
+                    
+                found_test = False
+                for file_path in actual_file_paths:
+                    actual_file_path = file_path.split('::')[0]
+                    
+                    if not os.path.exists(actual_file_path):
+                        continue
+                    test_code = self._extract_test_function_code(actual_file_path, test_name)
+                    
+                    if not test_code:
+                        continue
+                        
+                    found_test = True  
+                    test_data = self._extract_test_data(actual_file_path, test_name)
+                    
+                    enhanced_parts.append(f"{'─' * 80}")
+                    if is_expected_failure:
+                        enhanced_parts.append(f"❌ Expected Failure Test (MUST FIX): {test_name}")
+                        enhanced_parts.append(f"⚠️  This test is marked as @expectedFailure - you MUST fix it and remove the decorator!")
+                    else:
+                        enhanced_parts.append(f"❌ Failing Test: {test_name}")
+                    enhanced_parts.append(f"File: {actual_file_path}")
+                    enhanced_parts.append(f"{'─' * 80}")
+                    
+                    enhanced_parts.append("\nTest Code:")
+                    enhanced_parts.append("```python")
+                    enhanced_parts.append(test_code)
+                    enhanced_parts.append("```")
+                    
+                    if test_data:
+                        enhanced_parts.append("\nTest Data (setUp/setUpTestData):")
+                        enhanced_parts.append("```python")
+                        enhanced_parts.append(test_data)
+                        enhanced_parts.append("```")
+                    
+                    enhanced_parts.append("")
+                    break
+                
+                if not found_test:
+                    enhanced_parts.append(f"{'─' * 80}")
+                    enhanced_parts.append(f"⚠️  WARNING: Could not extract test function '{test_name}'")
+                    enhanced_parts.append(f"{'─' * 80}")
+                    enhanced_parts.append("")
+                    enhanced_parts.append("⚠️  ISSUE: Failed to automatically extract the test function code.")
+                    enhanced_parts.append("📋 ACTION REQUIRED: Please read the actual test file(s) to understand the test:")
+                    for file_path in actual_file_paths:
+                        if os.path.exists(file_path):
+                            enhanced_parts.append(f"   - {file_path}")
+                    enhanced_parts.append("")
+                    enhanced_parts.append("💡 TIP: Use read_file tool to examine the test file and locate the test function.")
+                    enhanced_parts.append("     Then analyze the test logic to determine why it's failing and how to fix it.")
+                    enhanced_parts.append("")
+                    
+            return "\n".join(enhanced_parts)
+            
+        except Exception as e:
+            logger.error(f"Error enhancing test output: {e}")
+            return test_output               
+        
     @EnhancedToolManager.tool
     def run_code(self,content:str,file_path:str)->str:
         '''
@@ -1581,18 +2008,13 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
         disallowed_modules = set()
         for node in ast.walk(tree):
             if isinstance(node, (ast.Import, ast.ImportFrom)):
-                # Use the module specified in 'from x import y' if available;
-                # otherwise fall back to the imported name from plain 'import x'
                 if isinstance(node, ast.ImportFrom) and node.module:
                     mod = node.module.split(".")[0]
                 else:
                     mod = node.names[0].name.split(".")[0]
 
-                # Skip if built-in module
                 if mod in sys.builtin_module_names:
                     continue
-
-               
 
                 # Skip relative imports ("from . import foo") which have level > 0
                 if isinstance(node, ast.ImportFrom) and node.level and node.level > 0:
@@ -1627,7 +2049,6 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
             logger.error(f"Cannot run, third party dependencies detected: {sorted(disallowed_modules)}\n")
             raise ToolManager.Error(ToolManager.Error.ErrorType.THIRD_PARTY_DEPENDENCIES.name,f"Error:Cannot run, third party dependencies detected: {sorted(disallowed_modules)}\n")
 
-        
         result = subprocess.run(["python", file_path], capture_output=True, text=True, check=False, timeout=60)
         if result.returncode!=0:
             
@@ -1638,10 +2059,38 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
                 error_type=EnhancedToolManager.Error.ErrorType.THIRD_PARTY_DEPENDENCIES
             raise EnhancedToolManager.Error(error_type,f"Error running code: {result.stderr}\n")
         observation = f"{result.stdout}\n"
-       
-
+    
         return observation
     
+    def _extract_test_function_code(self, file_path: str, test_name: str) -> Optional[str]:
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            tree = ast.parse(content, filename=file_path)
+            lines = content.splitlines()
+            
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef):
+                    for item in node.body:
+                        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            if item.name == test_name:
+                                start_line = item.lineno - 1
+                                end_line = self._get_function_end_line(item, lines)
+                                return '\n'.join(lines[start_line:end_line])
+            
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if node.name == test_name:
+                        start_line = node.lineno - 1
+                        end_line = self._get_function_end_line(node, lines)
+                        return '\n'.join(lines[start_line:end_line])
+            
+            return None
+        except Exception as e:
+            logger.error(f"Error extracting test function code: {e}")
+            return None
+        
     @EnhancedToolManager.tool
     def apply_code_edit(self,file_path:str, search:str, replace:str)->str:
         '''
@@ -1685,6 +2134,75 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
                 raise EnhancedToolManager.Error(EnhancedToolManager.Error.ErrorType.MULTIPLE_SEARCH_RESULTS_FOUND.name,f"Error: search string found {num_hits} times in file '{file_path}'.\nPlease reformulate your search and replace to apply only one change.")
     
     @EnhancedToolManager.tool
+    def run_validation_test(self, file_path: str) -> str:
+        '''
+        Run a validation test file that you created with generate_validation_test.
+        Arguments:
+            file_path: path to the validation test file
+        Output:
+            Test execution results (stdout/stderr)
+        '''
+        if not os.path.exists(file_path):
+            raise EnhancedToolManager.Error(
+                EnhancedToolManager.Error.ErrorType.FILE_NOT_FOUND.name,
+                f"Error: validation test file '{file_path}' not found."
+            )
+        
+        import subprocess
+        try:
+            result = subprocess.run(
+                ['python', file_path],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd=self.repo_path if hasattr(self, 'repo_path') else os.getcwd()
+            )
+            
+            output = f"=== VALIDATION TEST RESULTS ===\n"
+            output += f"File: {file_path}\n"
+            output += f"Exit Code: {result.returncode}\n\n"
+            
+            if result.stdout:
+                output += f"STDOUT:\n{result.stdout}\n\n"
+            if result.stderr:
+                output += f"STDERR:\n{result.stderr}\n\n"
+            
+            if result.returncode == 0:
+                output += "✅ Validation test PASSED\n\n"
+                output += "=" * 80 + "\n"
+                output += "⛔ CRITICAL WARNING - DO NOT SKIP THIS ⛔\n"
+                output += "=" * 80 + "\n"
+                output += "This validation test passing does NOT mean you are done!\n"
+                output += "This is NOT your success criteria!\n\n"
+                output += "⚠️ YOU MUST NOW:\n"
+                output += "1. Run run_repo_tests_for_fixing() on the relevant existing test files\n"
+                output += "2. Ensure ALL existing repository tests PASS (ZERO failures)\n"
+                output += "3. If ANY test fails, you MUST fix it or revise your entire approach\n"
+                output += "4. ONLY call finish_for_fixing after run_repo_tests_for_fixing shows ZERO failures\n\n"
+                output += "❌ DO NOT call finish_for_fixing just because this validation test passed!\n"
+                output += "❌ DO NOT think 'the original issue is fixed, so I'm done'!\n"
+                output += "❌ DO NOT ignore failing repository tests with excuses like 'edge cases' or 'unrelated'!\n"
+                output += "❌ DO NOT say 'these don't directly involve what I fixed' - if they fail after your changes, YOU broke them!\n"
+                output += "=" * 80 + "\n"
+            else:
+                output += "❌ Validation test FAILED\n\n"
+                output += "This means your fix has issues. Debug and fix them.\n"
+                output += "After fixing, you MUST ALSO run run_repo_tests_for_fixing() to verify existing tests pass!\n"
+            
+            return output
+            
+        except subprocess.TimeoutExpired:
+            raise EnhancedToolManager.Error(
+                EnhancedToolManager.Error.ErrorType.TIMEOUT.name,
+                f"Error: validation test timed out after 30 seconds."
+            )
+        except Exception as e:
+            raise EnhancedToolManager.Error(
+                EnhancedToolManager.Error.ErrorType.RUNTIME_ERROR.name,
+                f"Error running validation test: {str(e)}"
+            )
+    
+    @EnhancedToolManager.tool
     def finish(self,investigation_summary: str):
         '''
         Signals completion of the current workflow execution
@@ -1697,6 +2215,43 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
         qa_response={"is_patch_correct":"yes"}
         if qa_response.get("is_patch_correct","no").lower()=="yes":
             return "finish"
+        else: 
+            raise EnhancedToolManager.Error(EnhancedToolManager.Error.ErrorType.BUG_REPORT_REQUIRED.name,qa_response.get("analysis",""))
+
+    def _get_function_end_line(self, node, lines: List[str]) -> int:
+        if hasattr(node, 'end_lineno') and node.end_lineno:
+            return node.end_lineno
+        
+        start_line = node.lineno - 1
+        if start_line >= len(lines):
+            return len(lines)
+        
+        base_indent = len(lines[start_line]) - len(lines[start_line].lstrip())
+        
+        end_line = start_line + 1
+        while end_line < len(lines):
+            line = lines[end_line]
+            if line.strip():
+                current_indent = len(line) - len(line.lstrip())
+                if current_indent <= base_indent:
+                    break
+            end_line += 1
+        
+        return end_line
+    
+    @EnhancedToolManager.tool
+    def finish_for_fixing(self,investigation_summary: str):
+        '''
+        Signals completion of the current workflow execution
+        Arguments:
+            investigation_summary: Please provide a detailed summary of the findings from your investigation and detailed solution to the problem.Use the following format:
+                Problem: <problem_statement>
+                Investigation: <investigation_summary>
+                Solution: <your solution>
+        '''
+        qa_response={"is_patch_correct":"yes"}
+        if qa_response.get("is_patch_correct","no").lower()=="yes":
+            return self.submit_solution(investigation_summary)
         else: 
             raise EnhancedToolManager.Error(EnhancedToolManager.Error.ErrorType.BUG_REPORT_REQUIRED.name,qa_response.get("analysis",""))
 
@@ -1769,7 +2324,6 @@ def process_fix_task(input_dict: Dict[str, Any]):
         Optional keys: 'run_id', 'instance_id' for tracking purposes.
     """
     global run_id
-    # setting environment to include current working directory and lib directory
     problem_text = input_dict.get("problem_statement")
     if not problem_text:
         raise ValueError("input_dict must contain 'problem_statement'.")
@@ -1795,7 +2349,7 @@ def process_fix_task(input_dict: Dict[str, Any]):
         logger.info(f"current files:{os.listdir()}")
         logger.info(f"packages installed:{subprocess.check_output(['pip','list']).decode('utf-8')}")
         logger.info(f"About to execute workflow...")
-        patch_text= fix_task_solve_workflow(
+        patch_text= fix_task_solve_for_fixing_workflow(
             problem_text,
             timeout=timeout,
             run_id_1=run_id,
@@ -1899,7 +2453,6 @@ def post_process_instruction(instruction: str) -> str:
         
         return "[\n    " + ",\n    ".join(processed_lines) + "\n]"
             
-    # Pattern to match ```text...``` blocks
     pattern = r'```text\n(.*?)\n```'
     
     def replace_text_block(match):
@@ -1908,7 +2461,6 @@ def post_process_instruction(instruction: str) -> str:
         
         return f'```text\n{processed_content}\n```'
     
-    # Replace all text blocks with processed versions
     processed_instruction = re.sub(pattern, replace_text_block, instruction, flags=re.DOTALL)
     return processed_instruction
 
@@ -1986,48 +2538,41 @@ def determine_model_order(problem_statement: str) -> list:
         logger.warning(f"[MODEL-ROUTER] Routing failed ({e}); using safe default order")
         return [QWEN_MODEL_NAME, DEEPSEEK_MODEL_NAME]
 
-def generate_initial_solution(problem_statement: str, code_skeleton: str) -> str:
-    models = determine_model_order(problem_statement)
-
+def generate_test_files(problem_statement: str, files_to_test: str, code_skeleton: str) -> str:
     retry = 0
     while retry < 10:
         try:
-            logger.info("Starting multi-step reasoning solution generation")
+            logger.info("Starting test cases generation")
+            testcases = generate_testcases_with_multi_step_reasoning(problem_statement, files_to_test, code_skeleton)
             
-            solution = generate_solution_with_multi_step_reasoning(problem_statement, code_skeleton)
-            
-            if solution:
-                logger.info("Generated initial solution successfully using multi-step reasoning")
-                return solution
+            if testcases:
+                logger.info("Generated testcases successfully using multi-step reasoning")
+                return testcases
             else:
                 logger.warning("Multi-step reasoning failed, falling back to single-step approach")
-                
-                # Fallback to original single-step approach if multi-step fails
                 messages = [
                     {
                         "role": "system",
-                        "content": GENERATE_INITIAL_SOLUTION_PROMPT
+                        "content": GENERATE_INITIAL_TESTCASES_PROMPT
                     },
                     {
                         "role": "user",
-                        "content": f"""Problem Statement:\n{problem_statement}\n\nInitial python files:\n{code_skeleton}\n\nGenerate the complete and correct implementation in python files."""
+                        "content": f"""Problem Statement:\n{problem_statement}\n\nPython files to test:\n{files_to_test}\n\nCode skeleton: \n{code_skeleton}\n\nGenerate the ground truth and edge case coveraging testcases."""
                     }
                 ]
                 
-                response = EnhancedNetwork.make_request(messages, model=models[0])
+                response = EnhancedNetwork.make_request(messages, model=QWEN_MODEL_NAME)
                 
-                # Clean up the response
-                solution = response.strip()
-                if solution.startswith('```python'):
-                    solution = solution[9:]
-                if solution.startswith('```'):
-                    solution = solution[3:]
-                if solution.endswith('```'):
-                    solution = solution[:-3]
-                solution = solution.strip()
-                
-                logger.info("Generated initial solution successfully using fallback approach")
-                return solution
+                testcases = response.strip()
+                if testcases.startswith('```python'):
+                    testcases = testcases[9:]
+                if testcases.startswith('```'):
+                    testcases = testcases[3:]
+                if testcases.endswith('```'):
+                    testcases = testcases[:-3]
+                testcases = testcases.strip()
+                logger.info("Generated testcases successfully using fallback approach")
+                return testcases
             
         except Exception as e:
             logger.error(f"Error generating initial solution: {str(e)}")
@@ -2131,7 +2676,6 @@ def generate_solution_with_multi_step_reasoning(problem_statement: str, code_ske
             loop_check_response = EnhancedNetwork.make_request(loop_check_messages, model=QWEN_MODEL_NAME)
             logger.info("Step 2 - Infinite Loop Check completed")
 
-            # Clean up the final response (use loop check response as it's the final validated version)
             solution = loop_check_response.strip()
             if solution.startswith('```python'):
                 solution = solution[9:]
@@ -2162,8 +2706,6 @@ def generate_solution_with_multi_step_reasoning(problem_statement: str, code_ske
     
     return ""
 
-
-
 def extract_and_write_files(initial_solution: str, base_dir: str = ".") -> list:
     import os
     
@@ -2178,23 +2720,18 @@ def extract_and_write_files(initial_solution: str, base_dir: str = ".") -> list:
     current_content = []
     
     for line in lines:
-        # Check if this line is just a Python filename (*.py pattern)
         stripped_line = line.strip()
         
-        # Pattern: ends with .py and looks like a filename (no spaces, reasonable length)
         if (stripped_line.endswith('.py') and 
             ' ' not in stripped_line and 
             len(stripped_line) > 3 and 
             '/' not in stripped_line.replace('/', '') and  # Allow subdirectories
             not stripped_line.startswith('#')):  # Not a comment
             
-            # Write the previous file if we have one
             if current_filename and current_content:
                 file_path = os.path.join(base_dir, current_filename)
-                # Create directory if needed (for subdirectories)
                 os.makedirs(os.path.dirname(file_path), exist_ok=True)
                 
-                # Join content and remove empty lines at start/end
                 content = '\n'.join(current_content).strip()
                 
                 with open(file_path, 'w', encoding='utf-8') as f:
@@ -2203,11 +2740,9 @@ def extract_and_write_files(initial_solution: str, base_dir: str = ".") -> list:
                 created_files.append(file_path)
                 print(f"Created file: {file_path}")
             
-            # Start new file
             current_filename = stripped_line
             current_content = []
         else:
-            # This line is content for the current file
             if current_filename:  # Only collect content if we have a filename
                 current_content.append(line)
     
@@ -2226,7 +2761,27 @@ def extract_and_write_files(initial_solution: str, base_dir: str = ".") -> list:
     
     return created_files
 
+def agent_main(input_dict: Dict[str, Any], repo_dir: str = "repo"):
+    """Legacy interface wrapper for backwards compatibility."""
+    global DEFAULT_PROXY_URL, DEFAULT_TIMEOUT, run_id
+    run_id = os.getenv("RUN_ID", "")
+    repo_dir = os.path.abspath(repo_dir)
+    sys.path.insert(0, repo_dir)
+    if os.path.exists(repo_dir):
+        os.chdir(repo_dir)
+    ensure_git_initialized()
+    set_env_for_agent()
+    try:
+        problem_type = check_problem_type(input_dict.get("problem_statement"))
+        if problem_type == PROBLEM_TYPE_FIX:
+            result = process_fix_task(input_dict)
+        else:
+            result = process_create_task(input_dict)
+    except Exception as e:
+        result = process_fix_task(input_dict)
+    os.system("git reset --hard")
 
+    return result
 
 def process_create_task(input_dict):
     problem_statement = input_dict.get("problem_statement", "")
@@ -2266,6 +2821,298 @@ def process_create_task(input_dict):
     tool_manager = EnhancedToolManager()
     patch = tool_manager.get_final_git_patch()
     return patch
+
+def fix_task_solve_for_fixing_workflow(problem_statement: str, *, timeout: int, run_id_1: str,\
+    test_runner: str = "pytest", test_runner_mode: str = "FILE", n_max_steps = MAX_FIX_TASK_STEPS) -> tuple[str, List[str], List[str]]:
+    global run_id
+    run_id=run_id_1
+    cot=EnhancedCOT(latest_observations_to_keep=30)
+    tool_manager=FixTaskEnhancedToolManager(
+        available_tools=[
+            "get_file_content",
+            "save_file",
+            "get_approval_for_solution",
+            "get_functions",
+            "get_classes",
+            "search_in_all_files_content",
+            "search_in_specified_file_v2",
+            "start_over",
+            "run_repo_tests_for_fixing",
+            "run_code",
+            "generate_validation_test",
+            "run_validation_test",
+            "apply_code_edit",
+            "generate_test_function",
+            "submit_solution",
+            "finish_for_fixing"
+        ],
+        test_runner=test_runner,
+        test_runner_mode=test_runner_mode
+    )
+    logger.info(f"Starting main agent execution...")
+    system_prompt = FIX_TASK_FOR_FIXING_SYSTEM_PROMPT.format(tools_docs=tool_manager.get_tool_docs(),format_prompt=FORMAT_PROMPT_V0)
+    instance_prompt = FIX_TASK_INSTANCE_PROMPT_TEMPLATE.format(problem_statement=problem_statement)
+    
+    start_time = time.time()
+    logs: List[str] = []
+    logs.append(f"cwd: {os.getcwd()}")
+    logger.info(f"Starting workflow execution with {n_max_steps} max steps: timeout: {timeout} seconds : run_id: {run_id}")
+    
+    for step in range(n_max_steps):
+        logger.info(f"Execution step {step + 1}/{n_max_steps}")
+        
+        if time.time() - start_time > timeout:
+            cot.add_action(EnhancedCOT.Action(next_thought="global timeout reached",next_tool_name="",next_tool_args={},observation="",is_error=True,inference_error_counter={},request_data=[]))
+            break
+
+        messages: List[Dict[str, Any]] = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": instance_prompt},
+            ]
+        
+        messages.extend(cot.to_str())
+        messages.append({"role": "system", "content": STOP_INSTRUCTION})
+    
+        if cot.is_thought_repeated():
+            logger.info(f"[TEST_PATCH_FIND] Thought repeated, adding DO NOT REPEAT TOOL CALLS instruction")
+            last_thought = cot.thoughts[-1]
+            messages.append({"role": "user", "content": DO_NOT_REPEAT_TOOL_CALLS.format(previous_response=f"next_tool_name:{last_thought.next_tool_name}\n next_tool_args:{last_thought.next_tool_args}")})
+    
+        try:
+            next_thought, next_tool_name, next_tool_args,raw_text,total_attempts,error_counter,messages = EnhancedNetwork.inference(messages, model=GLM_MODEL_NAME, run_id=run_id)
+        except Exception as e:
+            import traceback  # Ensure traceback is accessible
+            error_msg=f"\n\nERROR: {repr(e)} {traceback.format_exc()}"
+            logger.error(f"Inference error: {error_msg}")
+            cot.add_action(EnhancedCOT.Action(next_thought=error_msg,next_tool_name="",next_tool_args={},observation="",is_error=True,raw_response=raw_text,total_attempts=total_attempts),inference_error_counter=error_counter,request_data=messages)
+            break
+        
+        logger.info(f"About to execute operation: {next_tool_name}")
+       
+        try:
+            logger.info(f"next_thought: {next_thought}\nnext_tool_name: {next_tool_name}\nnext_tool_args: {next_tool_args}\n")
+            if '"' in next_tool_name or "'" in next_tool_name:
+                next_tool_name=next_tool_name.replace('"','')
+                next_tool_name=next_tool_name.replace("'","")
+                
+            next_observation = tool_manager.get_tool(next_tool_name)(**next_tool_args) if next_tool_args else tool_manager.get_tool(next_tool_name)()
+            logger.info(f"next_observation: {next_observation}")
+            cot.add_action(EnhancedCOT.Action(next_thought=next_thought,next_tool_name=next_tool_name,next_tool_args=next_tool_args,observation=next_observation,is_error=False,raw_response=raw_text,total_attempts=total_attempts,inference_error_counter=error_counter,request_data=messages))
+        except EnhancedToolManager.Error as e:
+            import traceback  
+            error_msg=f"observation: {e.message}"
+            logger.error(f"Tool error: {error_msg}")
+            cot.add_action(EnhancedCOT.Action(next_thought=next_thought,next_tool_name=next_tool_name,next_tool_args=next_tool_args,observation=error_msg,is_error=True,raw_response=raw_text,total_attempts=total_attempts,inference_error_counter=error_counter,request_data=messages))
+            continue
+        except Exception as e:
+            import traceback  # Ensure traceback is accessible
+            error_traceback=traceback.format_exc()
+            if isinstance(e,TypeError):
+                error_msg=f"observation: {str(e)}"
+            else:
+                error_msg=f"observation: {repr(e)} {error_traceback}"
+            logger.error(f"Tool error: {error_msg}")
+            cot.add_action(EnhancedCOT.Action(next_thought=next_thought,next_tool_name=next_tool_name,next_tool_args=next_tool_args,observation=error_msg,is_error=True,raw_response=raw_text,total_attempts=total_attempts,inference_error_counter=error_counter,request_data=messages))
+            continue
+        
+        if next_tool_name == "finish_for_fixing":
+            logger.info('[CRITICAL] Workflow called finish_for_fixing operation')
+            if next_observation == "finish_for_fixing":  # Only break if validation passed
+                break
+            
+        print(f"[CRITICAL] Completed step {step + 1}, continuing to next step")
+    else:
+        cot.add_action(EnhancedCOT.Action(next_thought="global timeout reached",next_tool_name="",next_tool_args={},observation="",is_error=True))
+        logger.info(f"[CRITICAL] Workflow completed after reaching MAX_STEPS ({n_max_steps})")
+        if n_max_steps < MAX_FIX_TASK_STEPS:
+            return None
+    
+    logger.info(f"[CRITICAL] Workflow execution completed after {step + 1} steps")
+    logger.info(f"[CRITICAL] About to generate final patch...")
+    patch = tool_manager.get_final_git_patch()
+    logger.info(f"Final Patch Generated..: Length: {len(patch)}")
+
+    return patch
+
+def get_code_skeleton() -> str:
+    result = ""
+    
+    for root, _, files in os.walk("."):
+        for file in files:
+            if file.endswith(".py"):
+                file_path = os.path.join(root, file)
+                with open(file_path, "r") as f:
+                    content = f.read()
+                result += f"{file}\n{{\n{content}\n}}\n\n"
+    
+    return result
+
+def get_directory_tree(start_path: str = '.') -> str:
+
+    tree_lines = []
+    
+    def add_directory_tree(path: str, prefix: str = "", is_last: bool = True, is_root: bool = False):
+        """Recursively build the tree structure"""
+        try:
+            dir_name = os.path.basename(path) if path != '.' else os.path.basename(os.getcwd())
+            
+            if not is_root:
+                connector = "└── " if is_last else "├── "
+                tree_lines.append(f"{prefix}{connector}{dir_name}/")
+            
+            try:
+                items = os.listdir(path)
+                items = [item for item in items if not item.startswith('.')]
+                items.sort()
+                
+                dirs = []
+                files = []
+                for item in items:
+                    item_path = os.path.join(path, item)
+                    if os.path.isdir(item_path):
+                        dirs.append(item)
+                    else:
+                        files.append(item)
+                
+                for i, dir_name in enumerate(dirs):
+                    dir_path = os.path.join(path, dir_name)
+                    is_last_dir = (i == len(dirs) - 1) and len(files) == 0
+                    new_prefix = prefix + ("" if is_root else ("    " if is_last else "│   "))
+                    add_directory_tree(dir_path, new_prefix, is_last_dir, False)
+                
+                for i, file_name in enumerate(files):
+                    is_last_file = i == len(files) - 1
+                    connector = "└── " if is_last_file else "├── "
+                    tree_lines.append(f"{prefix}{'' if is_root else ('    ' if is_last else '│   ')}{connector}{file_name}")
+                    
+            except PermissionError:
+                error_prefix = prefix + ("" if is_root else ("    " if is_last else "│   "))
+                tree_lines.append(f"{error_prefix}└── [Permission Denied]")
+                
+        except Exception as e:
+            tree_lines.append(f"{prefix}└── [Error: {str(e)}]")
+    
+    add_directory_tree(start_path, is_root=True)
+    return "\n".join(tree_lines)
+
+def find_readme(file_path: str, repo_path: str) -> Optional[str]:
+    """Find README file by traversing up from the given path."""
+    current_dir = os.path.dirname(file_path)
+    
+    while True:
+        for readme_name in ['README.md', 'README.rst']:
+            readme_path = os.path.join(current_dir, readme_name)
+            if os.path.exists(readme_path):
+                return readme_path
+        if current_dir == repo_path:
+            break
+        current_dir = os.path.dirname(current_dir)
+
+    return None
+
+def find_test_runner(readme_file_path: Optional[str] = None):
+    if not readme_file_path:
+        return "pytest"
+    try:
+        with open(readme_file_path, "r", encoding='utf-8') as f:
+            readme_content = f.read()
+        
+        response = EnhancedNetwork.make_request([
+            {"role": "system", "content": FIND_TEST_RUNNER_PROMPT},
+            {"role": "user", "content": readme_content}
+        ], model=DEEPSEEK_MODEL_NAME)
+        return response.strip() or "pytest"
+    except Exception as e:
+        logger.error(f"Error finding test runner: {e}")
+        return "pytest"
+
+def filepath_to_module(file_path: str, repo_path: str, test_runner: str) -> str:
+    """Convert file path to Python module notation."""
+    root_path = os.path.abspath(repo_path)
+    abs_filepath = os.path.abspath(file_path)
+    
+    module_path = os.path.splitext(abs_filepath)[0]
+    if module_path.startswith(root_path):
+        module_path = module_path[len(root_path):].lstrip(os.path.sep)
+    test_runner_dir = os.path.dirname(test_runner)
+    if test_runner_dir and module_path.startswith(test_runner_dir):
+        module_path = module_path[len(test_runner_dir):].lstrip(os.path.sep)
+
+    return module_path.replace(os.path.sep, '.')
+
+def clean_filepath(file_path: str, repo_path: str, test_runner: str) -> str:
+    root_path = os.path.abspath(repo_path)
+    abs_filepath = os.path.abspath(file_path)
+    
+    module_path = os.path.splitext(abs_filepath)[0]
+    if module_path.startswith(root_path):
+        module_path = module_path[len(root_path):].lstrip(os.path.sep)
+
+    test_runner_dir = os.path.dirname(test_runner)
+    if test_runner_dir and module_path.startswith(test_runner_dir):
+        module_path = module_path[len(test_runner_dir):].lstrip(os.path.sep)
+    return module_path
+
+def get_test_runner_mode(test_runner: str):
+    if test_runner == 'pytest':
+        return "FILE"
+
+    try:
+        with open(test_runner, "r", encoding='utf-8') as f:
+            runner_content = f.read()
+        
+        response = EnhancedNetwork.make_request([
+            {"role": "system", "content": TEST_RUNNER_MODE_PROMPT},
+            {"role": "user", "content": runner_content}
+        ], model=DEEPSEEK_MODEL_NAME)
+        return response.strip() or "FILE"
+    except Exception as e:
+        logger.error(f"Error determining test runner mode: {e}")
+        return "FILE"
+
+def count_test_cases(file_path: str) -> int:
+    """Count the number of test cases (functions starting with 'test_') in a Python file."""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        import re
+        test_functions = re.findall(r'^\s*def\s+test_\w+', content, re.MULTILINE)
+        return len(test_functions)
+    
+    except (FileNotFoundError, UnicodeDecodeError):
+        return 0
+
+def get_test_runner_and_mode():
+    test_runner = "pytest"
+    test_runner_mode = "FILE"
+    test_files = []  # Initialize the test_files list
+    test_file_path = None
+    
+    for root, _, files in os.walk('.'):
+        for file in files:
+            if 'test_' in file and file.endswith('.py'):
+                test_files.append(os.path.join(root, file))
+    
+    test_files.sort(key=len)
+
+    for path in test_files:
+        if count_test_cases(path) > 5:
+            test_file_path = path
+            break
+
+    if not test_file_path:
+        print(f"no test file found")
+        return "pytest", "FILE"
+
+    print(f"test_file_path: {test_file_path}")
+    readme_file_path = find_readme(test_file_path, '.')
+    if readme_file_path:
+        print(f"README found: {readme_file_path}")
+        test_runner = find_test_runner(readme_file_path)
+        test_runner_mode = get_test_runner_mode(test_runner)
+    else:
+        print("No README found, using default pytest")
+    return test_runner, test_runner_mode
 
 def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: str,\
     test_runner: str = "pytest", test_runner_mode: str = "FILE", n_max_steps = MAX_FIX_TASK_STEPS) -> tuple[str, List[str], List[str]]:
@@ -2375,274 +3222,46 @@ def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: s
 
     return patch
 
-def get_code_skeleton() -> str:
-    # Initialize the result string
-    result = ""
-    
-    # Walk through the current directory
-    for root, _, files in os.walk("."):
-        for file in files:
-            # Check if the file is a Python file
-            if file.endswith(".py"):
-                file_path = os.path.join(root, file)
-                with open(file_path, "r") as f:
-                    content = f.read()
-                # Concatenate the file name and content
-                result += f"{file}\n{{\n{content}\n}}\n\n"
-    
-    return result
+def generate_initial_solution(problem_statement: str, code_skeleton: str) -> str:
+    models = determine_model_order(problem_statement)
 
-def get_directory_tree(start_path: str = '.') -> str:
-
-    tree_lines = []
-    
-    def add_directory_tree(path: str, prefix: str = "", is_last: bool = True, is_root: bool = False):
-        """Recursively build the tree structure"""
-        try:
-            # Get the directory name
-            dir_name = os.path.basename(path) if path != '.' else os.path.basename(os.getcwd())
-            
-            # Add current directory to tree (skip for root directory)
-            if not is_root:
-                connector = "└── " if is_last else "├── "
-                tree_lines.append(f"{prefix}{connector}{dir_name}/")
-            
-            # Get all items in directory
-            try:
-                items = os.listdir(path)
-                # Filter out hidden directories and files starting with '.'
-                items = [item for item in items if not item.startswith('.')]
-                items.sort()
-                
-                # Separate directories and files
-                dirs = []
-                files = []
-                for item in items:
-                    item_path = os.path.join(path, item)
-                    if os.path.isdir(item_path):
-                        dirs.append(item)
-                    else:
-                        files.append(item)
-                
-                # Process directories first
-                for i, dir_name in enumerate(dirs):
-                    dir_path = os.path.join(path, dir_name)
-                    is_last_dir = (i == len(dirs) - 1) and len(files) == 0
-                    new_prefix = prefix + ("" if is_root else ("    " if is_last else "│   "))
-                    add_directory_tree(dir_path, new_prefix, is_last_dir, False)
-                
-                # Then process files
-                for i, file_name in enumerate(files):
-                    is_last_file = i == len(files) - 1
-                    connector = "└── " if is_last_file else "├── "
-                    tree_lines.append(f"{prefix}{'' if is_root else ('    ' if is_last else '│   ')}{connector}{file_name}")
-                    
-            except PermissionError:
-                # Handle directories we can't read
-                error_prefix = prefix + ("" if is_root else ("    " if is_last else "│   "))
-                tree_lines.append(f"{error_prefix}└── [Permission Denied]")
-                
-        except Exception as e:
-            tree_lines.append(f"{prefix}└── [Error: {str(e)}]")
-    
-    add_directory_tree(start_path, is_root=True)
-    return "\n".join(tree_lines)
-
-def find_readme(file_path: str, repo_path: str) -> Optional[str]:
-    """Find README file by traversing up from the given path."""
-    current_dir = os.path.dirname(file_path)
-    
-    while True:
-        for readme_name in ['README.md', 'README.rst']:
-            readme_path = os.path.join(current_dir, readme_name)
-            if os.path.exists(readme_path):
-                return readme_path
-        if current_dir == repo_path:
-            break
-        current_dir = os.path.dirname(current_dir)
-
-    return None
-
-def find_test_runner(readme_file_path: Optional[str] = None):
-    if not readme_file_path:
-        return "pytest"
-    try:
-        with open(readme_file_path, "r", encoding='utf-8') as f:
-            readme_content = f.read()
-        
-        response = EnhancedNetwork.make_request([
-            {"role": "system", "content": FIND_TEST_RUNNER_PROMPT},
-            {"role": "user", "content": readme_content}
-        ], model=DEEPSEEK_MODEL_NAME)
-        return response.strip() or "pytest"
-    except Exception as e:
-        logger.error(f"Error finding test runner: {e}")
-        return "pytest"
-
-def filepath_to_module(file_path: str, repo_path: str, test_runner: str) -> str:
-    """Convert file path to Python module notation."""
-    root_path = os.path.abspath(repo_path)
-    abs_filepath = os.path.abspath(file_path)
-    
-    # Remove extension and make relative to repo
-    module_path = os.path.splitext(abs_filepath)[0]
-    if module_path.startswith(root_path):
-        module_path = module_path[len(root_path):].lstrip(os.path.sep)
-
-    # Adjust relative to test runner directory if needed
-    test_runner_dir = os.path.dirname(test_runner)
-    if test_runner_dir and module_path.startswith(test_runner_dir):
-        module_path = module_path[len(test_runner_dir):].lstrip(os.path.sep)
-
-    return module_path.replace(os.path.sep, '.')
-
-def clean_filepath(file_path: str, repo_path: str, test_runner: str) -> str:
-    root_path = os.path.abspath(repo_path)
-    abs_filepath = os.path.abspath(file_path)
-    
-    module_path = os.path.splitext(abs_filepath)[0]
-    if module_path.startswith(root_path):
-        module_path = module_path[len(root_path):].lstrip(os.path.sep)
-
-    test_runner_dir = os.path.dirname(test_runner)
-    if test_runner_dir and module_path.startswith(test_runner_dir):
-        module_path = module_path[len(test_runner_dir):].lstrip(os.path.sep)
-
-    return module_path
-
-def get_test_runner_mode(test_runner: str):
-    if test_runner == 'pytest':
-        return "FILE"
-
-    try:
-        with open(test_runner, "r", encoding='utf-8') as f:
-            runner_content = f.read()
-        
-        response = EnhancedNetwork.make_request([
-            {"role": "system", "content": TEST_RUNNER_MODE_PROMPT},
-            {"role": "user", "content": runner_content}
-        ], model=DEEPSEEK_MODEL_NAME)
-        return response.strip() or "FILE"
-    except Exception as e:
-        logger.error(f"Error determining test runner mode: {e}")
-        return "FILE"
-
-def count_test_cases(file_path: str) -> int:
-    """Count the number of test cases (functions starting with 'test_') in a Python file."""
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-
-        import re
-        test_functions = re.findall(r'^\s*def\s+test_\w+', content, re.MULTILINE)
-        return len(test_functions)
-    
-    except (FileNotFoundError, UnicodeDecodeError):
-        return 0
-
-def get_test_runner_and_mode():
-    test_runner = "pytest"
-    test_runner_mode = "FILE"
-    test_files = []  # Initialize the test_files list
-    test_file_path = None
-    
-    for root, _, files in os.walk('.'):
-        for file in files:
-            if 'test_' in file and file.endswith('.py'):
-                test_files.append(os.path.join(root, file))
-    
-    test_files.sort(key=len)
-
-    for path in test_files:
-        if count_test_cases(path) > 5:
-            test_file_path = path
-            break
-
-    if not test_file_path:
-        print(f"no test file found")
-        return "pytest", "FILE"
-
-    print(f"test_file_path: {test_file_path}")
-    readme_file_path = find_readme(test_file_path, '.')
-    if readme_file_path:
-        print(f"README found: {readme_file_path}")
-        test_runner = find_test_runner(readme_file_path)
-        test_runner_mode = get_test_runner_mode(test_runner)
-    else:
-        print("No README found, using default pytest")
-
-    return test_runner, test_runner_mode
-
-def agent_main(input_dict: Dict[str, Any], repo_dir: str = "repo"):
-    """Legacy interface wrapper for backwards compatibility."""
-    global DEFAULT_PROXY_URL, DEFAULT_TIMEOUT, run_id
-    run_id = os.getenv("RUN_ID", "")
-    repo_dir = os.path.abspath(repo_dir)
-
-    sys.path.insert(0, repo_dir)
-
-
-    if os.path.exists(repo_dir):
-        os.chdir(repo_dir)
-
-    ensure_git_initialized()
-
-    set_env_for_agent()
-
-    try:
-        problem_type = check_problem_type(input_dict.get("problem_statement"))
-
-        if problem_type == PROBLEM_TYPE_FIX:
-            result = process_fix_task(input_dict)
-        else:
-            result = process_create_task(input_dict)
-    except Exception as e:
-        result = process_fix_task(input_dict)
-
-    os.system("git reset --hard")
-
-    return result
-
-def generate_test_files(problem_statement: str, files_to_test: str, code_skeleton: str) -> str:
     retry = 0
     while retry < 10:
         try:
-            logger.info("Starting test cases generation")
+            logger.info("Starting multi-step reasoning solution generation")
             
-            testcases = generate_testcases_with_multi_step_reasoning(problem_statement, files_to_test, code_skeleton)
+            solution = generate_solution_with_multi_step_reasoning(problem_statement, code_skeleton)
             
-            if testcases:
-                logger.info("Generated testcases successfully using multi-step reasoning")
-                return testcases
+            if solution:
+                logger.info("Generated initial solution successfully using multi-step reasoning")
+                return solution
             else:
                 logger.warning("Multi-step reasoning failed, falling back to single-step approach")
                 
-                # Fallback to original single-step approach if multi-step fails
                 messages = [
                     {
                         "role": "system",
-                        "content": GENERATE_INITIAL_TESTCASES_PROMPT
+                        "content": GENERATE_INITIAL_SOLUTION_PROMPT
                     },
                     {
                         "role": "user",
-                        "content": f"""Problem Statement:\n{problem_statement}\n\nPython files to test:\n{files_to_test}\n\nCode skeleton: \n{code_skeleton}\n\nGenerate the ground truth and edge case coveraging testcases."""
+                        "content": f"""Problem Statement:\n{problem_statement}\n\nInitial python files:\n{code_skeleton}\n\nGenerate the complete and correct implementation in python files."""
                     }
                 ]
                 
-                response = EnhancedNetwork.make_request(messages, model=QWEN_MODEL_NAME)
+                response = EnhancedNetwork.make_request(messages, model=models[0])
                 
-                # Clean up the response
-                testcases = response.strip()
-                if testcases.startswith('```python'):
-                    testcases = testcases[9:]
-                if testcases.startswith('```'):
-                    testcases = testcases[3:]
-                if testcases.endswith('```'):
-                    testcases = testcases[:-3]
-                testcases = testcases.strip()
+                solution = response.strip()
+                if solution.startswith('```python'):
+                    solution = solution[9:]
+                if solution.startswith('```'):
+                    solution = solution[3:]
+                if solution.endswith('```'):
+                    solution = solution[:-3]
+                solution = solution.strip()
                 
-                logger.info("Generated testcases successfully using fallback approach")
-                return testcases
+                logger.info("Generated initial solution successfully using fallback approach")
+                return solution
             
         except Exception as e:
             logger.error(f"Error generating initial solution: {str(e)}")

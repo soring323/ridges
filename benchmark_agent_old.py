@@ -28,15 +28,12 @@ console = Console()
 
 # Default test problems - edit this list
 DEFAULT_TEST_PROBLEMS = [
-    # "affine-cipher",
-    # "beer-song", 
-    #"react",
-    #"robot-name",
-    #"rest-api",      # Test: JSON string format detection
-    #"book-store",    # Test: Unit conversion (cents vs dollars)
-    #"scale-generator",
-    #"grep",
-    "pov",
+    #"affine-cipher",
+    #"beer-song", 
+    "react",
+    # "rest-api",
+    # "scale-generator",
+    # "pov"
 ]
 
 
@@ -96,8 +93,8 @@ def run_agent_locally(agent_file_path: str, problem, suite, timeout: int) -> tup
         return patch, logs, elapsed, repo_dir
     finally:
         os.chdir(original_cwd)
-        if workspace_dir in sys.path:
-            sys.path.remove(workspace_dir)
+        # if workspace_dir in sys.path:
+        #     sys.path.remove(workspace_dir)
 
 
 def run_tests(repo_dir: str, problem_name: str, problem_dir: str) -> Dict:
@@ -134,7 +131,7 @@ def run_tests(repo_dir: str, problem_name: str, problem_dir: str) -> Dict:
     try:
         # Run pytest with verbose output
         result = subprocess.run(
-            [sys.executable, "-m", "pytest", repo_test_file, "-v", "--tb=short"],
+            [sys.executable, "-m", "unittest", repo_test_file, "-v"],
             cwd=repo_dir,
             capture_output=True,
             text=True,
@@ -143,28 +140,64 @@ def run_tests(repo_dir: str, problem_name: str, problem_dir: str) -> Dict:
         
         output = result.stdout + "\n" + result.stderr
         
-        # Parse test results
-        passed_match = re.search(r'(\d+) passed', output)
-        failed_match = re.search(r'(\d+) failed', output)
-        error_match = re.search(r'(\d+) error', output)
-        
-        tests_passed = int(passed_match.group(1)) if passed_match else 0
-        tests_failed = int(failed_match.group(1)) if failed_match else 0
-        tests_error = int(error_match.group(1)) if error_match else 0
-        tests_total = tests_passed + tests_failed + tests_error
+        # --- Parse summary lines ---
+        summary = {
+            "total": 0,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0,
+            "passed": 0,
+            "result": None
+        }
+
+        # 1️⃣ Extract total number of tests
+        match_total = re.search(r"Ran (\d+) tests?", output)
+        if match_total:
+            summary["total"] = int(match_total.group(1))
+
+        # 2️⃣ Extract status line ("OK" or "FAILED (...)")
+        match_result = re.search(r"^(OK|FAILED.*)$", output, re.MULTILINE)
+        if match_result:
+            summary["result"] = match_result.group(1).strip()
+
+        # 3️⃣ If FAILED line exists, extract breakdown like (failures=1, errors=1, skipped=2)
+        if summary["result"] and summary["result"].startswith("FAILED"):
+            failures = re.search(r"failures=(\d+)", summary["result"])
+            errors = re.search(r"errors=(\d+)", summary["result"])
+            skipped = re.search(r"skipped=(\d+)", summary["result"])
+            summary["failures"] = int(failures.group(1)) if failures else 0
+            summary["errors"] = int(errors.group(1)) if errors else 0
+            summary["skipped"] = int(skipped.group(1)) if skipped else 0
+
+        # 4️⃣ If OK line exists, check if skipped info is embedded (e.g., OK (skipped=1))
+        elif summary["result"] and summary["result"].startswith("OK"):
+            skipped = re.search(r"skipped=(\d+)", summary["result"])
+            summary["skipped"] = int(skipped.group(1)) if skipped else 0
+
+        # 5️⃣ Compute passed
+        summary["passed"] = (
+            summary["total"]
+            - summary["failures"]
+            - summary["errors"]
+            - summary["skipped"]
+        )
+
+        print("\n=== Parsed Summary ===")
+        for k, v in summary.items():
+            print(f"{k}: {v}")
         
         # Save test output
         test_output_file = os.path.join(problem_dir, "test_output.txt")
         with open(test_output_file, "w") as f:
             f.write(output)
         
-        console.print(f"  📊 Tests: {tests_passed}/{tests_total} passed", 
-                     style="green" if tests_passed == tests_total else "yellow")
+        console.print(f"  📊 Tests: {summary['passed']}/{summary['total']} passed", 
+                     style="green" if summary['passed'] == summary['total'] else "yellow")
         
         return {
-            "tests_passed": tests_passed,
-            "tests_total": tests_total,
-            "tests_failed": tests_failed,
+            "tests_passed": summary["passed"],
+            "tests_total": summary["total"],
+            "tests_failed": summary["failures"],
             "test_output": output,
             "error": None if result.returncode == 0 else "Tests failed"
         }
@@ -229,8 +262,12 @@ def evaluate_problem(problem_name: str, agent_file: str, timeout: int, results_d
             main_dst = os.path.join(problem_dir, "main.py")
             shutil.copy2(main_src, main_dst)
         
-        # Note: reference_solution.py removed - not needed for benchmarking
+        # Copy reference solution from original problem directory
         problem_dataset_dir = os.path.join("evaluator/datasets/polyglot", problem.name)
+        reference_solution = os.path.join(problem_dataset_dir, "solution.py")
+        if os.path.exists(reference_solution):
+            reference_dst = os.path.join(problem_dir, "reference_solution.py")
+            shutil.copy2(reference_solution, reference_dst)
         
         # Copy tests.py from dataset
         tests_src = os.path.join(problem_dataset_dir, "tests.py")
@@ -288,9 +325,8 @@ def evaluate_problem(problem_name: str, agent_file: str, timeout: int, results_d
 
 def benchmark_agent(agent_file: str, problems: List[str], timeout: int):
     """Run benchmark on all problems."""
-    # Use first problem name for directory (cleaner for single-problem runs)
-    first_problem_slug = problems[0].replace("/", "_").replace(" ", "_")
-    results_dir = os.path.join("result", f"benchmark_{first_problem_slug}")
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    results_dir = os.path.join("result", f"benchmark_{timestamp}")
     os.makedirs(results_dir, exist_ok=True)
     
     console.print("📡 Requires inference gateway at http://localhost:8000", style="cyan")
@@ -381,7 +417,7 @@ def benchmark_agent(agent_file: str, problems: List[str], timeout: int):
     
     # Save summary
     summary_data = {
-
+        "timestamp": timestamp,
         "agent_file": agent_file,
         "final_score": final_score,
         "problems_tested": len(problems),
@@ -398,7 +434,7 @@ def benchmark_agent(agent_file: str, problems: List[str], timeout: int):
         json.dump(summary_data, f, indent=2)
     
     # Create README
-    readme_content = f"""# Benchmark Results:
+    readme_content = f"""# Benchmark Results - {timestamp}
 
 ## Summary
 - **Agent**: {agent_file}
@@ -423,6 +459,7 @@ def benchmark_agent(agent_file: str, problems: List[str], timeout: int):
 
 Each problem has its own subdirectory with:
 - `main.py` - **🎯 Generated solution** by your agent (this is what was tested!)
+- `reference_solution.py` - Correct reference solution from dataset
 - `tests.py` - Test cases from dataset (executed against main.py)
 - `test_output.txt` - **📊 Complete test execution logs** with all pass/fail details
 - `agent_logs.txt` - Agent's internal execution logs
@@ -438,6 +475,7 @@ Each problem has its own subdirectory with:
 1. Check `summary.json` for overall score
 2. For each problem, review:
    - `main.py` to see what your agent generated
+   - `reference_solution.py` to see the correct implementation
    - `test_output.txt` to see which tests passed/failed and error messages
    - `agent_logs.txt` to debug agent behavior
    
@@ -445,8 +483,16 @@ Each problem has its own subdirectory with:
 
 You can re-run tests for any problem:
 ```bash
-cd result/benchmark_<problem-name>/<PROBLEM_NAME>/
+cd result/benchmark_TIMESTAMP/PROBLEM_NAME/
 python -m pytest tests.py -v
+```
+
+## Comparing Your Solution vs Reference
+
+To see how your agent's solution differs from the reference:
+```bash
+cd result/benchmark_TIMESTAMP/PROBLEM_NAME/
+diff main.py reference_solution.py
 ```
 
 ## Test Output Format
@@ -465,6 +511,7 @@ The `test_output.txt` files contain pytest output showing:
     console.print(f"   - [cyan]README.md[/cyan] - Human-readable summary")
     console.print(f"   - [cyan]summary.json[/cyan] - Machine-readable data")
     console.print(f"   - [cyan]<problem>/main.py[/cyan] - 🎯 Generated solution (tested)")
+    console.print(f"   - [cyan]<problem>/reference_solution.py[/cyan] - Reference solution (correct)")
     console.print(f"   - [cyan]<problem>/tests.py[/cyan] - Test cases from dataset")
     console.print(f"   - [cyan]<problem>/test_output.txt[/cyan] - 📊 Complete test logs")
     console.print(f"\n   Quick access: [cyan]result/latest_benchmark.json[/cyan]")

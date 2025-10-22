@@ -1,24 +1,39 @@
 """
-Competitive Programming Agent
-==============================
-A clean, focused agent for solving algorithm problems through structured reasoning.
+Dynamic Adaptive Problem Solving Agent
+========================================
+An intelligent agent that adapts its reasoning chain based on problem type, like human thinking.
 
 Design Philosophy:
-- Simple & Clear: ~400 lines vs complex multi-agent frameworks (3000+ lines)
-- Single Purpose: Optimized for competitive programming, not general SWE tasks
-- Four-Phase Approach: Analysis → Design → Implementation → Self-Testing
-- Minimal Dependencies: Only Python standard library + basic infrastructure
-- Self-Validating: Tests and debugs its own code before returning
+- 🧠 Dynamic Reasoning: LLM naturally identifies problem type, not hardcoded categories
+- 🔄 Adaptive Chain: Each phase builds on previous understanding
+- 🎯 Problem-Agnostic: Works on ANY problem type - algorithms, APIs, patterns, etc.
+- 📝 Simple & Clear: ~500 lines vs complex multi-agent frameworks (3000+ lines)
+- 🎪 Self-Validating: Tests and debugs its own code before returning
+
+Dynamic Five-Phase Approach:
+Phase 0: Problem Type Detection (Open-ended) - "What kind of problem is this?"
+Phase 1: Analysis (Adaptive) - Tailored to identified problem type
+Phase 2: Design (Adaptive) - Strategy based on problem characteristics
+Phase 3: Implementation - Following adaptive design
+Phase 4: Self-Testing & Debug - Iterative refinement (up to 3 iterations)
+
+Why Dynamic?
+Instead of "if algorithm then X, if REST API then Y", the LLM naturally determines:
+- What type of problem it is (in its own words)
+- What technical approach is needed
+- What patterns and tools to use
+→ This allows handling NEW problem types not hardcoded into the agent!
 
 Key Features:
-- 🧠 Multi-phase reasoning: Deep problem analysis before coding
+- 🧠 Natural problem understanding: No forced categorization
+- 🔄 Adaptive reasoning: Each phase informed by previous
+- 🎯 Future-proof: Handles unforeseen problem types
 - 🔧 Self-testing: Runs unit tests and auto-debugs (up to 3 iterations)
-- 📦 Standard library only: No external dependencies (numpy, pandas, etc.)
+- 📦 Standard library only: No external dependencies
 - 🔄 Retry logic: Robust LLM calls with exponential backoff
-- 📝 Code extraction: Handles various LLM response formats (```python, raw, etc.)
-- ✅ Import validation: Warns if forbidden packages detected
 
-Inspired by complex agentic frameworks but intentionally kept simple and focused.
+Think → Understand → Adapt → Implement → Validate
+Like a human brain solving problems naturally.
 """
 
 import os
@@ -34,8 +49,8 @@ if not RUN_ID:
     os.environ["RUN_ID"] = RUN_ID  # Set for consistency
 
 SANDBOX_PROXY_URL = os.getenv("SANDBOX_PROXY_URL", "http://localhost:8000")
-MODEL = "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"
-
+# MODEL = "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"
+MODEL = "deepseek-ai/DeepSeek-V3-0324"
 print(f"[AGENT] Initialized with RUN_ID: {RUN_ID}")
 
 
@@ -100,8 +115,8 @@ def call_llm(messages: list, max_retries: int = 3) -> str:
     return ""
 
 
-# ========== PHASE 1: TEST ANALYSIS ==========
-TEST_ANALYSIS_PROMPT = """Analyze the test cases to understand the exact requirements for the evaluator system.
+# ========== PHASE 0: PROBLEM TYPE DETECTION (OPEN-ENDED) ==========
+PROBLEM_TYPE_PROMPT = """You are analyzing a programming problem. Think carefully and methodically.
 
 Problem:
 {problem}
@@ -109,83 +124,310 @@ Problem:
 Code Skeleton:
 {skeleton}
 
-Test Cases:
-{test_cases}
+CHAIN OF THOUGHT - Think through each step:
 
-CRITICAL: The evaluator system will run these tests using unittest framework in a sandboxed environment. Study each test case carefully to understand:
+Step 1 - Read Carefully:
+- What does the problem ask me to build?
+- What are the key nouns (objects/entities) mentioned?
+- What are the key verbs (actions/behaviors) required?
 
-1. **Exact Method Signatures**: What methods must exist? What parameters?
-2. **Expected Behavior**: What should each method do? What should it return?
-3. **State Management**: What internal state must be maintained?
-4. **Edge Cases**: What special cases are tested?
-5. **Error Handling**: What exceptions should be raised and when?
-6. **Dependencies**: How do objects interact with each other?
-7. **Lifecycle**: When are callbacks triggered? When are values updated?
-8. **Import Compatibility**: Tests will import from main.py - ensure all required classes/functions are available
-9. **Attribute Requirements**: All attributes referenced in tests must exist and be properly initialized
-10. **Method Requirements**: All methods called in tests must exist with correct signatures
+Step 2 - Identify Domain:
+- Is this algorithmic (sorting, graphs, DP, math)?
+- Is this reactive/event-driven (callbacks, observers, state changes)?
+- Is this data manipulation (JSON, parsing, transformation)?
+- Is this OOP-focused (class design, inheritance, patterns)?
 
-EVALUATOR SYSTEM NOTES:
-- Tests run using unittest framework in isolated environment
-- Tests import directly from main.py (no package structure)
-- All classes and methods must be available at module level
-- Tests expect specific attribute names and method signatures
-- Callbacks and state changes must work exactly as expected
+Step 3 - Technical Patterns:
+- Looking at the skeleton, what methods need to be implemented?
+- Do I see patterns like: observer, state machine, builder, factory?
+- What standard library would naturally fit? (collections, json, re, itertools, etc.)
 
-For each test, identify:
-- What it's testing
-- What the expected input/output is
-- What internal state changes are required
-- What edge cases it covers
-- What attributes/methods it expects to exist
+Step 4 - Key Challenge:
+- What's the HARD part of this problem?
+- What could go wrong if I'm not careful?
 
-Output a detailed test analysis focusing on the exact requirements for the evaluator system."""
+OUTPUT (2-3 sentences):
+Describe the problem type, domain, key technical approach, and main challenge."""
 
 
-# ========== PHASE 2: DESIGN ==========
-DESIGN_PROMPT = """Design the complete algorithm based on test requirements for the evaluator system.
+# ========== PHASE 1: ANALYSIS (ADAPTIVE) ==========
+ANALYSIS_PROMPT = """Analyze this programming problem in depth.
 
-Test Analysis:
-{test_analysis}
+Problem Type (from your earlier analysis):
+{problem_type}
+
+Problem Statement:
+{problem}
+
+Code Skeleton:
+{skeleton}
+
+CHAIN OF THOUGHT - Analyze systematically:
+
+STEP 1 - List ALL Requirements:
+Read the problem statement line by line. What MUST the solution do?
+- List each requirement explicitly
+- Include both explicit AND implicit requirements
+- What behaviors are described?
+
+STEP 2 - Method Signatures (from skeleton):
+For EACH method in the skeleton:
+- Method name: ___
+- Input parameters: ___ (types and meaning)
+- Return value: ___ (type and meaning)
+- Purpose: ___
+
+STEP 3 - State Management:
+- What data must persist between method calls?
+- What data can be computed on-the-fly?
+- Best data structure: list, dict, set, custom class?
+- Why is this structure optimal?
+
+STEP 4 - Technical Approach:
+- What design pattern fits? (Observer, State Machine, Builder, etc.)
+- What standard library modules help? (collections, json, re, etc.)
+- Any special handling needed? (callbacks, JSON, parsing, etc.)
+
+STEP 5 - Edge Cases & Pitfalls:
+Standard edge cases:
+- What if inputs are empty or None?
+- What if inputs are invalid?
+- What boundary conditions exist?
+
+Pattern-specific edge cases (discover through CONCRETE EXAMPLES):
+- What design pattern did I identify in Step 4?
+
+Now think through a CONCRETE scenario for edge cases:
+1. Create a simple example with this pattern
+2. Walk through what happens step-by-step
+3. Identify where things could go wrong
+
+Example walkthrough template:
+- Initial state: ___ (describe starting values)
+- Action 1: ___ (what happens)
+- Intermediate state: ___ (what changes)
+- Action 2: ___ (what happens next)
+- Final state: ___ (result)
+
+Now ask yourself:
+- In this scenario, what SHOULD trigger notifications/updates/changes?
+- What SHOULD NOT trigger them, even though something changed?
+- Example: If a dependency changes but the computed result stays the same, what happens?
+- Example: If I update from value A → B → A (back to original), what should happen?
+
+The key question:
+- Am I reacting to INPUTS changing, or OUTPUTS changing?
+- How do I distinguish between the two?
+
+DOMAIN-SPECIFIC PATTERNS (based on problem type):
+
+If this is a REACTIVE/OBSERVER/SPREADSHEET system:
+⚠️ Common edge case: Dependencies change but computed value stays the same
+- When implementing notification logic, ask yourself:
+  * Should callbacks fire EVERY TIME a dependency changes?
+  * Or ONLY when the computed result actually changes?
+- How do you detect if a result changed? (Hint: need before & after values to compare)
+
+If this is a STATE MACHINE:
+⚠️ Common edge case: Invalid state transitions
+- When implementing transitions, ask: Is every transition valid, or only certain ones?
+- Do I need to check validity before changing state?
+
+If this is a PARSER/INTERPRETER:
+⚠️ Common edge case: Edge cases in delimiters, empty strings, malformed input
+- What if input is empty? What if delimiters are missing?
+
+If this is a GRAPH/TREE problem:
+⚠️ Common edge case: Cycles, disconnected components, empty graph
+- Need to handle cycles, ensure termination
+
+How do I avoid these pitfalls?
+
+SELF-CHECK:
+- Did I understand ALL requirements?
+- Am I clear on what each method should do?
+- Do I know what data structures to use?
+
+OUTPUT: Comprehensive analysis covering all 5 steps above."""
+
+
+# ========== PHASE 1.5: TEST EXPECTATIONS ANALYSIS (DYNAMIC) ==========
+TEST_SIGNATURE_PROMPT = """Analyze the test code to understand what the implementation must provide.
+
+Test Code:
+{test_code}
+
+Analyze and extract:
+
+1. **Method Signatures**: What methods are being called? What are their EXACT parameters?
+   - Look at how tests instantiate classes and call methods
+   - Note parameter names, types, and whether they're optional
+
+2. **Callback Patterns**: Are there callbacks, observers, or event handlers?
+   - If yes, what are their signatures?
+   - How many arguments do they receive?
+
+2.5. **Parameter Data Structures**: For each parameter passed to __init__ or methods, what is its exact structure?
+   - Look at actual test values: copy them exactly as they appear
+   - What is the nested structure? (lists, dicts, primitives, etc.)
+   - Show examples from multiple tests to reveal the pattern
+   - Based on the structure, how should the code access/iterate these values?
+
+3. **Return Value Expectations**: What do tests expect methods to return?
+   - Look at the ACTUAL VALUES in assertEqual(), assertDictEqual(), etc.
+   - What TYPE is expected? (int, str, list, dict, etc.)
+   - Are there any PATTERNS in the expected values?
+   - If strings/lists of strings: Examine the EXACT characters used (don't just read, look closely)
+
+4. **Value Format Discovery**: Compare what problem describes vs what tests expect
+   - Do problem descriptions use one format but tests expect another?
+   - If problem shows certain symbols/characters, what do tests actually use?
+   - Are the characters IDENTICAL or just similar-looking?
+   - Look for discrepancies between problem statement units/formats and test expectations
+
+5. **Input Handling**: What formats/types do tests pass as input?
+   - Look at test data - what variations are tested?
+   - Are there edge cases in the input formats?
+
+6. **Special Behaviors**: Any decorators, properties, magic methods, or special patterns?
+
+7. **Callback/Observer Edge Cases** (if callbacks exist):
+   For EACH test with "not", "shouldn't", "only", or conditional language:
+   
+   Step A: List the test name
+   Step B: Break down what the test name says:
+     - What behavior is being tested?
+     - What condition must be met?
+     - What should happen vs NOT happen?
+   
+   Step C: Derive the implementation requirement:
+     - What must my code CHECK before doing something?
+     - What information do I need to make that check?
+   
+   Breakdown:
+   - "callbacks" = testing callback notification
+   - "should_not_be_called" = callbacks must NOT fire
+   - "if_dependencies_change" = even though inputs changed
+   - "but_output_value_doesn't_change" = when result stays same
+   
+   Implementation requirement:
+   → Before notifying callbacks, CHECK if output value actually changed
+   → Need: old_output and new_output to compare
+   → Logic: if old != new, THEN notify
+   
+   Do this analysis for ALL conditional tests!
+
+⚠️ CRITICAL THINKING:
+- Examine ACTUAL VALUES in test assertions - they reveal the truth!
+- Read TEST NAMES - they describe EXACT behavior expected
+- If problem says one thing but tests expect another, trust the tests
+- Look for patterns across multiple test cases
+- Negative tests (should NOT happen) are as important as positive tests
+- Only mention requirements you can DIRECTLY OBSERVE in the tests
+
+Be specific and evidence-based. Quote test lines if helpful."""
+
+
+# ========== PHASE 2: DESIGN (ADAPTIVE) ==========
+DESIGN_PROMPT = """Design the complete solution.
+
+Problem Type:
+{problem_type}
+
+Analysis:
+{analysis}
+
+Test Signatures (CRITICAL - match these exactly):
+{test_signatures}
 
 Skeleton:
 {skeleton}
 
-EVALUATOR COMPATIBILITY REQUIREMENTS:
-- All classes must be defined at module level (no nested classes)
-- All methods must be accessible to unittest framework
-- All attributes referenced in tests must exist and be properly initialized
-- Import statements must be compatible with direct module import
-- No external dependencies beyond Python standard library
+CHAIN OF THOUGHT - Design step-by-step:
 
-Design Requirements:
-1. **Class Structure**: Exact class names, inheritance, attributes
-2. **Method Signatures**: Exact method names, parameters, return types
-3. **State Management**: All internal attributes and their purposes
-4. **Dependencies**: How objects reference each other
-5. **Lifecycle**: When values are computed, when callbacks fire
-6. **Error Handling**: What exceptions to raise and when
-7. **Edge Cases**: How to handle special cases from tests
-8. **Attribute Initialization**: ALL attributes must be initialized in __init__
+STEP 1 - Class Attributes (Instance Variables):
+What data needs to be stored in __init__?
+- List each attribute: self.___ = ___
+- What is its type? (list, dict, set, etc.)
+- What is its initial value?
+- Why do we need it?
 
-For each class:
-- List ALL attributes (including private ones like _dependent_cells, _callbacks)
-- List ALL methods with exact signatures
-- Describe the purpose of each attribute and method
-- Explain how objects interact (dependencies, updates, callbacks)
-- Specify which attributes are initialized in __init__
+STEP 2 - Method Design (One by one):
+For EACH method in the skeleton, design its logic:
 
-For each method:
-- What it does
-- What it returns
-- What side effects it has
-- When it's called
-- What exceptions it might raise
-- How it interacts with other objects
+Method: ___
+Inputs: ___
+Output: ___
+Algorithm:
+  1. First, do ___
+  2. Then, do ___
+  3. Finally, return ___
+State changes: What attributes get modified?
 
-CRITICAL: Ensure every attribute and method referenced in the test cases exists and works exactly as expected by the unittest framework.
+STEP 3 - Data Flow:
+Walk through a concrete example:
+- Start: Initial state is ___
+- Call method1(args) → state becomes ___
+- Call method2(args) → state becomes ___
+- Result: ___
 
-Be extremely specific about data structures and relationships."""
+Now walk through an EDGE CASE scenario:
+- What if I do the same operation twice?
+- What if an input changes but computed output doesn't?
+- What if I go back to a previous state?
+- In each case: What SHOULD happen vs what MIGHT happen if I implement naively?
+
+STEP 4 - Edge Cases:
+For each edge case from analysis, design the handling:
+- Edge case: ___
+- How to handle: ___
+- Where to check: in method ___
+
+For pattern-specific edge cases (based on YOUR pattern):
+- If my pattern involves notifications/callbacks/observers:
+  * What condition determines whether to notify?
+  * Do I need to compare something before notifying?
+  * What information do I need to make this comparison?
+- If my pattern involves state/dependencies:
+  * What triggers an update?
+  * Should ALL changes trigger updates, or only CERTAIN changes?
+  * How do I distinguish between the two?
+
+REMINDER - Domain-Specific Design Patterns:
+
+For REACTIVE/OBSERVER systems:
+- Design the notification logic carefully:
+  1. Store current value BEFORE recomputing
+  2. Compute new value
+  3. Compare old vs new
+  4. Only notify if different
+- Why? Input changes don't always mean output changes
+
+For STATE MACHINES:
+- Design transition validation:
+  1. Check if transition is valid
+  2. If valid, change state
+  3. If invalid, raise error or ignore
+
+For CACHING systems:
+- Design invalidation logic:
+  1. Check if cached value is still valid
+  2. If invalid, recompute
+  3. Store and return new value
+
+STEP 5 - Critical Details:
+⚠️ VERIFY these match test expectations:
+- Method signatures: Do parameter names/types match tests?
+- Return types: Do return values match test assertions?
+- Callback signatures: If tests pass callbacks, how many args do they take?
+
+SELF-CHECK before moving to implementation:
+✓ Did I design ALL methods from skeleton?
+✓ Are ALL attributes initialized in __init__?
+✓ Did I handle ALL edge cases?
+✓ Do signatures match test expectations?
+
+OUTPUT: Complete design covering all steps above, ready to implement."""
 
 
 # ========== PHASE 3: IMPLEMENTATION ==========
@@ -194,82 +436,68 @@ IMPL_PROMPT = """Generate ONLY valid Python code - NO explanations, NO markdown,
 Design:
 {design}
 
+Test Signatures (MATCH EXACTLY):
+{test_signatures}
+
 Skeleton:
 {skeleton}
-
-Test Cases:
-{test_cases}
 
 OUTPUT FORMAT - ONLY THIS, NOTHING ELSE:
 ```python
 <YOUR COMPLETE WORKING CODE HERE>
 ```
 
-EVALUATOR SYSTEM REQUIREMENTS:
+CRITICAL REQUIREMENTS:
 - ⚠️ USE ONLY PYTHON STANDARD LIBRARY (no numpy, pandas, external packages)
-- All classes must be defined at module level (no nested classes)
-- All classes and methods must be importable by unittest framework
-- Implement EXACTLY what the tests expect - match method signatures precisely
-- Initialize ALL attributes in __init__ (including _dependent_cells, _callbacks, etc.)
+- ⚠️ MATCH FUNCTION SIGNATURES EXACTLY (wrong signatures = TypeError)
+- Store ALL parameters in __init__
+- Initialize ALL data structures
 - Implement ALL methods (NO pass statements)
-- Handle ALL edge cases from the test cases
-- Ensure proper object relationships and dependencies
+- Handle edge cases
 - Valid Python syntax only
 - Self-contained code that runs without external dependencies
 
-CRITICAL FOR EVALUATOR COMPATIBILITY:
-- Every attribute referenced in tests must exist and be initialized
-- Every method called in tests must exist with correct signature
-- All classes must be available for direct import from main.py
-- Callbacks and state management must work exactly as expected
-- No missing functionality that tests depend on
+ALLOWED IMPORTS: 
+- Standard library only: collections, itertools, math, re, functools, json, etc.
 
-VALIDATION CHECKLIST:
-- All classes have required attributes initialized in __init__
-- All methods match test expectations exactly
-- Dependencies between objects are properly maintained
-- Callbacks are triggered at the right times
-- Edge cases from tests are handled
-- No missing attributes or methods
-- Code is compatible with unittest framework
-- All test requirements are met
+FORBIDDEN: 
+- numpy, pandas, scipy, requests, flask, django, any external packages
 
-ALLOWED: collections, itertools, math, re, functools, etc. (built-in modules)
-FORBIDDEN: numpy, pandas, scipy, requests, any external packages
+BEFORE YOU CODE - VERIFY YOUR UNDERSTANDING:
+1. ✓ I know EXACTLY what each method should do
+2. ✓ I know EXACTLY what data structures to use
+3. ✓ I know EXACTLY what to return from each method
+4. ✓ I've checked the test signatures - parameter names match
+5. ✓ I've checked the test signatures - return types match
+6. ✓ I know how to handle edge cases (empty inputs, invalid data, etc.)
+
+IMPLEMENTATION CHECKLIST (verify as you code):
+□ __init__: Store ALL constructor parameters as instance variables
+□ __init__: Initialize ALL data structures (lists, dicts, etc.) to proper initial values
+□ Each method: Implement the EXACT algorithm from the design
+□ Each method: Use the EXACT parameter names from the skeleton
+□ Each method: Return the EXACT type expected by tests
+□ Edge cases: Add checks for empty/invalid inputs
+□ State: Update instance variables correctly when state changes
+□ Standard library only: No numpy, pandas, requests, etc.
+□ Callbacks/notifications: Did I implement the correct trigger condition from my design?
+
+COMMON MISTAKES TO AVOID:
+- Don't change parameter names from skeleton
+- Don't forget to store constructor parameters
+- Don't return wrong type (e.g., string instead of list)
+- Don't use external libraries
+- Don't leave any method with just 'pass'
 
 START YOUR RESPONSE WITH ```python AND END WITH ```
 NO TEXT BEFORE OR AFTER THE CODE BLOCK."""
 
 
-# ========== PHASE 4: VALIDATION ==========
-VALIDATION_PROMPT = """Validate the generated code against test requirements.
+# ========== PHASE 4: DEBUG ==========
+DEBUG_PROMPT = """Fix the failing tests. Output ONLY corrected Python code.
 
-Generated Code:
-{code}
-
-Test Cases:
-{test_cases}
-
-Validation Checklist:
-1. **Class Structure**: Do all required classes exist with correct names?
-2. **Attributes**: Are all required attributes initialized in __init__?
-3. **Methods**: Do all required methods exist with correct signatures?
-4. **Dependencies**: Are object relationships properly maintained?
-5. **Logic**: Does the business logic match test expectations?
-6. **Edge Cases**: Are all edge cases from tests handled?
-7. **Error Handling**: Are exceptions raised when expected?
-
-For each test case, verify:
-- The code can handle the test's input
-- The code produces the expected output
-- All required attributes and methods exist
-- Dependencies are properly maintained
-
-Output detailed validation results."""
-
-
-# ========== PHASE 5: DEBUG ==========
-DEBUG_PROMPT = """Fix the failing tests for the evaluator system. Output ONLY corrected Python code.
+Original Problem Statement:
+{problem}
 
 Current Code:
 {code}
@@ -277,47 +505,55 @@ Current Code:
 Test Failures:
 {test_output}
 
-Original Test Cases:
-{test_cases}
+Expected Test Signatures (match these exactly):
+{test_signatures}
 
-EVALUATOR SYSTEM ANALYSIS:
-1. **AttributeError Analysis**: What attributes are missing or not initialized?
-2. **MethodError Analysis**: What methods are missing or have wrong signatures?
-3. **ImportError Analysis**: Are all classes/functions available for import?
-4. **Logic Problems**: What business logic is incorrect?
-5. **Dependency Issues**: How are object relationships broken?
-6. **Callback Issues**: Are callbacks working as expected?
-7. **State Management**: Are object states being maintained correctly?
+CHAIN OF THOUGHT - Debug systematically:
 
-FIX REQUIREMENTS FOR EVALUATOR:
+STEP 1 - Read the Error Carefully:
+- What TYPE of error? (TypeError, AssertionError, AttributeError, etc.)
+- Which test failed? What does the test name tell me?
+- What is EXPECTED vs ACTUAL? Write them down:
+  Expected: ___
+  Actual: ___
+
+STEP 2 - Identify the Root Cause:
+Ask yourself:
+- Is this a TYPE error? (returning wrong type - str vs list, int vs str, etc.)
+- Is this a LOGIC error? (wrong algorithm, wrong calculation)
+- Is this a SIGNATURE error? (wrong parameter names, wrong number of parameters)
+- Is this a STATE error? (not updating/storing data correctly)
+- Is this an EDGE CASE? (empty input, None, boundary value)
+
+STEP 3 - Find WHERE the Bug Is:
+- Which METHOD is causing the failure?
+- Which LINE in that method is wrong?
+- What is the code doing vs what should it do?
+
+STEP 4 - Plan the Fix:
+- What EXACTLY needs to change?
+- Will this fix break anything else?
+- Does this fix ALL similar failures or just one?
+
+STEP 5 - Verify the Fix:
+Before outputting code, check:
+✓ Did I fix the root cause, not just the symptom?
+✓ Did I keep all working code unchanged?
+✓ Will this pass ALL tests, not just the failing one?
+
+COMMON BUG PATTERNS:
+- Forgot to store parameter in __init__
+- Returning wrong type (str instead of list, etc.)
+- Not updating state correctly
+- Wrong callback signature (wrong number of parameters)
+- Off-by-one error in loops/indexing
+- Not handling empty/None inputs
+
+REQUIREMENTS:
 - ⚠️ USE ONLY PYTHON STANDARD LIBRARY (no numpy, pandas, external packages)
-- Fix ALL bugs causing test failures
-- Ensure ALL required attributes exist and are initialized in __init__
-- Implement ALL missing methods with correct signatures
-- Fix object relationships and dependencies
-- Handle ALL edge cases from original tests
-- Ensure code is compatible with unittest framework
-- Make sure all classes are available for direct import
+- Fix the bugs causing test failures
+- Keep working code unchanged
 - Valid Python syntax only
-
-CRITICAL FIXES:
-- Initialize ALL attributes in __init__ methods
-- Implement ALL methods referenced in tests
-- Fix AttributeError issues by adding missing attributes
-- Fix MethodError issues by implementing missing methods
-- Ensure callbacks work exactly as expected
-- Fix object dependency relationships
-- Handle all edge cases from test cases
-
-VALIDATION CHECKLIST:
-- All AttributeError issues resolved
-- All methods implemented correctly with right signatures
-- Dependencies properly maintained
-- Callbacks work as expected
-- Edge cases handled
-- No missing functionality
-- Code compatible with unittest framework
-- All test requirements met
 
 OUTPUT FORMAT - ONLY THIS:
 ```python
@@ -337,8 +573,8 @@ def read_skeleton(repo_dir: str) -> str:
     return ""
 
 
-def read_test_cases(repo_dir: str) -> str:
-    """Read test cases if they exist."""
+def read_tests(repo_dir: str) -> str:
+    """Read tests.py if it exists."""
     test_path = os.path.join(repo_dir, "tests.py")
     if os.path.exists(test_path):
         with open(test_path, "r") as f:
@@ -346,104 +582,11 @@ def read_test_cases(repo_dir: str) -> str:
     return ""
 
 
-def analyze_test_failures(test_output: str) -> dict:
-    """Analyze test failures to extract key error patterns."""
-    import re
-    
-    errors = {
-        "attribute_errors": [],
-        "method_errors": [],
-        "logic_errors": [],
-        "import_errors": [],
-        "syntax_errors": []
-    }
-    
-    # Extract AttributeError patterns
-    attr_errors = re.findall(r"AttributeError: '(\w+)' object has no attribute '(\w+)'", test_output)
-    for class_name, attr_name in attr_errors:
-        errors["attribute_errors"].append(f"{class_name} missing {attr_name}")
-    
-    # Extract method call errors
-    method_errors = re.findall(r"TypeError: '(\w+)' object is not callable", test_output)
-    for obj_name in method_errors:
-        errors["method_errors"].append(f"{obj_name} is not callable")
-    
-    # Extract assertion errors
-    assertion_errors = re.findall(r"AssertionError: (.+)", test_output)
-    for error in assertion_errors:
-        errors["logic_errors"].append(error)
-    
-    return errors
-
-
-def validate_evaluator_compatibility(code: str, test_cases: str) -> tuple[bool, list[str]]:
-    """Validate that code will work with the evaluator system."""
-    import re
-    
-    issues = []
-    
-    # Check for required classes mentioned in tests
-    class_patterns = re.findall(r'class (\w+)', test_cases)
-    for class_name in class_patterns:
-        if f"class {class_name}" not in code:
-            issues.append(f"Missing class: {class_name}")
-    
-    # Check for required methods mentioned in tests
-    method_patterns = re.findall(r'def (test_\w+)', test_cases)
-    for method_name in method_patterns:
-        # Extract the actual method being tested
-        test_content = re.search(rf'def {method_name}\(.*?\):(.*?)(?=def|\Z)', test_cases, re.DOTALL)
-        if test_content:
-            test_body = test_content.group(1)
-            # Look for method calls in the test
-            method_calls = re.findall(r'(\w+)\.(\w+)\(', test_body)
-            for obj_name, method_name in method_calls:
-                if f"def {method_name}" not in code and f"self.{method_name}" not in code:
-                    issues.append(f"Missing method: {method_name}")
-    
-    # Check for attribute access in tests
-    attr_patterns = re.findall(r'(\w+)\.(\w+)(?![(])', test_cases)
-    for obj_name, attr_name in attr_patterns:
-        if f"self.{attr_name}" not in code and f".{attr_name}" not in code:
-            issues.append(f"Missing attribute: {attr_name}")
-    
-    # Check for proper __init__ methods
-    class_defs = re.findall(r'class (\w+).*?:', code)
-    for class_name in class_defs:
-        if f"class {class_name}" in code:
-            class_content = re.search(rf'class {class_name}.*?:(.*?)(?=class|\Z)', code, re.DOTALL)
-            if class_content and "def __init__" not in class_content.group(1):
-                issues.append(f"Missing __init__ method in class: {class_name}")
-    
-    return len(issues) == 0, issues
-
-
-def validate_imports(code: str) -> tuple[bool, list[str]]:
-    """Check if code only uses standard library imports."""
-    import re
-    
-    # List of forbidden packages
-    FORBIDDEN = {
-        'numpy', 'np', 'pandas', 'pd', 'scipy', 'sklearn', 'tensorflow', 'tf',
-        'torch', 'requests', 'flask', 'django', 'matplotlib', 'seaborn',
-        'bs4', 'beautifulsoup', 'selenium', 'scrapy', 'sqlalchemy'
-    }
-    
-    # Find all import statements
-    imports = re.findall(r'^\s*(?:from|import)\s+(\w+)', code, re.MULTILINE)
-    
-    forbidden_found = []
-    for imp in imports:
-        if imp in FORBIDDEN:
-            forbidden_found.append(imp)
-    
-    return len(forbidden_found) == 0, forbidden_found
-
-
 def extract_code_from_response(response: str) -> str:
     """
     Extract Python code from LLM response.
-    Handles multiple formats: filename.py\n<code>\n, ```python blocks, etc.
+    Handles format: filename.py\n<code>\n
+    Inspired by reference implementation's extract_and_write_files.
     """
     lines = response.split('\n')
     current_filename = None
@@ -474,48 +617,6 @@ def extract_code_from_response(response: str) -> str:
     # Return content for main.py if found
     if current_filename == 'main.py' and current_content:
         return '\n'.join(current_content).strip()
-    
-    return None
-
-
-def extract_python_code_robust(response: str) -> str:
-    """
-    Robust Python code extraction with multiple strategies.
-    """
-    import re
-    
-    # Strategy 1: Look for ```python blocks
-    python_blocks = re.findall(r'```python\s*\n(.*?)```', response, re.DOTALL)
-    if python_blocks:
-        return python_blocks[0].strip()
-    
-    # Strategy 2: Look for generic ``` blocks
-    generic_blocks = re.findall(r'```\s*\n(.*?)```', response, re.DOTALL)
-    if generic_blocks:
-        return generic_blocks[0].strip()
-    
-    # Strategy 3: Look for filename + content format
-    extracted = extract_code_from_response(response)
-    if extracted:
-        return extracted
-    
-    # Strategy 4: Look for Python keywords and extract from there
-    lines = response.strip().split('\n')
-    start_idx = 0
-    
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if (stripped.startswith(('def ', 'class ', 'import ', 'from ')) or
-            (stripped.startswith('#') and i < 5)):
-            start_idx = i
-            break
-    
-    if start_idx > 0:
-        return '\n'.join(lines[start_idx:]).strip()
-    
-    # Strategy 5: Return the whole response if it looks like Python
-    if any(keyword in response for keyword in ['def ', 'class ', 'import ', 'from ']):
-        return response.strip()
     
     return None
 
@@ -552,13 +653,41 @@ def write_solution(repo_dir: str, code: str):
         code = code[:-3].strip()  # Remove closing ```
         print(f"[AGENT DEBUG] 🧹 Removed ``` suffix")
     
-    # Use robust extraction
-    extracted = extract_python_code_robust(code)
+    # Strategy 1: Try filename + content format (main.py\n<code>)
+    extracted = extract_code_from_response(code)
     if extracted:
         code = extracted
-        print(f"[AGENT DEBUG] ✅ Extracted using robust method: {len(code)} chars")
+        print(f"[AGENT DEBUG] ✅ Extracted from filename+content format: {len(code)} chars")
     else:
-        print(f"[AGENT DEBUG] ⚠️ Robust extraction failed, using original")
+        # Strategy 2: Try ```python blocks (in case still nested)
+        import re
+        python_blocks = re.findall(r'```python\s*\n(.*?)```', code, re.DOTALL)
+        
+        if python_blocks:
+            code = python_blocks[0].strip()
+            print(f"[AGENT DEBUG] ✅ Extracted from nested ```python block: {len(code)} chars")
+        else:
+            # Strategy 3: Try generic ``` blocks
+            generic_blocks = re.findall(r'```\s*\n(.*?)```', code, re.DOTALL)
+            if generic_blocks:
+                code = generic_blocks[0].strip()
+                print(f"[AGENT DEBUG] ✅ Extracted from nested ``` block: {len(code)} chars")
+            else:
+                # Strategy 4: Look for Python keywords
+                print(f"[AGENT DEBUG] 🔍 Looking for Python keywords...")
+                lines = code.strip().split("\n")
+                
+                start_idx = 0
+                for i, line in enumerate(lines):
+                    stripped = line.strip()
+                    if (stripped.startswith(('def ', 'class ', 'import ', 'from ')) or
+                        (stripped.startswith('#') and i < 5)):
+                        start_idx = i
+                        print(f"[AGENT DEBUG] Found Python code at line {i}")
+                        break
+                
+                code = "\n".join(lines[start_idx:]).strip()
+                print(f"[AGENT DEBUG] ✅ Extracted from line {start_idx}: {len(code)} chars")
     
     # Final validation
     if not code or len(code) < 10:
@@ -568,11 +697,6 @@ def write_solution(repo_dir: str, code: str):
         print(original[:1000])
         print("=" * 80)
         code = original.strip()
-    
-    # Validate imports (only standard library)
-    valid, forbidden = validate_imports(code)
-    if not valid:
-        print(f"[AGENT WARNING] ⚠️ Code uses forbidden packages: {', '.join(forbidden)}")
     
     # Write to file
     main_path = os.path.join(repo_dir, "main.py")
@@ -660,7 +784,17 @@ def generate_patch(repo_dir: str) -> str:
 
 def agent_main(input_dict: dict) -> str:
     """
-    Main entry point for competitive programming agent.
+    Main entry point for dynamic adaptive problem solving agent.
+    
+    Dynamic 5-Phase Approach:
+    0. Problem Type Detection (Open-ended) - LLM naturally identifies problem type
+    1. Analysis (Adaptive) - Tailored to identified type
+    2. Design (Adaptive) - Strategy based on problem characteristics
+    3. Implementation - Following adaptive design
+    4. Self-Testing & Debug - Iterative refinement
+    
+    This approach allows the agent to handle ANY problem type, including ones
+    not explicitly programmed, by letting the LLM naturally understand and adapt.
     
     Args:
         input_dict: Dict with 'problem_statement' key
@@ -668,9 +802,9 @@ def agent_main(input_dict: dict) -> str:
     Returns:
         Git diff patch of the solution
     """
-    print("[AGENT] ========================================")
-    print("[AGENT] Competitive Programming Agent Started")
-    print("[AGENT] ========================================")
+    print("[AGENT] ================================================")
+    print("[AGENT] 🧠 Dynamic Adaptive Problem Solving Agent Started")
+    print("[AGENT] ================================================")
     
     problem = input_dict.get("problem_statement", "")
     if not problem:
@@ -684,33 +818,70 @@ def agent_main(input_dict: dict) -> str:
     print(f"[AGENT] Using repo_dir: {repo_dir}")
     print(f"[AGENT] Problem: {len(problem)} chars")
     
-    # Read skeleton and test cases
+    # Read skeleton
     skeleton = read_skeleton(repo_dir)
-    test_cases = read_test_cases(repo_dir)
     print(f"[AGENT] Skeleton: {len(skeleton)} chars")
-    print(f"[AGENT] Test cases: {len(test_cases)} chars")
+    
+    # Read tests
+    test_code = read_tests(repo_dir)
+    print(f"[AGENT] Tests: {len(test_code)} chars")
     
     # Initialize git
     init_git(repo_dir)
     
-    # ========== PHASE 1: TEST ANALYSIS ==========
-    print("\n[AGENT] ===== PHASE 1: TEST ANALYSIS =====")
-    test_analysis = call_llm([{
+    # ========== PHASE 0: PROBLEM TYPE DETECTION (DYNAMIC) ==========
+    print("\n[AGENT] ===== PHASE 0: PROBLEM TYPE DETECTION =====")
+    print("[AGENT] 🧠 Letting LLM naturally identify the problem type...")
+    problem_type = call_llm([{
         "role": "user",
-        "content": TEST_ANALYSIS_PROMPT.format(problem=problem, skeleton=skeleton, test_cases=test_cases)
+        "content": PROBLEM_TYPE_PROMPT.format(problem=problem, skeleton=skeleton)
     }])
     
-    if not test_analysis:
-        print("[AGENT] ERROR: Test analysis failed")
+    if not problem_type:
+        print("[AGENT] ERROR: Problem type detection failed")
         return ""
     
-    print(f"[AGENT] Test analysis: {len(test_analysis)} chars")
+    print(f"[AGENT] ✅ Problem Type Identified: {len(problem_type)} chars")
+    print(f"[AGENT] Preview: {problem_type[:200]}...")
     
-    # ========== PHASE 2: DESIGN ==========
-    print("\n[AGENT] ===== PHASE 2: DESIGN =====")
+    # ========== PHASE 1: ANALYSIS (ADAPTIVE) ==========
+    print("\n[AGENT] ===== PHASE 1: ANALYSIS (ADAPTIVE) =====")
+    print("[AGENT] 🎯 Tailoring analysis based on identified problem type...")
+    analysis = call_llm([{
+        "role": "user",
+        "content": ANALYSIS_PROMPT.format(problem_type=problem_type, problem=problem, skeleton=skeleton)
+    }])
+    
+    if not analysis:
+        print("[AGENT] ERROR: Analysis failed")
+        return ""
+    
+    print(f"[AGENT] Analysis: {len(analysis)} chars")
+    
+    # ========== PHASE 1.5: TEST EXPECTATIONS ANALYSIS (DYNAMIC) ==========
+    print("\n[AGENT] ===== PHASE 1.5: TEST EXPECTATIONS ANALYSIS =====")
+    print("[AGENT] 🔍 Discovering what tests reveal about requirements...")
+    if test_code:
+        test_signatures = call_llm([{
+            "role": "user",
+            "content": TEST_SIGNATURE_PROMPT.format(test_code=test_code)
+        }])
+        print(f"[AGENT] Test Expectations: {len(test_signatures)} chars")
+    else:
+        print("[AGENT] ⚠️ No tests found, skipping expectations analysis")
+        test_signatures = "No tests available"
+    
+    # ========== PHASE 2: DESIGN (ADAPTIVE) ==========
+    print("\n[AGENT] ===== PHASE 2: DESIGN (ADAPTIVE) =====")
+    print("[AGENT] 📐 Creating design tailored to problem type...")
     design = call_llm([{
         "role": "user",
-        "content": DESIGN_PROMPT.format(test_analysis=test_analysis, skeleton=skeleton)
+        "content": DESIGN_PROMPT.format(
+            problem_type=problem_type,
+            analysis=analysis,
+            test_signatures=test_signatures,
+            skeleton=skeleton
+        )
     }])
     
     if not design:
@@ -723,7 +894,11 @@ def agent_main(input_dict: dict) -> str:
     print("\n[AGENT] ===== PHASE 3: IMPLEMENTATION =====")
     code = call_llm([{
         "role": "user",
-        "content": IMPL_PROMPT.format(design=design, skeleton=skeleton, test_cases=test_cases)
+        "content": IMPL_PROMPT.format(
+            design=design,
+            test_signatures=test_signatures,
+            skeleton=skeleton
+        )
     }])
     
     if not code:
@@ -733,27 +908,8 @@ def agent_main(input_dict: dict) -> str:
     print(f"[AGENT] Implementation: {len(code)} chars")
     write_solution(repo_dir, code)
     
-    # ========== PHASE 4: VALIDATION ==========
-    print("\n[AGENT] ===== PHASE 4: VALIDATION =====")
-    
-    # Check evaluator compatibility
-    is_compatible, compatibility_issues = validate_evaluator_compatibility(code, test_cases)
-    if not is_compatible:
-        print(f"[AGENT] ⚠️ Evaluator compatibility issues: {compatibility_issues}")
-    else:
-        print(f"[AGENT] ✅ Code is compatible with evaluator system")
-    
-    validation = call_llm([{
-        "role": "user",
-        "content": VALIDATION_PROMPT.format(code=code, test_cases=test_cases)
-    }])
-    
-    if validation:
-        print(f"[AGENT] Validation: {len(validation)} chars")
-        print(f"[AGENT] Validation results: {validation[:200]}...")
-    
-    # ========== PHASE 5: SELF-TESTING & DEBUG ==========
-    print("\n[AGENT] ===== PHASE 5: SELF-TESTING & DEBUG =====")
+    # ========== PHASE 4: SELF-TESTING & DEBUG ==========
+    print("\n[AGENT] ===== PHASE 4: SELF-TESTING & DEBUG =====")
     print("[AGENT] Running unit tests against generated code...")
     
     max_iterations = 3
@@ -769,10 +925,6 @@ def agent_main(input_dict: dict) -> str:
         if iteration < max_iterations - 1:
             print(f"[AGENT] ❌ Tests failed, analyzing failures and regenerating code...")
             
-            # Analyze test failures
-            error_analysis = analyze_test_failures(test_output)
-            print(f"[AGENT] 🔍 Error analysis: {error_analysis}")
-            
             # Read current code
             with open(os.path.join(repo_dir, "main.py"), "r") as f:
                 current_code = f.read()
@@ -781,7 +933,12 @@ def agent_main(input_dict: dict) -> str:
             print(f"[AGENT] 🔧 Debugging failed tests...")
             fixed_code = call_llm([{
                 "role": "user",
-                "content": DEBUG_PROMPT.format(code=current_code, test_output=test_output, test_cases=test_cases)
+                "content": DEBUG_PROMPT.format(
+                    problem=problem,
+                    code=current_code,
+                    test_output=test_output,
+                    test_signatures=test_signatures
+                )
             }])
             
             if fixed_code:

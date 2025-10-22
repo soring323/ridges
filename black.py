@@ -89,7 +89,7 @@ DO NOT generate `observation:` in your response. It will be provided by user for
 Generate only SINGLE triplet of `next_thought`, `next_tool_name`, `next_tool_args` in your response.
 """)
 
-DEFAULT_PROXY_URL = os.getenv("SANDBOX_PROXY_URL", "http://localhost:8000")
+DEFAULT_PROXY_URL = os.getenv("SANDBOX_PROXY_URL", "http://sandbox_proxy")
 DEFAULT_TIMEOUT = int(os.getenv("AGENT_TIMEOUT", "2000"))
 
 PROBLEM_TYPE_CREATE = "CREATE"

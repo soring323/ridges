@@ -1,15 +1,14 @@
 from __future__ import annotations
-import ast
-import json
 import os
 import requests
 import subprocess
-import ast, sys
+import sys
+import ast
 import textwrap
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from json import JSONDecodeError
 import re
 import inspect
@@ -20,11 +19,27 @@ import csv
 import logging
 from uuid import uuid4
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+# default values from env
+DEFAULT_PROXY_URL = os.getenv("SANDBOX_PROXY_URL", "http://sandbox_proxy")
+DEFAULT_TIMEOUT = int(os.getenv("AGENT_TIMEOUT", "2000"))
+MAX_TEST_PATCH_TIMEOUT = int(os.getenv("MAX_STEPS_TEST_PATCH_FIND", "400"))
 
+# available models
+GLM_MODEL_NAME = "zai-org/GLM-4.5-FP8"
+KIMI_MODEL_NAME = "moonshotai/Kimi-K2-Instruct"
+DEEPSEEK_MODEL_NAME = "deepseek-ai/DeepSeek-V3-0324"
+QWEN_MODEL_NAME = "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"
+AGENT_MODELS=[GLM_MODEL_NAME, KIMI_MODEL_NAME, DEEPSEEK_MODEL_NAME, QWEN_MODEL_NAME]
+MAX_FIX_TASK_STEPS = 400
+
+# set logger
+logger = logging.getLogger(__name__)
+
+logger.setLevel(logging.DEBUG)
+# env for logger
 for h in list(logger.handlers):
     logger.removeHandler(h)
+
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 stream_handler = logging.StreamHandler(sys.stdout)
@@ -33,19 +48,28 @@ stream_handler.setFormatter(formatter)
 logger.addHandler(stream_handler)
 run_id=None
 
+# constans and prompts
+PROBLEM_TYPE_CREATE = "CREATE"
+PROBLEM_TYPE_FIX = "FIX"
+
+STOP_INSTRUCTION = textwrap.dedent("""
+# 🎨 
+DO NOT generate `observation:` in your response. It will be provided by user for you.
+Generate only SINGLE triplet of `next_thought`, `next_tool_name`, `next_tool_args` in your response.
+""")
+
 PROBLEM_TYPE_CHECK_PROMPT = textwrap.dedent(
 '''
-You are the problem type checker that will categories problem type into:
+You are a problem type checker that check whether problem type is one of following:
 
 1. CREATE: If the problem statement is about creating a new functionality from scratch.
 2. FIX: If the problem statement is about fixing a bug, creating a new functionality or improving the existing codebase.
 
-Only respond with the "FIX" or "CREATE".
+You must only respond with the "FIX" or "CREATE".
 '''
 )
 
-
-FORMAT_PROMPT_V0=textwrap.dedent("""
+FORMAT_PROMPT_V0 = textwrap.dedent("""
 **📝 Response Format Requirements**
 
 1. **Strict Triplet Format**:
@@ -82,168 +106,6 @@ FORMAT_PROMPT_V0=textwrap.dedent("""
    - Using incorrect tool names
    - Not quoting special characters properly
 """)
-
-STOP_INSTRUCTION=textwrap.dedent("""
-# 🎨 
-DO NOT generate `observation:` in your response. It will be provided by user for you.
-Generate only SINGLE triplet of `next_thought`, `next_tool_name`, `next_tool_args` in your response.
-""")
-
-DEFAULT_PROXY_URL = os.getenv("SANDBOX_PROXY_URL", "http://localhost:8000")
-DEFAULT_TIMEOUT = int(os.getenv("AGENT_TIMEOUT", "2000"))
-
-PROBLEM_TYPE_CREATE = "CREATE"
-PROBLEM_TYPE_FIX = "FIX"
-
-GLM_MODEL_NAME = "zai-org/GLM-4.5-FP8"
-KIMI_MODEL_NAME = "moonshotai/Kimi-K2-Instruct"
-DEEPSEEK_MODEL_NAME = "deepseek-ai/DeepSeek-V3-0324"
-QWEN_MODEL_NAME = "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"
-AGENT_MODELS=[GLM_MODEL_NAME, KIMI_MODEL_NAME, DEEPSEEK_MODEL_NAME, QWEN_MODEL_NAME]
-MAX_FIX_TASK_STEPS = 400
-
-DO_NOT_REPEAT_TOOL_CALLS=textwrap.dedent("""
-You're not allowed to repeat the same tool call with the same arguments.
-Your previous response: 
-{previous_response}
-
-Try to use something different!
-""")
-
-GENERATE_INITIAL_TESTCASES_PROMPT = textwrap.dedent("""
-You are an expert Python testcase developer. Your task is to generate a complete testcases for the given problem statement.
-
-Important things:
-1. Test functions declared in code skeleton, don't customized those prototypes.
-2. Read the problem statement carefully and deeply and generate testcases that exactly match the rules, mathmatical fomulas, algorithms, data, and workflow in it.
-3. Do not generate testcases that are not mentioned in problem statement
-4. Minimize all testcases as you have context and generation limit
-
-Strict Requirements:
-1. Output the full content of Python test files along with their file names. You **MUST** output the **file name** along with file content.
-2. Do not include explanations, comments, or markdown formatting.
-3. Use only standard Python (no external libraries).
-
-Response Examples:
-```python
-test_a.py
-contents of test_a.py
-
-test_b.py
-contents of test_b.py
-```
-"""
-)
-
-INFINITE_LOOP_CHECK_PROMPT = textwrap.dedent(
-"""
-You are an expert code reviewer specializing in infinite loop detection and prevention. Your task is to analyze the generated Python code for potential infinite loops and provide a corrected version if issues are found.
-
-CRITICAL INFINITE LOOP DETECTION:
-1. Check for while True: loops without guaranteed exit conditions
-2. Verify all while loops have clear termination conditions
-3. Ensure recursive functions have proper base cases
-4. Look for loops that depend on external state that might never change
-5. Check for patterns that could lead to infinite iteration
-
-If you find potential infinite loops:
-- Provide a corrected version of the code
-- Ensure all loops have finite termination conditions
-- Add reasonable iteration limits or timeout mechanisms where appropriate
-
-If no infinite loops are detected:
-- Return the original code unchanged
-
-STRICT REQUIREMENT: Return the final Python code along with file names. Do not include any explanations, comments, or additional text.
-
-example:
-```python
-a.py
-contents of a.py
-
-b.py
-contents of b.py
-```
-"""
-)
-
-GENERATE_INITIAL_SOLUTION_PROMPT = textwrap.dedent("""
-You are an expert Python developer. Your task is to generate a complete, working Python solution for the given problem statement.
-
-Strict Requirements:
-1. Output the full content of Python files along with their file names.
-2. Do not include explanations, comments, or markdown formatting.
-3. Use only standard Python (no external libraries).
-4. Implement all required classes and functions exactly with the same names as in the initial code stub.
-5. You may add helper functions or classes if needed, but do not remove or rename the original ones.
-6. Ensure the solution handles all edge cases, validates inputs, and produces correct outputs.
-7. The solution must be executable as-is with no placeholders or TODOs.
-
-Return only the final python files code.
-
-Response Examples:
-```python
-a.py
-{content}
-
-b.py
-{content}
-```
-"""
-)
-
-
-GENERATE_TESTCASES_WITH_MULTI_STEP_REASONING_PROMPT = textwrap.dedent(
-"""
-You are an expert Python testcase developer. Your task is to generate a complete testcases for the given problem statement.
-
-Important things:
-1. Test functions declared in code skeleton, don't customized those prototypes.
-2. Read the problem statement carefully and deeply and generate testcases that exactly match the rules, mathmatical fomulas, algorithms, data, and workflow in it.
-3. Do not generate testcases that are not mentioned in problem statement
-4. Minimize all testcases as you have context and generation limit
-
-Strict Requirements:
-1. Output the full content of Python test files along with their file names. You **MUST** output the **file name** along with file content.
-2. Do not include explanations, comments, or markdown formatting.
-3. Use only standard Python (no external libraries).
-
-Response Examples:
-```python
-test_a.py
-contents of test_a.py
-
-test_b.py
-contents of test_b.py
-```
-"""
-)
-
-GENERATE_SOLUTION_WITH_MULTI_STEP_REASONING_PROMPT = textwrap.dedent(
-"""
-You are an expert Python developer. Your task is to generate a complete, working Python solution for the given problem statement.
-
-Strict Requirements:
-1. Output the full content of Python files along with their file names. You **MUST** output the **file name** along with file content.
-2. Do not include explanations, comments, or markdown formatting.
-3. Use only standard Python (no external libraries).
-4. Implement all required classes and functions exactly with the same names as in the initial code stub.
-5. You may add helper functions or classes if needed, but do not remove or rename the original ones.
-6. Ensure the solution handles all edge cases, validates inputs, and produces correct outputs.
-7. The solution must be executable as-is with no placeholders or TODOs.
-8. If problem statement doesn't explicitely requires a list of strings as a response, do not use list of strings for multiline text problems, just use raw string format.
-Return only the final Python code.
-
-Response Examples:
-```python
-a.py
-{content}
-
-b.py
-{content}
-```
-"""
-)
 
 FIX_TASK_SYSTEM_PROMPT = textwrap.dedent("""
 # Hey there! You're a Coding Assistant 🚀. I have uploaded all files of a python repository. Your current working directory is at the root of that repo. You will be provided with a problem statement and you need to make the necessary changes to fix the issue.
@@ -287,6 +149,131 @@ FIX_TASK_INSTANCE_PROMPT_TEMPLATE = textwrap.dedent("""
 {problem_statement}
 """)
 
+DO_NOT_REPEAT_TOOL_CALLS = textwrap.dedent("""
+You're not allowed to repeat the same tool call with the same arguments.
+Your previous response: 
+{previous_response}
+
+Try to use something different!
+""")
+
+GENERATE_SOLUTION_WITH_MULTI_STEP_REASONING_PROMPT = textwrap.dedent(
+"""
+You are an expert Python developer. Generate a complete, working Python solution for the given problem.
+
+CRITICAL REQUIREMENTS:
+1. Output ALL Python files with their exact filenames and complete content
+2. NO explanations, comments, or markdown formatting
+3. Use ONLY standard Python (no external libraries unless specified)
+4. Implement EXACTLY the required classes/functions with same names as initial stub
+5. You may add helper functions/classes but NEVER remove/rename original ones
+6. Handle ALL edge cases, validate inputs, ensure correct outputs
+7. Solution must be EXECUTABLE with NO placeholders or TODOs
+8. For multiline text problems, use raw strings unless explicitly required as list of strings
+9. Include proper input validation and error handling
+10. Follow Python best practices and PEP 8 guidelines
+
+RESPONSE FORMAT:
+```python
+a.py
+<code>
+
+b.py
+<code>
+```
+"""
+)
+
+GENERATE_COMPLETED_SOLUTION_PROMPT = textwrap.dedent("""
+You are an expert Python developer. Generate a complete, working Python solution.
+
+STRICT REQUIREMENTS:
+1. Output ALL Python files with filenames and complete content
+2. NO explanations, comments, or markdown formatting  
+3. Use ONLY standard Python (no external libraries)
+4. Implement EXACTLY required classes/functions with same names
+5. You may add helpers but NEVER remove/rename original ones
+6. Handle ALL edge cases, validate inputs, ensure correct outputs
+7. Solution must be EXECUTABLE with NO placeholders
+
+RESPONSE FORMAT:
+```python
+a.py
+<code>
+
+b.py
+<code>
+```
+"""
+)
+
+INFINITE_LOOP_CHECK_PROMPT = textwrap.dedent(
+"""
+You are an expert code reviewer specializing in infinite loop detection and code safety.
+
+CRITICAL CHECKS:
+1. while True: loops without guaranteed exit conditions
+2. All while loops must have clear termination conditions  
+3. Recursive functions must have proper base cases and depth limits
+4. Loops depending on external state that might never change
+5. Patterns that could lead to infinite iteration
+6. Missing break/return conditions in loops
+7. Potential stack overflow in recursion
+8. Unbounded iteration over growing data structures
+
+SAFETY REQUIREMENTS:
+- Add reasonable iteration limits where appropriate
+- Ensure recursive functions have proper base cases
+- Validate inputs that could cause infinite loops
+- Add timeout mechanisms for potentially long-running operations
+
+IF NO ISSUES FOUND:
+- Return original code unchanged
+
+STRICT: Return ONLY Python code with filenames. NO explanations.
+
+FORMAT:
+```python
+a.py
+contents of a.py
+
+b.py
+contents of b.py
+```
+"""
+)
+
+ERROR_MESSAGE_CHECK_PROMPT = textwrap.dedent("""
+You are debugging error message flow issues. 
+Found {total_raises} raise statements:
+
+{error_details}
+
+ANALYSIS REQUIREMENTS:
+1. For each raise statement, trace the complete execution flow from entry to final output
+2. Compare final raised error with expected error from test cases  
+3. Fix mismatches by removing error masking or preserving original errors
+4. Ensure proper exception propagation through call stack
+
+CRITICAL ERROR MASKING PATTERNS TO FIX:
+- Function A calls Function B
+- Function B raises correct error
+- Function A catches it and raises wrong error
+- This masks the original error message
+
+- Overly broad except clauses that catch and replace specific errors
+- Nested try/except blocks that change error context
+- Missing exception chaining (raise from)
+
+SOLUTION REQUIREMENTS:
+- Preserve original error messages from callee functions
+- Remove unnecessary try/except blocks that change error messages
+- Use specific exception types rather than generic Exception
+- Implement proper exception chaining where appropriate
+
+Return ONLY the complete enhanced Python code with filename. Do not include any explanations, comments, or markdown formatting.
+""")
+
 FIND_TEST_RUNNER_PROMPT = textwrap.dedent("""\
 You are a helpful assistant that can find the test runner for a given repository.
 - The test runner is the file that can run the individual test files and test cases. (e.g. pytest, unittest, etc.)
@@ -303,32 +290,6 @@ Output should be one of MODULE or FILE, No other texts are allowed.
 - MODULE: When the test runner requires a module path to run the test.
 - FILE: When the test runner requires a file path to run the test (e.g. pytest, unittest, py.test, etc.).
 """)
-
-TESTCASES_CHECK_PROMPT = textwrap.dedent(
-"""
-You are an expert testcases reviewer specializing in invalid testcases detection and prevention. Your task is to analyze the generated test code if it's all valid for the problem statement.
-
-Important:
-1. Check for incorrect/invalid intput/output pair based on the problem statement and fix them or remove if it's impossible to fix
-2. Check if testcases are not covering critical edgecases for the problem statement and add missing testcases
-3. Minimize all testcases as you have context and generation limit
-
-If no invalid testcases are detected and covered all critical edge cases:
-- Return the original code unchanged
-
-STRICT REQUIREMENT: Return the final Python test code along with their file names. Do not include any explanations, comments, or additional text.
-
-example:
-```python
-test_a.py
-contents of test_a.py
-
-test_b.py
-contents of test_b.py
-```
-"""
-)
-
 
 class EnhancedCOT:
     class Action:
@@ -347,7 +308,7 @@ class EnhancedCOT:
     def __init__(self,latest_observations_to_keep=5):
         self.thoughts: list[EnhancedCOT.Action] = []
         self.latest_observations_to_keep=latest_observations_to_keep
-
+        
     def add_action(self, action: EnhancedCOT.Action) -> bool: # don't add if thought is repeated
         self.thoughts.append(action)
         return True
@@ -425,187 +386,72 @@ class EnhancedCOT:
             messages.append({"role":"user","content":user_str})
         return messages
 
-class EnhancedToolManager:
-    logs = []
-    TOOL_LIST = {}
-
-    class Error(Exception):
-        class ErrorType(Enum):
-            SYNTAX_ERROR=1
-            RUNTIME_ERROR=2
-            TIMEOUT=3
-            FILE_NOT_FOUND=4
-            SEARCH_TERM_NOT_FOUND=5
-            UNKNOWN=6
-            THIRD_PARTY_DEPENDENCIES=7
-            MULTIPLE_SEARCH_RESULTS_FOUND=8
-            BUG_REPORT_REQUIRED=9
-            INVALID_RESPONSE_FORMAT=10
-            INVALID_TOOL_NAME=11
-            INVALID_FILE_PATH=12
-            INVALID_TOOL_CALL=13
-            IMPORT_ERROR=14
-            
-        def __init__(self,error_type:ErrorType,message:str):    
-            self.error_type=error_type
-            self.message=message
-
-    def tool(fn):
-        def wrapper(self, *args, **kwargs):
-            self.tool_invocations[fn.__name__]+=1
-            try:
-                return fn(self, *args, **kwargs)
-            except EnhancedToolManager.Error as e:
-                self.tool_failure[fn.__name__][e.error_type]+=1
-                return e.message
-
-        # Preserve original function metadata
-       
-        wrapper.__name__ = fn.__name__
-        wrapper.__doc__ = fn.__doc__
-        wrapper.__signature__ = inspect.signature(fn)
-        wrapper.__annotations__ = fn.__annotations__.copy()
-        wrapper.is_tool=True
-
-        return wrapper
-
-    def __init__(self, **kwargs):
-        pass
+class Utils:
     
     @classmethod
-    def tool_parsing(cls,fn):
-        tool_schemas = None
-        name = fn.__name__
-        doc_fn = fn.__doc__ or ""
-        # remove parameters section from here to be put in args section
-        doc=doc_fn.split("Arguments:")[0]
-        output_description=doc_fn.split("Output:")
-        if len(output_description)>1:
-            output_description="Output: "+output_description[1].strip()
-            doc=doc+"\n\n"+output_description
-        sig = inspect.signature(fn)
-        properties = {}
-        required = []
-        for param in sig.parameters.values():
-            if param.name == 'self':
-                continue
-            if param.default is param.empty and param.kind in (param.POSITIONAL_OR_KEYWORD, param.KEYWORD_ONLY):
-                required.append(param.name)
-            type_hint = str(param.annotation) if param.annotation != param.empty else "string"
-            param_description=re.search(f"{param.name}:([^\n]+)",doc_fn)
-            if param_description:
-                param_description=param_description.group(1)
-            else:
-                raise ValueError(f"Parameter description not found for {param.name} in {doc_fn}: tool name: {name}")
-            # Special handling for list[str] / List[str] annotations so that the
-            # generated JSON schema correctly represents an array of strings.
-            if ("list" in type_hint.lower()) and ("str" in type_hint):
-                properties[param.name] = {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": param_description
-                }
-                continue
-            elif 'str' in type_hint:
-                json_type = "string"
-            elif 'int' in type_hint:
-                json_type = "integer"
-            elif 'float' in type_hint:
-                json_type = "number"
-            elif 'bool' in type_hint:
-                json_type = "boolean"
-            else:
-                json_type = "string"
-            properties[param.name] = {
-                "type": json_type,
-                "description": param_description
-            }
-        parameters = {
-            "type": "object",
-            "properties": properties,
-            "required": required
-        }
-        tool_schemas={
-            "name": name,
-            "description": doc.strip(),
-            "input_schema": parameters
-        }
-        
-        return tool_schemas
-
+    def limit_strings(cls,strings: str, n=1000)->str:
+        '''
+        Limit the number of strings to 1000
+        '''
+        strings_list=strings.split("\n")
+        if len(strings_list)>n:
+            return "\n".join(strings_list[:n])+"\n..." + f"({len(strings_list)-n} more lines)"
+        else:
+            return strings
     @classmethod
-    def get_tool_args_for_tool(self,tool_name:str,required_only:bool=False)->list[str]:
-        if tool_name not in self.TOOL_LIST:
-            return f"Error: tool '{tool_name}' not found"
-        if not required_only: 
-            return list(self.TOOL_LIST[tool_name]['input_schema']['properties'].keys())
-        else:
-            return self.TOOL_LIST[tool_name]['input_schema']['required']
-
-    def get_tool_docs(self)->str:
-        return '\n\n'.join([json.dumps(tool_metadata, ensure_ascii=False) for _,tool_metadata in self.TOOL_LIST.items()])
-
-    def get_tool(self,tool_name:str):
-        if tool_name not in self.TOOL_LIST:
-            return f"Error: tool '{tool_name}' not found"
-        tool_method = getattr(self, tool_name, None)
-        if tool_method is None or not callable(tool_method):
-            return f"Error: tool '{tool_name}' does not exist. Please use one of the following tools: {', '.join(self.TOOL_LIST.keys())}"
-        
-        return tool_method
-    
-    def _check_syntax_error(self,content:str,file_path:str="<unknown>")->bool:
-        try:
-            ast.parse(content, filename=file_path)
-            return False, None
-        except SyntaxError as e:
-            logger.error(f"Syntax error: {e}")
-            return True, EnhancedToolManager.Error(EnhancedToolManager.Error.ErrorType.SYNTAX_ERROR.name,f"Syntax error. {str(e)}")
-
-    def _save(self,file_path: str, content: str)->str:
-        is_syntax_error, error = self._check_syntax_error(content)
-        if not is_syntax_error:
-            with open(file_path, "w") as file:
-                file.write(content)
-            # self.new_files_created.append(file_path)
-            return f"File {file_path} saved successfully"
-        else:
-            logger.error(f"Error saving file: {error.message}")
-            error.message="Error saving file. "+error.message
-            raise EnhancedToolManager.Error(EnhancedToolManager.Error.ErrorType.SYNTAX_ERROR.name,error.message)
-
-    def get_final_git_patch(self) -> str:
-        '''
-        Generates git diff patch containing all modifications in working directory
-        Useful for capturing comprehensive change summary before finalization
-        '''
-        try:
-            command = f"""
-            shopt -s globstar
-
-            cp .gitignore .gitignore.backup 2>/dev/null || true
-            echo 'src/agent.py' >> .gitignore
-            echo 'src/agent_runner.py' >> .gitignore
-
-            git add **/*.py 2>/dev/null || true
-            git add **/*.toml 2>/dev/null || true
-            git add **/*.cfg 2>/dev/null || true
-            git add **/*.txt 2>/dev/null || true
-
-            git diff --cached > .patch.txt
-            cat .patch.txt
-
-            mv .gitignore.backup .gitignore 2>/dev/null || true
-            """
-            print("Generating git patch...")
-            output = subprocess.run(["bash", "-c", command], timeout=30, capture_output=True, text=True)
-            
-            # output = output.stdout.decode("utf-8") + '\n' + output.stderr.decode("utf-8")
-            return output.stdout
+    def load_json(cls,json_string:str)->dict:
+        try: 
+            return json.loads(json_string)
         except Exception as e:
-            logger.error(f"Error generating git patch: {e}")
-            return f"Error generating git patch: {e}"
+            try:
+                return eval(json_string) 
+            except Exception as e: 
+                logger.info(f"unable to fix manually, trying with llm") 
+                fixed_json=EnhancedNetwork.fix_json_string_with_llm(json_string)
+                # if fixed_json == ""
+                if fixed_json:
+                    return fixed_json
+                else:
+                    raise JSONDecodeError(f"Invalid JSON: {json_string}")
+    @classmethod
+    def log_to_failed_messages(cls,text_resp:str):
+        with open("../failed_messages.csv","a") as f:
+                writer=csv.writer(f) 
+                writer.writerow([text_resp]) 
 
+class FunctionVisitor(ast.NodeVisitor):
+    def __init__(self, file_content: str):
+        self.functions = {}
+        self.current_class = None
+        self.class_hierarchy = []
+        self.file_content = file_content
+
+    def visit_ClassDef(self, node):
+        self.class_hierarchy.append(node.name)
+        self.current_class = "::".join(self.class_hierarchy)
+        self.generic_visit(node)
+        self.class_hierarchy.pop()
+        self.current_class = "::".join(self.class_hierarchy) if self.class_hierarchy else None
+
+class ClassVisitor(ast.NodeVisitor):
+    def __init__(self, file_content: str):
+        self.classes = {}
+        self.file_content = file_content
+
+    def visit_ClassDef(self, node):
+        line_number = node.lineno
+        if isinstance(node.decorator_list, list) and len(node.decorator_list) > 0:
+            line_number = node.decorator_list[0].lineno
+        end_line_number = line_number
+        if isinstance(node.body, list) and len(node.body) > 0:
+            end_line_number = node.body[-1].lineno
+        lines = self.file_content.split("\n")
+        body = "\n".join(lines[line_number-1:end_line_number])
+        self.classes[node.name] = {
+            "body": body,
+            "line_number": line_number
+        }
+        self.generic_visit(node)
 
 class EnhancedNetwork:
     class ErrorType(Enum):
@@ -661,10 +507,14 @@ class EnhancedNetwork:
             return None
     
     @classmethod
-    def make_request(cls,messages:list,model:str,attempt:int=0, temperature:float=0.0)->str:
+    def make_request(cls,messages:list,model:str,attempt:int=0, temperature:float=None)->str:
         global run_id
         url = f"{DEFAULT_PROXY_URL.rstrip('/')}/api/inference"
         print("[REQUEST] run_id:", run_id)
+
+        if temperature is None:
+            network = cls()
+            temperature = 0
 
         # Cache miss - make the actual request
         request_data = {
@@ -790,13 +640,13 @@ class EnhancedNetwork:
             pattern += f'"{k}": (.*)'
             if i != len(arguments) - 1:
                 pattern += r',\s*'
-
-        match=re.search(pattern, json_string)
-
+ 
+        match = re.search(pattern, json_string) 
+ 
         if not match:
             return f"Error: {json_string} can not match pattern {pattern}"
         
-        result_json={}
+        result_json = {}
         for i in range(len(arguments)):
             value=match.group(i+1)
             value=value.strip()
@@ -813,9 +663,9 @@ class EnhancedNetwork:
         parse string to json, fix unecaped " in values like this: '{"a": "text "text2" text3 "text4"", "b": "text3"}'
         returns json or error message
         '''
-
-        next_tool_args=next_tool_args.replace('```json','').strip('```')
-        error_msg=''
+ 
+        next_tool_args = next_tool_args.replace('```json','').strip('```')
+        error_msg = ''
 
         try:
             next_tool_args = Utils.load_json(next_tool_args.strip())
@@ -828,24 +678,24 @@ class EnhancedNetwork:
             except Exception as e:
                 raise Exception(error_msg)
         return next_tool_args
-
+ 
     @classmethod
-    def inference(cls, messages: List[Dict[str, Any]], model: str, run_id: str = str(uuid4()), temperature:float=0.0) -> dict:
+    def inference(cls, messages: List[Dict[str, Any]], model: str, run_id: str = str(uuid4()),return_json:bool=False, temperature:float=0.0) -> dict:
         """Prod inference with caching"""
         cleaned_msgs: List[Dict[str, Any]] = []
         for m in messages:
             role = m.get("role")
-            if role not in {"system", "user", "assistant", "tool"}:
-                continue
-            content = m.get("content", "")
-
+            if role not in {"system", "user", "assistant", "tool"}: 
+                continue 
+            content = m.get("content", "") 
+ 
             if role == "assistant" and not content.strip():
                 continue
-
-            cleaned_msgs.append({"role": role, "content": content})
-
+ 
+            cleaned_msgs.append({"role": role, "content": content}) 
+ 
         if not cleaned_msgs:
-            raise RuntimeError("No valid messages to send to proxy.")
+            raise RuntimeError("No valid messages to send to proxy.") 
 
         next_thought,next_tool_name,next_tool_args,raw_text,total_attempts,error_counter,messages = cls._request_next_action_with_retry(cleaned_msgs, model=model, temperature=temperature)
         
@@ -854,9 +704,9 @@ class EnhancedNetwork:
     @classmethod
     def sanitise_text_resp(cls,text_resp:str)->str:
         # remove all leading and trailing quotes
-        text_resp=re.sub("[\'\"]*next_thought[\'\"]*:","next_thought:",text_resp)
-        text_resp=re.sub("[\'\"]*next_tool_name[\'\"]*:","next_tool_name:",text_resp)
-        text_resp=re.sub("[\'\"]*next_tool_args[\'\"]*:","next_tool_args:",text_resp)
+        text_resp=re.sub("[\'\"]*next_thought[\'\"]*:","next_thought:",text_resp)  
+        text_resp=re.sub("[\'\"]*next_tool_name[\'\"]*:","next_tool_name:",text_resp) 
+        text_resp=re.sub("[\'\"]*next_tool_args[\'\"]*:","next_tool_args:",text_resp) 
         text_resp=re.sub("[\'\"]*observation[\'\"]*:","observation:",text_resp)
         if "next_thought" not in text_resp and "next_tool_name:" in text_resp and "next_tool_args:" in text_resp and text_resp.find("next_tool_name:")<text_resp.find("next_tool_args:") and text_resp.find("next_tool_name:")>10:
             logger.info(f"next_thought not found in {text_resp[:50]}, adding it")
@@ -864,16 +714,16 @@ class EnhancedNetwork:
         if "next_tool_name:" in text_resp and "next_tool_args:" in text_resp and text_resp.find("next_tool_name:")<text_resp.find("next_tool_args:"):
             # remove all leading and trailing quotes in tool_name
             next_tool_name=text_resp.split("next_tool_name:")[1].split("next_tool_args:")[0].strip().strip("\n").strip("\'").strip("\"").strip()
-            text_resp=re.sub(f"next_tool_name:[\'\" ]*{next_tool_name}[\'\" ]*","next_tool_name: "+next_tool_name,text_resp)
+            text_resp=re.sub(f"next_tool_name:[\'\" ]*{next_tool_name}[\'\" ]*","next_tool_name: "+next_tool_name,text_resp) 
         
-        return text_resp
-
+        return text_resp 
+ 
     @classmethod
-    def parse_response(cls,text_resp: str)->tuple[str, Any, Any]:
-        error_msg=None
-        text_resp = text_resp.strip()
-        text_resp=text_resp.split("observation:")[0]
-        text_resp=text_resp.strip().strip("\n")
+    def parse_response(cls,text_resp: str)->tuple[str, Any, Any]: 
+        error_msg=None 
+        text_resp = text_resp.strip() 
+        text_resp=text_resp.split("observation:")[0] 
+        text_resp=text_resp.strip().strip("\n") 
         text_resp=cls.sanitise_text_resp(text_resp)
         if "next_thought:" in text_resp and "next_tool_name:" in text_resp and "next_tool_args:" in text_resp and text_resp.find("next_thought:")<text_resp.find("next_tool_name:") and text_resp.find("next_tool_name:")<text_resp.find("next_tool_args:"):
             next_thought=text_resp.split("next_thought:")[1].split("next_tool_name:")[0].strip().strip("\n")
@@ -915,102 +765,473 @@ class EnhancedNetwork:
             
         return next_thought, next_tool_name, next_tool_args,error_msg
 
-class FunctionVisitor(ast.NodeVisitor):
-    def __init__(self, file_content: str):
-        self.functions = {}
-        self.current_class = None
-        self.class_hierarchy = []
-        self.file_content = file_content
+class EnhancedToolManager:
+    logs = []
+    TOOL_LIST = {}
 
-    def visit_ClassDef(self, node):
-        self.class_hierarchy.append(node.name)
-        self.current_class = "::".join(self.class_hierarchy)
-        self.generic_visit(node)
-        self.class_hierarchy.pop()
-        self.current_class = "::".join(self.class_hierarchy) if self.class_hierarchy else None
+    class Error(Exception):
+        class ErrorType(Enum):
+            SYNTAX_ERROR=1
+            RUNTIME_ERROR=2
+            TIMEOUT=3
+            FILE_NOT_FOUND=4
+            SEARCH_TERM_NOT_FOUND=5
+            UNKNOWN=6
+            THIRD_PARTY_DEPENDENCIES=7
+            MULTIPLE_SEARCH_RESULTS_FOUND=8
+            BUG_REPORT_REQUIRED=9
+            INVALID_RESPONSE_FORMAT=10
+            INVALID_TOOL_NAME=11
+            INVALID_FILE_PATH=12
+            INVALID_TOOL_CALL=13
+            IMPORT_ERROR=14
+            GIT_OPERATION_FAILED=15
+            GIT_CONFIG_ERROR=16
+            GIT_STATE_ERROR=17
+            GIT_MERGE_CONFLICT=18
+            GIT_BRANCH_ERROR=19
+            TEST_COVERAGE_ERROR = 20
+            DEPENDENCY_ANALYSIS_ERROR = 21
+            CODE_SMELL_DETECTION_ERROR = 22
+            GIT_HISTORY_ERROR = 23
+            CODE_QUALITY_ERROR = 24
+            SOLUTION_VALIDATION_ERROR = 25
+            CODE_STYLE_ERROR = 26
+            SOLUTION_COMPARISON_ERROR = 27
+            
+        def __init__(self,error_type:ErrorType,message:str):    
+            self.error_type=error_type
+            self.message=message
 
-    def _process_function(self, node):
-        full_function_name = f"{self.current_class}::{node.name}" if self.current_class else node.name
-        line_number = node.lineno
-        if isinstance(node.decorator_list, list) and len(node.decorator_list) > 0:
-            line_number = node.decorator_list[0].lineno
-        
-        end_line_number = line_number
-        if isinstance(node.body, list) and len(node.body) > 0:
-            end_line_number = node.body[-1].lineno
-        
-        lines = self.file_content.split("\n")
-        body = "\n".join(lines[line_number-1:end_line_number])
-        
-        self.functions[full_function_name] = {
-            "class": self.current_class,
-            "body": body,
-            "line_number": line_number
-        }
-        self.generic_visit(node)
-
-    def visit_FunctionDef(self, node):
-        self._process_function(node)
-
-    def visit_AsyncFunctionDef(self, node):
-        self._process_function(node)
-
-    def visit_Module(self, node):
-        self.current_class = None
-        self.generic_visit(node)
-        self.current_class = None
-
-class ClassVisitor(ast.NodeVisitor):
-    def __init__(self, file_content: str):
-        self.classes = {}
-        self.file_content = file_content
-
-    def visit_ClassDef(self, node):
-        line_number = node.lineno
-        if isinstance(node.decorator_list, list) and len(node.decorator_list) > 0:
-            line_number = node.decorator_list[0].lineno
-        end_line_number = line_number
-        if isinstance(node.body, list) and len(node.body) > 0:
-            end_line_number = node.body[-1].lineno
-        lines = self.file_content.split("\n")
-        body = "\n".join(lines[line_number-1:end_line_number])
-        self.classes[node.name] = {
-            "body": body,
-            "line_number": line_number
-        }
-        self.generic_visit(node)
-
-class Utils:
-    @classmethod
-    def limit_strings(cls,strings: str, n=1000)->str:
-        '''
-        Limit the number of strings to 1000
-        '''
-        strings_list=strings.split("\n")
-        if len(strings_list)>n:
-            return "\n".join(strings_list[:n])+"\n..." + f"({len(strings_list)-n} more lines)"
-        else:
-            return strings
-    @classmethod
-    def load_json(cls,json_string:str)->dict:
-        try:
-            return json.loads(json_string)
-        except Exception as e:
+    def tool(fn):
+        def wrapper(self, *args, **kwargs):
+            self.tool_invocations[fn.__name__]+=1
             try:
-                return eval(json_string)
-            except Exception as e:
-                logger.info(f"unable to fix manually, trying with llm")
-                fixed_json=EnhancedNetwork.fix_json_string_with_llm(json_string)
-                if fixed_json:
-                    return fixed_json
-                else:
-                    raise JSONDecodeError("Invalid JSON", json_string, 0)
-                
+                return fn(self, *args, **kwargs)
+            except EnhancedToolManager.Error as e:
+                self.tool_failure[fn.__name__][e.error_type]+=1
+                return e.message
+
+        # Preserve original function metadata
+       
+        wrapper.__name__ = fn.__name__
+        wrapper.__doc__ = fn.__doc__
+        wrapper.__signature__ = inspect.signature(fn)
+        wrapper.__annotations__ = fn.__annotations__.copy()
+        wrapper.is_tool=True
+
+        return wrapper
+
+    def __init__(self, **kwargs):
+        pass
+    
     @classmethod
-    def log_to_failed_messages(cls,text_resp:str):
-        with open("../failed_messages.csv","a") as f:
-                writer=csv.writer(f)
-                writer.writerow([text_resp])
+    def tool_parsing(cls,fn):
+        tool_schemas = None
+        name = fn.__name__
+        doc_fn = fn.__doc__ or ""
+        # remove parameters section from here to be put in args section
+        doc=doc_fn.split("Arguments:")[0]
+        output_description=doc_fn.split("Output:")
+        if len(output_description)>1:
+            output_description="Output: "+output_description[1].strip()
+            doc=doc+"\n\n"+output_description
+        sig = inspect.signature(fn)
+        properties = {}
+        required = []
+        for param in sig.parameters.values():
+            if param.name == 'self':
+                continue
+            if param.default is param.empty and param.kind in (param.POSITIONAL_OR_KEYWORD, param.KEYWORD_ONLY):
+                required.append(param.name)
+            type_hint = str(param.annotation) if param.annotation != param.empty else "string"
+            param_description=re.search(f"{param.name}:([^\n]+)",doc_fn)
+            if param_description:
+                param_description=param_description.group(1)
+            else:
+                raise ValueError(f"Parameter description not found for {param.name} in {doc_fn}: tool name: {name}")
+            # Special handling for list[str] / List[str] annotations so that the
+            # generated JSON schema correctly represents an array of strings.
+            if ("list" in type_hint.lower()) and ("str" in type_hint):
+                properties[param.name] = {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": param_description
+                }
+                continue
+            elif 'str' in type_hint:
+                json_type = "string"
+            elif 'int' in type_hint:
+                json_type = "integer"
+            elif 'float' in type_hint:
+                json_type = "number"
+            elif 'bool' in type_hint:
+                json_type = "boolean"
+            else:
+                json_type = "string"
+            properties[param.name] = {
+                "type": json_type,
+                "description": param_description
+            }
+        parameters = {
+            "type": "object",
+            "properties": properties,
+            "required": required
+        }
+        tool_schemas={
+            "name": name,
+            "description": doc.strip(),
+            "input_schema": parameters
+        }
+        
+        return tool_schemas
+
+    @classmethod
+    def get_tool_args_for_tool(self,tool_name:str,required_only:bool=False)->list[str]:
+        if tool_name not in self.TOOL_LIST:
+            return f"Error: tool '{tool_name}' not found"
+        if not required_only: 
+            return list(self.TOOL_LIST[tool_name]['input_schema']['properties'].keys())
+        else:
+            return self.TOOL_LIST[tool_name]['input_schema']['required']
+
+    def get_tool_docs(self)->str:
+        return '\n\n'.join([json.dumps(tool_metadata, ensure_ascii=False) for _,tool_metadata in self.TOOL_LIST.items()])
+
+    def get_tool(self,tool_name:str):
+        if tool_name not in self.TOOL_LIST:
+            return f"Error: tool '{tool_name}' not found"
+        tool_method = getattr(self, tool_name, None)
+        if tool_method is None or not callable(tool_method):
+            return f"Error: tool '{tool_name}' does not exist. Please use one of the following tools: {', '.join(self.TOOL_LIST.keys())}"
+        
+        return tool_method
+    
+    
+    def _check_syntax_error(self,content:str,file_path:str="<unknown>")->bool:
+        try:
+            ast.parse(content, filename=file_path)
+            return False, None
+        except SyntaxError as e:
+            logger.error(f"Syntax error: {e}")
+            return True, EnhancedToolManager.Error(EnhancedToolManager.Error.ErrorType.SYNTAX_ERROR.name,f"Syntax error. {str(e)}")
+
+    def _save(self,file_path: str, content: str)->str:
+        is_syntax_error, error = self._check_syntax_error(content)
+        if not is_syntax_error:
+            with open(file_path, "w") as file:
+                file.write(content)
+            # self.new_files_created.append(file_path)
+            return f"File {file_path} saved successfully"
+        else:
+            logger.error(f"Error saving file: {error.message}")
+            error.message="Error saving file. "+error.message
+            raise EnhancedToolManager.Error(EnhancedToolManager.Error.ErrorType.SYNTAX_ERROR.name,error.message)
+
+    def get_final_git_patch(self) -> str:
+        '''
+        Generates git diff patch containing all modifications in working directory
+        Useful for capturing comprehensive change summary before finalization
+        '''
+        try:
+            # Update to include cfg, txt, and toml files along with py files
+            # Check whether ignore_files is a property of this clas
+            command = f"""
+            shopt -s globstar
+
+            cp .gitignore .gitignore.backup 2>/dev/null || true
+            echo 'src/agent.py' >> .gitignore
+            echo 'src/agent_runner.py' >> .gitignore
+
+            git add **/*.py 2>/dev/null || true
+            git add **/*.toml 2>/dev/null || true
+            git add **/*.cfg 2>/dev/null || true
+            git add **/*.txt 2>/dev/null || true
+
+            git diff --cached > .patch.txt
+            cat .patch.txt
+
+            mv .gitignore.backup .gitignore 2>/dev/null || true
+            """
+            print("Generating git patch...")
+            output = subprocess.run(["bash", "-c", command], timeout=30, capture_output=True, text=True)
+            
+            # output = output.stdout.decode("utf-8") + '\n' + output.stderr.decode("utf-8")
+            return output.stdout
+        except Exception as e:
+            logger.error(f"Error generating git patch: {e}")
+            return f"Error generating git patch: {e}"
+
+class SolutionGenerator:
+    """Enhanced solution generator with improved performance and error handling."""
+    
+    def __init__(self, model_name: str = QWEN_MODEL_NAME):
+        self.model_name = model_name
+        self.max_retries = 10
+        self.retry_delay = 2
+        self.max_retry_delay = 30
+        
+    def _clean_response(self, response: str) -> str:
+        """Clean and normalize the API response."""
+        if not response:
+            return ""
+            
+        cleaned = response.strip()
+        
+        # Remove markdown code blocks efficiently
+        markdown_patterns = [
+            (r'^```python\s*', ''),
+            (r'^```\s*', ''),
+            (r'```\s*$', '')
+        ]
+        
+        for pattern, replacement in markdown_patterns:
+            cleaned = re.sub(pattern, replacement, cleaned, flags=re.MULTILINE)
+        
+        return cleaned.strip()
+    
+    def _validate_response_format(self, response: str) -> Tuple[bool, str]:
+        """Validate that response has proper file format."""
+        if not response:
+            return False, "Empty response"
+            
+        lines = response.split('\n')
+        if not lines:
+            return False, "No content"
+            
+        first_line = lines[0].strip()
+        if not first_line.endswith('.py'):
+            return False, f"First line '{first_line}' is not a Python filename"
+            
+        return True, "Valid format"
+    
+    def _exponential_backoff(self, retry_count: int) -> None:
+        """Implement exponential backoff with jitter for retries."""
+        delay = min(self.retry_delay * (2 ** retry_count), self.max_retry_delay)
+        jitter = delay * 0.1  # 10% jitter
+        actual_delay = delay + (jitter * (0.5 - (hash(str(time.time())) % 1000) / 1000))
+        time.sleep(actual_delay)
+    
+    def _make_enhanced_request(self, messages: List[Dict[str, str]], operation_name: str) -> Optional[str]:
+        """Make request with enhanced error handling and logging."""
+        try:
+            start_time = time.time()
+            response = EnhancedNetwork.make_request(messages, model=self.model_name)
+            elapsed_time = time.time() - start_time
+            
+            logger.info(f"{operation_name} completed in {elapsed_time:.2f}s")
+            return response
+            
+        except Exception as e:
+            logger.error(f"{operation_name} failed: {str(e)}")
+            return None
+    
+    def generate_solution_with_multi_step_reasoning(self, problem_statement: str, code_skeleton: str) -> str:
+        """Generate solution with multi-step reasoning and validation."""
+        
+        code_generation_messages = [
+            {
+                "role": "system",
+                "content": GENERATE_SOLUTION_WITH_MULTI_STEP_REASONING_PROMPT
+            },
+            {
+                "role": "user",
+                "content": f"Problem Statement:\n{problem_statement}\n\nInitial python files:\n{code_skeleton}\nGenerate the complete and correct implementation in python files.\n\nSTRICT REQUIREMENT: You **MUST** output the **file name** along with file content.\nexample:\n```python\na.py\ncontents of a.py\n\nb.py\ncontents of b.py\n```"
+            }
+        ]
+        
+        for retry in range(self.max_retries):
+            try:
+                # Step 1: Generate initial solution
+                code_response = self._make_enhanced_request(
+                    code_generation_messages, "Step 1 - Code Generation"
+                )
+                
+                if not code_response:
+                    continue
+                
+                # Step 2: Infinite loop validation
+                loop_check_response = self._perform_infinite_loop_check(code_response)
+                if not loop_check_response:
+                    continue
+                
+                # Clean and validate final response
+                solution = self._clean_response(loop_check_response)
+                is_valid, validation_msg = self._validate_response_format(solution)
+                
+                if is_valid:
+                    logger.info("Multi-step reasoning solution generation completed successfully")
+                    return solution
+                else:
+                    logger.warning(f"Response validation failed: {validation_msg}")
+                    # Add corrective feedback for next retry
+                    code_generation_messages.extend([
+                        {"role": "assistant", "content": code_response},
+                        {"role": "user", "content": f"Format validation failed: {validation_msg}. Please include file names in the response. Example:\n```python\na.py\ncontents of a.py\n\nb.py\ncontents of b.py\n```"}
+                    ])
+                    
+            except Exception as e:
+                logger.error(f"Exception in multi-step generation (attempt {retry + 1}): {e}")
+            
+            # Exponential backoff before retry
+            if retry < self.max_retries - 1:
+                self._exponential_backoff(retry)
+        
+        logger.error("Multi-step reasoning solution generation failed after all retries")
+        return ""
+    
+    def _perform_infinite_loop_check(self, code_response: str) -> Optional[str]:
+        """Perform infinite loop check on generated code."""
+        loop_check_messages = [
+            {
+                "role": "system",
+                "content": INFINITE_LOOP_CHECK_PROMPT
+            },
+            {
+                "role": "user",
+                "content": f"Generated Code:\n{code_response}\n\nAnalyze this code for potential infinite loops and provide a corrected version if any issues are found. Return ONLY the final Python code."
+            }   
+        ]
+        
+        return self._make_enhanced_request(loop_check_messages, "Step 2 - Infinite Loop Check")
+    
+    def analyze_error_flow(self, initial_solution: str) -> List[Dict[str, Any]]:
+        """Analyze all raise statements in the code and their flow."""
+        if not initial_solution:
+            return []
+            
+        lines = initial_solution.split('\n')
+        raise_info = []
+        
+        for i, line in enumerate(lines, 1):
+            if 'raise' in line and not line.strip().startswith('#'):
+                # Extract the error message if present
+                error_match = re.search(r'raise\s+(\w+)\(["\']([^"\']*)["\']\)', line)
+                if error_match:
+                    error_type = error_match.group(1)
+                    error_msg = error_match.group(2)
+                else:
+                    error_type = "Exception"
+                    error_msg = "No message"
+                
+                raise_info.append({
+                    'line_number': i,
+                    'line_content': line.strip(),
+                    'error_type': error_type,
+                    'error_message': error_msg
+                })
+        
+        logger.info(f"analyze_error_flow: Found {len(raise_info)} raise statements")
+        return raise_info
+    
+    def get_error_flow_analysis_prompt(self, problem_statement: str, initial_solution: str) -> str:
+        """Get comprehensive error flow analysis prompt."""
+        raise_info = self.analyze_error_flow(initial_solution)
+        total_raises = len(raise_info)
+        
+        if total_raises == 0:
+            return "No raise statements found in the code."
+        
+        # Create detailed error analysis section
+        error_details = "\n".join([
+            f"- Line {info['line_number']}: {info['error_type']} - '{info['error_message']}'"
+            for info in raise_info
+        ])
+        
+        error_analysis_prompt = ERROR_MESSAGE_CHECK_PROMPT.format(total_raises=total_raises, error_details=error_details)
+        logger.info(f"Generated error analysis prompt with {total_raises} raise statements")
+        return error_analysis_prompt
+    
+    def error_msg_flow_check(self, problem_statement: str, initial_solution: str) -> str:
+        """Check and fix error message flow issues."""    
+        try:
+            error_flow_prompt = self.get_error_flow_analysis_prompt(problem_statement, initial_solution)
+            
+            messages = [
+                {
+                    "role": "system",
+                    "content": error_flow_prompt
+                },
+                {
+                    "role": "user", 
+                    "content": f"Problem statement:\n{problem_statement}\n\nCurrent solution:\n{initial_solution}\n\nReturn ONLY the corrected Python code with filename, no explanations. OUTPUT FORMAT: \n```python\nfilename.py\n<code>\n```"
+                }
+            ]
+            
+            response = self._make_enhanced_request(messages, "Error Message Flow Check")
+            if not response:
+                return initial_solution
+                
+            optimized_solution = self._clean_response(response)
+            is_valid, validation_msg = self._validate_response_format(optimized_solution)
+            
+            if is_valid:
+                logger.info("Successfully applied error message flow check")
+                return optimized_solution
+            else:
+                logger.warning(f"Error flow check format validation failed: {validation_msg}")
+                return initial_solution
+                
+        except Exception as e:
+            logger.error(f"Error message flow check failed: {e}, returning original solution")
+            return initial_solution
+    
+    def prevent_potential_errors(self, problem_statement: str, initial_solution: str) -> str:
+        """Apply error prevention techniques to the solution."""     
+        try:
+            improved_solution = self.error_msg_flow_check(problem_statement, initial_solution)
+            logger.info("Completed error prevention processing")
+            return improved_solution
+            
+        except Exception as e:
+            logger.error(f"Error prevention failed: {e}, returning original solution")
+            return initial_solution
+    
+    def generate_complete_solution(self, problem_statement: str, code_skeleton: str) -> str:
+        """Main entry point for generating complete solutions."""
+        
+        for retry in range(self.max_retries):
+            try:
+                logger.info("Starting solution generation attempt %d", retry + 1)
+                
+                # Try multi-step reasoning first
+                solution = self.generate_solution_with_multi_step_reasoning(
+                    problem_statement, code_skeleton
+                )
+                
+                if solution:
+                    corrected_solution = self.prevent_potential_errors(problem_statement, solution)
+                    logger.info("Generated solution successfully using multi-step reasoning")
+                    return corrected_solution
+                else:
+                    logger.warning("Multi-step reasoning failed, falling back to single-step approach")
+                    return self._generate_fallback_solution(problem_statement, code_skeleton)
+                    
+            except Exception as e:
+                logger.error(f"Solution generation attempt {retry + 1} failed: {str(e)}")
+                if retry < self.max_retries - 1:
+                    self._exponential_backoff(retry)
+        
+        logger.error("Failed to generate solution after all retries")
+        return ""
+    
+    def _generate_fallback_solution(self, problem_statement: str, code_skeleton: str) -> str:
+        """Generate solution using fallback single-step approach."""
+        messages = [
+            {
+                "role": "system",
+                "content": GENERATE_COMPLETED_SOLUTION_PROMPT
+            },
+            {
+                "role": "user",
+                "content": f"""Problem Statement:\n{problem_statement}\n\nInitial python files:\n{code_skeleton}\n\nGenerate the complete and correct implementation in python files."""
+            }
+        ]
+        
+        response = self._make_enhanced_request(messages, "Fallback Solution Generation")
+        if response:
+            return self._clean_response(response)
+        return ""
 
 class FixTaskEnhancedToolManager(EnhancedToolManager):
 
@@ -1347,6 +1568,7 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
         if not file_path.endswith(".py"):
             raise EnhancedToolManager.Error(EnhancedToolManager.Error.ErrorType.INVALID_FILE_PATH.name,f"Error: file '{file_path}' is not a python file.")
         return self._extract_function_matches(file_path, search_term)
+
     
     @EnhancedToolManager.tool
     def start_over(self,problem_with_old_approach:str,new_apprach_to_try:str):
@@ -1517,6 +1739,7 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
 
         return f"Test {'created' if is_new_file else 'updated'} in '{rel}' (position={position})."
 
+
     @EnhancedToolManager.tool
     def run_repo_tests(self,file_paths:List[str])->str:
         '''
@@ -1576,7 +1799,7 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
         # Parse the file's AST to collect import statements
         
         with open(file_path, "r") as f:
-            tree = ast.parse(f.read(), filename=file_path)
+            tree = ast.parse(f.read(), filename=file_path) 
 
         disallowed_modules = set()
         for node in ast.walk(tree):
@@ -1590,15 +1813,12 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
 
                 # Skip if built-in module
                 if mod in sys.builtin_module_names:
-                    continue
-
-               
+                    continue 
 
                 # Skip relative imports ("from . import foo") which have level > 0
                 if isinstance(node, ast.ImportFrom) and node.level and node.level > 0:
                     continue
 
-                # --- Additional check: allow local modules/packages in CWD ---
                 cwd = os.getcwd()
                 local_file = os.path.join(cwd, f"{mod}.py")
                 local_pkg_init = os.path.join(cwd, mod, "__init__.py")
@@ -1617,16 +1837,9 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
                     or os.path.isfile(lib_pkg_init)
                     or os.path.isdir(lib_pkg_dir)
                 ):
-                    # Treat as local dependency, allow it
                     continue
 
-                # Any other module is considered disallowed
                 disallowed_modules.add(mod)
-
-        if disallowed_modules and False:
-            logger.error(f"Cannot run, third party dependencies detected: {sorted(disallowed_modules)}\n")
-            raise ToolManager.Error(ToolManager.Error.ErrorType.THIRD_PARTY_DEPENDENCIES.name,f"Error:Cannot run, third party dependencies detected: {sorted(disallowed_modules)}\n")
-
         
         result = subprocess.run(["python", file_path], capture_output=True, text=True, check=False, timeout=60)
         if result.returncode!=0:
@@ -1638,8 +1851,8 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
                 error_type=EnhancedToolManager.Error.ErrorType.THIRD_PARTY_DEPENDENCIES
             raise EnhancedToolManager.Error(error_type,f"Error running code: {result.stderr}\n")
         observation = f"{result.stdout}\n"
-       
-
+        
+ 
         return observation
     
     @EnhancedToolManager.tool
@@ -1657,22 +1870,22 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
         if not self.is_solution_approved:
             raise EnhancedToolManager.Error(EnhancedToolManager.Error.ErrorType.INVALID_TOOL_CALL.name,f"Error: You cannot use this tool before you have approval from user on your proposed solution. Please call get_approval_for_solution tool first with list of proposed solutions.")
         if not os.path.exists(file_path):
-            logger.error(f"file '{file_path}' does not exist.")
+            logger.error(f"file '{file_path}' does not exist.") 
             raise EnhancedToolManager.Error(EnhancedToolManager.Error.ErrorType.FILE_NOT_FOUND.name,f"Error: file '{file_path}' does not exist.")
         
-        original=self._get_file_content(file_path,limit=-1)
-
+        original=self._get_file_content(file_path,limit=-1) 
+ 
         match original.count(search):
             case 0:
                 logger.error(f"search string not found in file {file_path}. You need to share the exact code you want to replace.")
                 raise EnhancedToolManager.Error(EnhancedToolManager.Error.ErrorType.SEARCH_TERM_NOT_FOUND.name,f"Error: search string not found in file {file_path}. You need to share the exact code you want to replace.")
             case 1:
                 
-                new_content = original.replace(search, replace)
+                new_content = original.replace(search, replace) 
                 try:
-                        is_error,error=self.check_syntax_error(new_content)
+                        is_error,error=self.check_syntax_error(new_content) 
                         if not is_error:
-                            self.save_file(file_path, new_content)
+                            self.save_file(file_path, new_content) 
                                 
                             return "ok, code edit applied successfully"
                         else:
@@ -1758,65 +1971,39 @@ def set_env_for_agent():
     if Path(os.getcwd()+"/lib").exists() and os.getcwd()+"/lib" not in os.environ.get("PYTHONPATH",""):
         os.environ["PYTHONPATH"]=os.environ["PYTHONPATH"]+":"+os.getcwd()+"/lib"
 
-def process_fix_task(input_dict: Dict[str, Any]):
-    """Main entry point for task processing and code modification.
+def agent_main(input_dict: Dict[str, Any], repo_dir: str = "repo", test_mode: bool = False):
+    """Legacy interface wrapper for backwards compatibility."""
+    global DEFAULT_PROXY_URL, REPO_DIR, DEFAULT_TIMEOUT, MAX_TEST_PATCH_TIMEOUT, run_id
+    run_id = os.getenv("RUN_ID", "")
+    repo_dir = os.path.abspath(repo_dir)
+    REPO_DIR = repo_dir
+    if test_mode:
+        DEFAULT_TIMEOUT = 1000
+        MAX_TEST_PATCH_TIMEOUT = 400
 
-    Parameters
-    ----------
-    input_dict : dict
-        Configuration dictionary containing the task specification.
-        Required key: 'problem_statement' with task details.
-        Optional keys: 'run_id', 'instance_id' for tracking purposes.
-    """
-    global run_id
-    # setting environment to include current working directory and lib directory
-    problem_text = input_dict.get("problem_statement")
-    if not problem_text:
-        raise ValueError("input_dict must contain 'problem_statement'.")
-    timeout = int(os.getenv("AGENT_TIMEOUT", str(DEFAULT_TIMEOUT)))
-    
-    logs = []
-    patch_text = ""  # Initialize to avoid UnboundLocalError
-    
-    repo_path = os.getenv("REPO_PATH", "/sandbox/repo")
-    repod_dir = repo_path.split('/')[-1]
-    repod_path = repo_path[:-len(repod_dir)-1]
-    if os.path.exists(repod_dir):
-        os.chdir(repod_dir)
+    sys.path.insert(0, repo_dir)
+
+
+    if os.path.exists(repo_dir):
+        os.chdir(repo_dir)
+
+    ensure_git_initialized()
 
     set_env_for_agent()
-    cwd = os.getcwd()
-    logger.info(f"Current working directory: {cwd} and environ:{os.environ}")
-    
-    test_runner, test_runner_mode = get_test_runner_and_mode()
-    print(f"test_runner: {test_runner}, test_runner_mode: {test_runner_mode}")
 
     try:
-        logger.info(f"current files:{os.listdir()}")
-        logger.info(f"packages installed:{subprocess.check_output(['pip','list']).decode('utf-8')}")
-        logger.info(f"About to execute workflow...")
-        patch_text= fix_task_solve_workflow(
-            problem_text,
-            timeout=timeout,
-            run_id_1=run_id,
-            test_runner=test_runner,
-            test_runner_mode=test_runner_mode
-        )
-        logger.info(f"workflow execution completed, patch length: {len(patch_text)}")
+        problem_type = check_problem_type(input_dict.get("problem_statement"))
 
-        os.system("git reset --hard")
-
+        if problem_type == PROBLEM_TYPE_FIX:
+            result = process_fix_task(input_dict)
+        else:
+            result = process_create_task(input_dict)
     except Exception as e:
-        import traceback  # Ensure traceback is accessible
-        error_info = f"Error: {e}, {traceback.format_exc()}"
-        logger.error(f"[CRITICAL] Exception in task processing: {error_info}")
-        logs.append(error_info)
-    finally:
-        os.chdir(cwd)
+        result = process_fix_task(input_dict)
 
-    print(f"[CRITICAL] task processor returning patch length: {len(patch_text)}")
-    print(f"[CRITICAL] patch: {patch_text}")
-    return patch_text
+    os.system("git reset --hard")
+
+    return result
 
 def check_problem_type(problem_statement: str) -> str:
     retry = 0
@@ -1841,331 +2028,7 @@ def check_problem_type(problem_statement: str) -> str:
 
     return response
 
-def post_process_instruction(instruction: str) -> str:
-    """
-    Post-processes instruction to mark whitespaces and empty lines explicitly.
-    """
-    import re
-    
-    def apply_markup(text_block: str) -> str:
-        """
-        Apply markup to make whitespaces and empty lines explicit to make llm not confusing and ignoring them.
-        For example, if the text block is:
-
-        ```text
-        This is a test.
-
-        This is another test!
-        ```text
-
-        Then the text block should be:
-
-        ```
-        This is a test.
-        [EMPTY_LINE]
-        This is another test!
-        ```
-        """
-        lines = text_block.split('\n')
-        processed_lines = []
-        
-        should_apply_markup = True
-        for line in lines:
-            if line.strip() == '':
-                should_apply_markup = True
-                break
-            if line[-1] != "." and line[-1] != "!":
-                should_apply_markup = False
-                break
-            
-        if should_apply_markup == False:
-            return text_block
-
-        for i, line in enumerate(lines):
-            if line.strip() == '':                
-                processed_line = '[EMPTY_LINE]'
-            else:
-                # Mark trailing and leading spaces
-                leading_spaces = len(line) - len(line.lstrip(' '))
-                trailing_spaces = len(line) - len(line.rstrip(' '))
-                
-                processed_line = line
-                if leading_spaces > 0:
-                    processed_line = f'[{leading_spaces}_LEADING_SPACES]' + line.lstrip(' ')
-                if trailing_spaces > 0:
-                    processed_line = processed_line.rstrip(' ') + f'[{trailing_spaces}_TRAILING_SPACES]'
-            
-            processed_lines.append(f"\"{processed_line}\"")
-        
-        return "[\n    " + ",\n    ".join(processed_lines) + "\n]"
-            
-    # Pattern to match ```text...``` blocks
-    pattern = r'```text\n(.*?)\n```'
-    
-    def replace_text_block(match):
-        text_content = match.group(1)
-        processed_content = apply_markup(text_content)
-        
-        return f'```text\n{processed_content}\n```'
-    
-    # Replace all text blocks with processed versions
-    processed_instruction = re.sub(pattern, replace_text_block, instruction, flags=re.DOTALL)
-    return processed_instruction
-
-def determine_model_order(problem_statement: str) -> list:
-    """Determine model priority via LLM routing based on the problem statement.
-
-    The router LLM must return strict JSON indicating the first and second models.
-    Falls back to a safe default if parsing fails.
-    """
-    try:
-        system_prompt = (
-            "You are a model router. Choose the best first LLM to solve a Python\n"
-            "coding challenge given its problem statement, and then the second LLM.\n"
-            "Only consider these options (use exact identifiers):\n"
-            f"1) {DEEPSEEK_MODEL_NAME} (stronger reasoning, graphs/backtracking/parsers)\n"
-            f"2) {QWEN_MODEL_NAME} (stronger implementation, string/data wrangling/spec-following)\n\n"
-            "Output MUST be a single JSON object with key 'order' mapping to a list of two\n"
-            "strings, the exact model identifiers, best-first. No explanations."
-        )
-
-        user_prompt = (
-            "Problem statement to route:\n\n" + (problem_statement or "").strip()
-        )
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-
-        raw = EnhancedNetwork.make_request(messages, model=DEEPSEEK_MODEL_NAME)
-
-        # Normalize potential fenced responses
-        cleaned = raw.strip()
-        cleaned = cleaned.replace('```json', '```')
-        if cleaned.startswith('```') and cleaned.endswith('```'):
-            cleaned = cleaned.strip('`').strip()
-
-        try:
-            data = json.loads(cleaned)
-        except Exception:
-            match = re.search(r"\{[\s\S]*\}", cleaned)
-            data = json.loads(match.group(0)) if match else {}
-
-        order = []
-        if isinstance(data, dict):
-            if isinstance(data.get('order'), list):
-                order = data['order']
-            elif 'first' in data and 'second' in data:
-                order = [data['first'], data['second']]
-
-        alias_map = {
-            DEEPSEEK_MODEL_NAME.lower(): DEEPSEEK_MODEL_NAME,
-            QWEN_MODEL_NAME.lower(): QWEN_MODEL_NAME,
-            'deepseek': DEEPSEEK_MODEL_NAME,
-            'qwen': QWEN_MODEL_NAME,
-        }
-
-        mapped = []
-        for item in order:
-            if not isinstance(item, str):
-                continue
-            key = item.strip().lower()
-            if key in alias_map and alias_map[key] not in mapped:
-                mapped.append(alias_map[key])
-
-        for candidate in [DEEPSEEK_MODEL_NAME, QWEN_MODEL_NAME]:
-            if candidate not in mapped:
-                mapped.append(candidate)
-            if len(mapped) == 2:
-                break
-
-        logger.info(f"[MODEL-ROUTER] Selected model order via LLM: {mapped}")
-        return mapped[:2]
-    except Exception as e:
-        logger.warning(f"[MODEL-ROUTER] Routing failed ({e}); using safe default order")
-        return [QWEN_MODEL_NAME, DEEPSEEK_MODEL_NAME]
-
-def generate_initial_solution(problem_statement: str, code_skeleton: str) -> str:
-    models = determine_model_order(problem_statement)
-
-    retry = 0
-    while retry < 10:
-        try:
-            logger.info("Starting multi-step reasoning solution generation")
-            
-            solution = generate_solution_with_multi_step_reasoning(problem_statement, code_skeleton)
-            
-            if solution:
-                logger.info("Generated initial solution successfully using multi-step reasoning")
-                return solution
-            else:
-                logger.warning("Multi-step reasoning failed, falling back to single-step approach")
-                
-                # Fallback to original single-step approach if multi-step fails
-                messages = [
-                    {
-                        "role": "system",
-                        "content": GENERATE_INITIAL_SOLUTION_PROMPT
-                    },
-                    {
-                        "role": "user",
-                        "content": f"""Problem Statement:\n{problem_statement}\n\nInitial python files:\n{code_skeleton}\n\nGenerate the complete and correct implementation in python files."""
-                    }
-                ]
-                
-                response = EnhancedNetwork.make_request(messages, model=models[0])
-                
-                # Clean up the response
-                solution = response.strip()
-                if solution.startswith('```python'):
-                    solution = solution[9:]
-                if solution.startswith('```'):
-                    solution = solution[3:]
-                if solution.endswith('```'):
-                    solution = solution[:-3]
-                solution = solution.strip()
-                
-                logger.info("Generated initial solution successfully using fallback approach")
-                return solution
-            
-        except Exception as e:
-            logger.error(f"Error generating initial solution: {str(e)}")
-            retry += 1
-            time.sleep(2)
-    
-    if retry >= 10:
-        logger.error("Failed to generate initial solution")
-        return ""
-    return ""
-
-def generate_testcases_with_multi_step_reasoning(problem_statement: str, files_to_test: str, code_skeleton: str) -> str:
-    retry = 0
-    test_generation_messages = [
-        {
-            "role": "system",
-            "content": GENERATE_TESTCASES_WITH_MULTI_STEP_REASONING_PROMPT
-        },
-        {
-            "role": "user",
-            "content": f"Problem Statement:\n{problem_statement}\n\nFiles To Test: {files_to_test}\n\nCode skeleton: \n{code_skeleton}\n\nGenerate the complete and correct testcases in python files.\n\nSTRICT REQUIREMENT: You **MUST** output the **file name** along with file content.\nexample:\n```python\ntest_a.py\ncontents of test_a.py\n\ntest_b.py\ncontents of test_b.py\n```"
-        }
-    ]
-    while retry < 10:
-        try:
-            testcode_response = EnhancedNetwork.make_request(test_generation_messages, model=QWEN_MODEL_NAME)
-            logger.info("Step 1 - Testcase Generation completed")
-            
-            testcases_check_messages = [
-                {
-                    "role": "system",
-                    "content": TESTCASES_CHECK_PROMPT
-                },
-                {
-                    "role": "user",
-                    "content": f"Problem statement: {problem_statement}\n\nFiles To Test: {files_to_test}\n\nCode skeleton: \n{code_skeleton}\n\nGenerated Test Code:\n{testcode_response}\n\nAnalyze this code for invalid testcases. Return ONLY the final Python test code."
-                }   
-            ]
-            
-            testcode_checked_response = EnhancedNetwork.make_request(testcases_check_messages, model=QWEN_MODEL_NAME)
-            logger.info("Step 2 - Testcase check completed")
-
-            testcases = testcode_checked_response.strip()
-            if testcases.startswith('```python'):
-                testcases = testcases[9:]
-            if testcases.startswith('```'):
-                testcases = testcases[3:]
-            if testcases.endswith('```'):
-                testcases = testcases[:-3]
-            testcases = testcases.strip()
-            
-            lines = testcases.split("\n")
-            if lines[0].endswith(".py") == False:
-                retry += 1
-                test_generation_messages.append({"role": "assistant", "content": testcode_checked_response})
-                test_generation_messages.append({"role": "user", "content": f"Include file name in the response. example:\n```python\ntest_a.py\ncontents of test_a.py\n\ntest_b.py\ncontents of test_b.py\n```"})
-                print(f"Retrying because the first line is not a python test file name:\n {testcases}")
-                continue
-
-            logger.info("Multi-step reasoning solution generation completed successfully with infinite loop validation")
-            return testcases
-        except Exception as e:
-            retry += 1
-            print(f"Exception in generate_testcases_with_multi_step_reasoning: {e}")
-            time.sleep(2)
-    
-    if retry >= 10:
-        logger.error("Multi-step reasoning testcase generation failed")
-        return ""
-    
-    return ""
-
-def generate_solution_with_multi_step_reasoning(problem_statement: str, code_skeleton: str) -> str:
-    retry = 0
-    code_generation_messages = [
-        {
-            "role": "system",
-            "content": GENERATE_SOLUTION_WITH_MULTI_STEP_REASONING_PROMPT
-        },
-        {
-            "role": "user",
-            "content": f"Problem Statement:\n{problem_statement}\n\nInitial python files:\n{code_skeleton}\nGenerate the complete and correct implementation in python files.\n\nSTRICT REQUIREMENT: You **MUST** output the **file name** along with file content.\nexample:\n```python\na.py\ncontents of a.py\n\nb.py\ncontents of b.py\n```"
-        }
-    ]
-    while retry < 10:
-        try:
-            code_response = EnhancedNetwork.make_request(code_generation_messages, model=QWEN_MODEL_NAME)
-            logger.info("Step 1 - Code Generation completed")
-            
-            loop_check_messages = [
-                {
-                    "role": "system",
-                    "content": INFINITE_LOOP_CHECK_PROMPT
-                },
-                {
-                    "role": "user",
-                    "content": f"Generated Code:\n{code_response}\n\nAnalyze this code for potential infinite loops and provide a corrected version if any issues are found. Return ONLY the final Python code."
-                }   
-            ]
-            
-            loop_check_response = EnhancedNetwork.make_request(loop_check_messages, model=QWEN_MODEL_NAME)
-            logger.info("Step 2 - Infinite Loop Check completed")
-
-            # Clean up the final response (use loop check response as it's the final validated version)
-            solution = loop_check_response.strip()
-            if solution.startswith('```python'):
-                solution = solution[9:]
-            if solution.startswith('```'):
-                solution = solution[3:]
-            if solution.endswith('```'):
-                solution = solution[:-3]
-            solution = solution.strip()
-            
-            lines = solution.split("\n")
-            if lines[0].endswith(".py") == False:
-                retry += 1
-                code_generation_messages.append({"role": "assistant", "content": code_response})
-                code_generation_messages.append({"role": "user", "content": f"Include file name in the response. example:\n```python\na.py\ncontents of a.py\n\nb.py\ncontents of b.py\n```"})
-                print(f"Retrying because the first line is not a python file name:\n {solution}")
-                continue
-
-            logger.info("Multi-step reasoning solution generation completed successfully with infinite loop validation")
-            return solution
-        except Exception as e:
-            retry += 1
-            print(f"Exception in generate_solution_with_multi_step_reasoning: {e}")
-            time.sleep(2)
-    
-    if retry >= 10:
-        logger.error("Multi-step reasoning solution generation failed")
-        return ""
-    
-    return ""
-
-
-
 def extract_and_write_files(initial_solution: str, base_dir: str = ".") -> list:
-    import os
     
     created_files = []
     
@@ -2226,153 +2089,24 @@ def extract_and_write_files(initial_solution: str, base_dir: str = ".") -> list:
     
     return created_files
 
-
-
 def process_create_task(input_dict):
     problem_statement = input_dict.get("problem_statement", "")
     problem_statement = post_process_instruction(problem_statement)
     print(problem_statement)
 
     code_skeleton = get_code_skeleton()
-    start_time = time.time()
-    initial_solution = generate_initial_solution(problem_statement, code_skeleton)
-    print(initial_solution)
+
+    _solution_generator = SolutionGenerator()
+    complete_solution = _solution_generator.generate_complete_solution(problem_statement, code_skeleton)
+    print(f"Generated completed solution:\n{complete_solution}")
     
     # Extract and write files from the solution
-    created_files = extract_and_write_files(initial_solution)
+    created_files = extract_and_write_files(complete_solution)
     print(f"Created or Updated {len(created_files)} files: {created_files}")
-
-    
-    test_cases = generate_test_files(problem_statement, created_files, code_skeleton)
-    print(test_cases)
-    # Extract and write files from test cases
-    test_files = extract_and_write_files(test_cases)
-    print(f"Created or Updated {len(test_files)} files: {test_files}")
-
-    timeout = DEFAULT_TIMEOUT - (time.time()-start_time) - 60
-    
-    patch = fix_task_solve_workflow(
-        problem_statement,
-        timeout=timeout,
-        run_id_1=run_id,
-        test_runner=f"unittest",
-        test_runner_mode="FILE",
-        n_max_steps=30
-    )
-
-    if patch is None:
-        extract_and_write_files(initial_solution)
 
     tool_manager = EnhancedToolManager()
     patch = tool_manager.get_final_git_patch()
-    return patch
-
-def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: str,\
-    test_runner: str = "pytest", test_runner_mode: str = "FILE", n_max_steps = MAX_FIX_TASK_STEPS) -> tuple[str, List[str], List[str]]:
-    global run_id
-    run_id=run_id_1
-    cot=EnhancedCOT(latest_observations_to_keep=30)
-    tool_manager=FixTaskEnhancedToolManager(
-        available_tools=[
-            "get_file_content",
-            "save_file",
-            "get_approval_for_solution",
-            "get_functions",
-            "get_classes",
-            "search_in_all_files_content",
-            "search_in_specified_file_v2",
-            "start_over",
-            "run_repo_tests",
-            "run_code",
-            "apply_code_edit",
-            "generate_test_function",
-            "finish"
-        ],
-        test_runner=test_runner,
-        test_runner_mode=test_runner_mode
-    )
-    logger.info(f"Starting main agent execution...")
-    system_prompt = FIX_TASK_SYSTEM_PROMPT.format(tools_docs=tool_manager.get_tool_docs(),format_prompt=FORMAT_PROMPT_V0)
-    instance_prompt = FIX_TASK_INSTANCE_PROMPT_TEMPLATE.format(problem_statement=problem_statement)
-    
-    start_time = time.time()
-    logs: List[str] = []
-    logs.append(f"cwd: {os.getcwd()}")
-    logger.info(f"Starting workflow execution with {n_max_steps} max steps: timeout: {timeout} seconds : run_id: {run_id}")
-    
-    for step in range(n_max_steps):
-        logger.info(f"Execution step {step + 1}/{n_max_steps}")
-        
-        if time.time() - start_time > timeout:
-            cot.add_action(EnhancedCOT.Action(next_thought="global timeout reached",next_tool_name="",next_tool_args={},observation="",is_error=True,inference_error_counter={},request_data=[]))
-            break
-
-        messages: List[Dict[str, Any]] = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": instance_prompt},
-            ]
-        
-        messages.extend(cot.to_str())
-
-        messages.append({"role": "system", "content": STOP_INSTRUCTION})
-    
-        if cot.is_thought_repeated():
-            logger.info(f"[TEST_PATCH_FIND] Thought repeated, adding DO NOT REPEAT TOOL CALLS instruction")
-            last_thought = cot.thoughts[-1]
-            messages.append({"role": "user", "content": DO_NOT_REPEAT_TOOL_CALLS.format(previous_response=f"next_tool_name:{last_thought.next_tool_name}\n next_tool_args:{last_thought.next_tool_args}")})
-    
-        try:
-            next_thought, next_tool_name, next_tool_args,raw_text,total_attempts,error_counter,messages = EnhancedNetwork.inference(messages, model=GLM_MODEL_NAME, run_id=run_id)
-        except Exception as e:
-            import traceback  # Ensure traceback is accessible
-            error_msg=f"\n\nERROR: {repr(e)} {traceback.format_exc()}"
-            logger.error(f"Inference error: {error_msg}")
-            cot.add_action(EnhancedCOT.Action(next_thought=error_msg,next_tool_name="",next_tool_args={},observation="",is_error=True,raw_response=raw_text,total_attempts=total_attempts),inference_error_counter=error_counter,request_data=messages)
-            break
-        
-        logger.info(f"About to execute operation: {next_tool_name}")
-       
-        try:
-            logger.info(f"next_thought: {next_thought}\nnext_tool_name: {next_tool_name}\nnext_tool_args: {next_tool_args}\n")
-            if '"' in next_tool_name or "'" in next_tool_name:
-                next_tool_name=next_tool_name.replace('"','')
-                next_tool_name=next_tool_name.replace("'","")
-                
-            next_observation = tool_manager.get_tool(next_tool_name)(**next_tool_args) if next_tool_args else tool_manager.get_tool(next_tool_name)()
-            logger.info(f"next_observation: {next_observation}")
-            cot.add_action(EnhancedCOT.Action(next_thought=next_thought,next_tool_name=next_tool_name,next_tool_args=next_tool_args,observation=next_observation,is_error=False,raw_response=raw_text,total_attempts=total_attempts,inference_error_counter=error_counter,request_data=messages))
-        except EnhancedToolManager.Error as e:
-            import traceback  # Ensure traceback is accessible
-            error_msg=f"observation: {e.message}"
-            logger.error(f"Tool error: {error_msg}")
-            cot.add_action(EnhancedCOT.Action(next_thought=next_thought,next_tool_name=next_tool_name,next_tool_args=next_tool_args,observation=error_msg,is_error=True,raw_response=raw_text,total_attempts=total_attempts,inference_error_counter=error_counter,request_data=messages))
-            continue
-        except Exception as e:
-            import traceback  # Ensure traceback is accessible
-            error_traceback=traceback.format_exc()
-            if isinstance(e,TypeError):
-                error_msg=f"observation: {str(e)}"
-            else:
-                error_msg=f"observation: {repr(e)} {error_traceback}"
-            logger.error(f"Tool error: {error_msg}")
-            cot.add_action(EnhancedCOT.Action(next_thought=next_thought,next_tool_name=next_tool_name,next_tool_args=next_tool_args,observation=error_msg,is_error=True,raw_response=raw_text,total_attempts=total_attempts,inference_error_counter=error_counter,request_data=messages))
-            continue
-        
-        if next_tool_name == "finish":
-            logger.info('[CRITICAL] Workflow called finish operation')
-            break
-        print(f"[CRITICAL] Completed step {step + 1}, continuing to next step")
-    else:
-        cot.add_action(EnhancedCOT.Action(next_thought="global timeout reached",next_tool_name="",next_tool_args={},observation="",is_error=True))
-        logger.info(f"[CRITICAL] Workflow completed after reaching MAX_STEPS ({n_max_steps})")
-        if n_max_steps < MAX_FIX_TASK_STEPS:
-            return None
-    
-    logger.info(f"[CRITICAL] Workflow execution completed after {step + 1} steps")
-    logger.info(f"[CRITICAL] About to generate final patch...")
-    patch = tool_manager.get_final_git_patch()
-    logger.info(f"Final Patch Generated..: Length: {len(patch)}")
-
+    logger.info(f"Final patch: {patch}")
     return patch
 
 def get_code_skeleton() -> str:
@@ -2444,99 +2178,16 @@ def get_directory_tree(start_path: str = '.') -> str:
                 
         except Exception as e:
             tree_lines.append(f"{prefix}└── [Error: {str(e)}]")
-    
     add_directory_tree(start_path, is_root=True)
     return "\n".join(tree_lines)
-
-def find_readme(file_path: str, repo_path: str) -> Optional[str]:
-    """Find README file by traversing up from the given path."""
-    current_dir = os.path.dirname(file_path)
-    
-    while True:
-        for readme_name in ['README.md', 'README.rst']:
-            readme_path = os.path.join(current_dir, readme_name)
-            if os.path.exists(readme_path):
-                return readme_path
-        if current_dir == repo_path:
-            break
-        current_dir = os.path.dirname(current_dir)
-
-    return None
-
-def find_test_runner(readme_file_path: Optional[str] = None):
-    if not readme_file_path:
-        return "pytest"
-    try:
-        with open(readme_file_path, "r", encoding='utf-8') as f:
-            readme_content = f.read()
-        
-        response = EnhancedNetwork.make_request([
-            {"role": "system", "content": FIND_TEST_RUNNER_PROMPT},
-            {"role": "user", "content": readme_content}
-        ], model=DEEPSEEK_MODEL_NAME)
-        return response.strip() or "pytest"
-    except Exception as e:
-        logger.error(f"Error finding test runner: {e}")
-        return "pytest"
-
-def filepath_to_module(file_path: str, repo_path: str, test_runner: str) -> str:
-    """Convert file path to Python module notation."""
-    root_path = os.path.abspath(repo_path)
-    abs_filepath = os.path.abspath(file_path)
-    
-    # Remove extension and make relative to repo
-    module_path = os.path.splitext(abs_filepath)[0]
-    if module_path.startswith(root_path):
-        module_path = module_path[len(root_path):].lstrip(os.path.sep)
-
-    # Adjust relative to test runner directory if needed
-    test_runner_dir = os.path.dirname(test_runner)
-    if test_runner_dir and module_path.startswith(test_runner_dir):
-        module_path = module_path[len(test_runner_dir):].lstrip(os.path.sep)
-
-    return module_path.replace(os.path.sep, '.')
-
-def clean_filepath(file_path: str, repo_path: str, test_runner: str) -> str:
-    root_path = os.path.abspath(repo_path)
-    abs_filepath = os.path.abspath(file_path)
-    
-    module_path = os.path.splitext(abs_filepath)[0]
-    if module_path.startswith(root_path):
-        module_path = module_path[len(root_path):].lstrip(os.path.sep)
-
-    test_runner_dir = os.path.dirname(test_runner)
-    if test_runner_dir and module_path.startswith(test_runner_dir):
-        module_path = module_path[len(test_runner_dir):].lstrip(os.path.sep)
-
-    return module_path
-
-def get_test_runner_mode(test_runner: str):
-    if test_runner == 'pytest':
-        return "FILE"
-
-    try:
-        with open(test_runner, "r", encoding='utf-8') as f:
-            runner_content = f.read()
-        
-        response = EnhancedNetwork.make_request([
-            {"role": "system", "content": TEST_RUNNER_MODE_PROMPT},
-            {"role": "user", "content": runner_content}
-        ], model=DEEPSEEK_MODEL_NAME)
-        return response.strip() or "FILE"
-    except Exception as e:
-        logger.error(f"Error determining test runner mode: {e}")
-        return "FILE"
 
 def count_test_cases(file_path: str) -> int:
     """Count the number of test cases (functions starting with 'test_') in a Python file."""
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
-
-        import re
         test_functions = re.findall(r'^\s*def\s+test_\w+', content, re.MULTILINE)
         return len(test_functions)
-    
     except (FileNotFoundError, UnicodeDecodeError):
         return 0
 
@@ -2545,12 +2196,10 @@ def get_test_runner_and_mode():
     test_runner_mode = "FILE"
     test_files = []  # Initialize the test_files list
     test_file_path = None
-    
     for root, _, files in os.walk('.'):
         for file in files:
             if 'test_' in file and file.endswith('.py'):
                 test_files.append(os.path.join(root, file))
-    
     test_files.sort(key=len)
 
     for path in test_files:
@@ -2573,83 +2222,290 @@ def get_test_runner_and_mode():
 
     return test_runner, test_runner_mode
 
-def agent_main(input_dict: Dict[str, Any], repo_dir: str = "repo"):
-    """Legacy interface wrapper for backwards compatibility."""
-    global DEFAULT_PROXY_URL, DEFAULT_TIMEOUT, run_id
-    run_id = os.getenv("RUN_ID", "")
-    repo_dir = os.path.abspath(repo_dir)
-
-    sys.path.insert(0, repo_dir)
-
-
-    if os.path.exists(repo_dir):
-        os.chdir(repo_dir)
-
-    ensure_git_initialized()
-
-    set_env_for_agent()
-
+def get_test_runner_mode(test_runner: str):
+    if test_runner == 'pytest':
+        return "FILE"
     try:
-        problem_type = check_problem_type(input_dict.get("problem_statement"))
-
-        if problem_type == PROBLEM_TYPE_FIX:
-            result = process_fix_task(input_dict)
-        else:
-            result = process_create_task(input_dict)
+        with open(test_runner, "r", encoding='utf-8') as f:
+            runner_content = f.read()
+        response = EnhancedNetwork.make_request([
+            {"role": "system", "content": TEST_RUNNER_MODE_PROMPT},
+            {"role": "user", "content": runner_content}
+        ], model=DEEPSEEK_MODEL_NAME)
+        return response.strip() or "FILE"
     except Exception as e:
-        result = process_fix_task(input_dict)
+        logger.error(f"Error determining test runner mode: {e}")
+        return "FILE"
 
-    os.system("git reset --hard")
+def find_test_runner(readme_file_path: Optional[str] = None):
+    if not readme_file_path:
+        return "pytest"
+    try:
+        with open(readme_file_path, "r", encoding='utf-8') as f:
+            readme_content = f.read()
+        response = EnhancedNetwork.make_request([
+            {"role": "system", "content": FIND_TEST_RUNNER_PROMPT},
+            {"role": "user", "content": readme_content}
+        ], model=DEEPSEEK_MODEL_NAME)
+        return response.strip() or "pytest"
+    except Exception as e:
+        logger.error(f"Error finding test runner: {e}")
+        return "pytest"
 
-    return result
+def post_process_instruction(instruction: str) -> str:
+    """
+    Post-processes instruction to mark whitespaces and empty lines explicitly.
+    """
+    def apply_markup(text_block: str) -> str:
+        """
+        Apply markup to make whitespaces and empty lines explicit to make llm not confusing and ignoring them.
+        For example, if the text block is:
 
-def generate_test_files(problem_statement: str, files_to_test: str, code_skeleton: str) -> str:
-    retry = 0
-    while retry < 10:
-        try:
-            logger.info("Starting test cases generation")
+        ```text
+        This is a test.
+
+        This is another test!
+        ```text
+
+        Then the text block should be:
+
+        ```
+        This is a test.
+        [EMPTY_LINE]
+        This is another test!
+        ```
+        """
+        lines = text_block.split('\n')
+        processed_lines = []
+        
+        should_apply_markup = True
+        for line in lines:
+            if line.strip() == '':
+                should_apply_markup = True
+                break
+            if line[-1] != "." and line[-1] != "!":
+                should_apply_markup = False
+                break
             
-            testcases = generate_testcases_with_multi_step_reasoning(problem_statement, files_to_test, code_skeleton)
-            
-            if testcases:
-                logger.info("Generated testcases successfully using multi-step reasoning")
-                return testcases
+        if should_apply_markup == False:
+            return text_block
+
+        for i, line in enumerate(lines):
+            if line.strip() == '':                
+                processed_line = '[EMPTY_LINE]'
             else:
-                logger.warning("Multi-step reasoning failed, falling back to single-step approach")
+                # Mark trailing and leading spaces
+                leading_spaces = len(line) - len(line.lstrip(' '))
+                trailing_spaces = len(line) - len(line.rstrip(' '))
                 
-                # Fallback to original single-step approach if multi-step fails
-                messages = [
-                    {
-                        "role": "system",
-                        "content": GENERATE_INITIAL_TESTCASES_PROMPT
-                    },
-                    {
-                        "role": "user",
-                        "content": f"""Problem Statement:\n{problem_statement}\n\nPython files to test:\n{files_to_test}\n\nCode skeleton: \n{code_skeleton}\n\nGenerate the ground truth and edge case coveraging testcases."""
-                    }
-                ]
-                
-                response = EnhancedNetwork.make_request(messages, model=QWEN_MODEL_NAME)
-                
-                # Clean up the response
-                testcases = response.strip()
-                if testcases.startswith('```python'):
-                    testcases = testcases[9:]
-                if testcases.startswith('```'):
-                    testcases = testcases[3:]
-                if testcases.endswith('```'):
-                    testcases = testcases[:-3]
-                testcases = testcases.strip()
-                
-                logger.info("Generated testcases successfully using fallback approach")
-                return testcases
+                processed_line = line
+                if leading_spaces > 0:
+                    processed_line = f'[{leading_spaces}_LEADING_SPACES]' + line.lstrip(' ')
+                if trailing_spaces > 0:
+                    processed_line = processed_line.rstrip(' ') + f'[{trailing_spaces}_TRAILING_SPACES]'
             
-        except Exception as e:
-            logger.error(f"Error generating initial solution: {str(e)}")
-            retry += 1
-            time.sleep(2)
+            processed_lines.append(f"\"{processed_line}\"")
+        
+        return "[\n    " + ",\n    ".join(processed_lines) + "\n]"
+            
+    # Pattern to match ```text...``` blocks
+    pattern = r'```text\n(.*?)\n```'
     
-    if retry >= 10:
-        logger.error("Failed to generate initial solution")
-        return ""
-    return ""
+    def replace_text_block(match):
+        text_content = match.group(1)
+        processed_content = apply_markup(text_content)
+        
+        return f'```text\n{processed_content}\n```'
+    
+    # Replace all text blocks with processed versions
+    processed_instruction = re.sub(pattern, replace_text_block, instruction, flags=re.DOTALL)
+    return processed_instruction
+
+def find_readme(file_path: str, repo_path: str) -> Optional[str]:
+    """Find README file by traversing up from the given path."""
+    current_dir = os.path.dirname(file_path)
+    while True:
+        for readme_name in ['README.md', 'README.rst']:
+            readme_path = os.path.join(current_dir, readme_name)
+            if os.path.exists(readme_path):
+                return readme_path
+        if current_dir == repo_path:
+            break
+        current_dir = os.path.dirname(current_dir)
+    return None
+
+def process_fix_task(input_dict: Dict[str, Any]):
+    """Main entry point for task processing and code modification.
+
+    Parameters
+    ----------
+    input_dict : dict
+        Configuration dictionary containing the task specification.
+        Required key: 'problem_statement' with task details.
+        Optional keys: 'run_id', 'instance_id' for tracking purposes.
+    """
+    global run_id
+    # setting environment to include current working directory and lib directory
+    problem_text = input_dict.get("problem_statement")
+    if not problem_text:
+        raise ValueError("input_dict must contain 'problem_statement'.")
+    timeout = int(os.getenv("AGENT_TIMEOUT", str(DEFAULT_TIMEOUT)))
+    logs = []
+    patch_text = ""  # Initialize to avoid UnboundLocalError
+    repo_path = os.getenv("REPO_PATH", "/sandbox/repo")
+    repod_dir = repo_path.split('/')[-1]
+    if os.path.exists(repod_dir):
+        os.chdir(repod_dir)
+    set_env_for_agent()
+    cwd = os.getcwd()
+    logger.info(f"Current working directory: {cwd} and environ:{os.environ}")
+    test_runner, test_runner_mode = get_test_runner_and_mode()
+    print(f"test_runner: {test_runner}, test_runner_mode: {test_runner_mode}")
+    try:
+        logger.info(f"current files:{os.listdir()}")
+        logger.info(f"packages installed:{subprocess.check_output(['pip','list']).decode('utf-8')}")
+        logger.info(f"About to execute workflow...")
+        patch_text= fix_task_solve_workflow_fix(
+            problem_text,
+            timeout=timeout,
+            run_id_1=run_id,
+            instance_id="",
+            test_runner=test_runner,
+            test_runner_mode=test_runner_mode
+        )
+        logger.info(f"workflow execution completed, patch length: {len(patch_text)}")
+        os.system("git reset --hard")
+    except Exception as e:
+        error_info = f"Error: {e}, {traceback.format_exc()}"
+        logger.error(f"[CRITICAL] Exception in task processing: {error_info}")
+        logs.append(error_info)
+    finally:
+        os.chdir(cwd)
+    print(f"[CRITICAL] task processor returning patch length: {len(patch_text)}")
+    print(f"[CRITICAL] patch: {patch_text}")
+    return patch_text
+
+def fix_task_solve_workflow_fix(problem_statement: str, *, timeout: int, run_id_1: str, instance_id: str = "", \
+    test_runner: str = "pytest", test_runner_mode: str = "FILE") -> tuple[str, List[str], List[str]]:
+    global run_id
+    run_id=run_id_1
+    cot=EnhancedCOT(latest_observations_to_keep=30)
+    tool_manager=FixTaskEnhancedToolManager(
+        available_tools=[
+            "get_file_content",
+            "save_file",
+            "get_approval_for_solution",
+            "get_functions",
+            "get_classes",
+            "search_in_all_files_content",
+            "search_in_specified_file_v2",
+            "start_over",
+            "run_repo_tests",
+            "run_code",
+            "apply_code_edit",
+            "generate_test_function",
+            "finish"
+        ],
+        test_runner=test_runner,
+        test_runner_mode=test_runner_mode
+    )
+    logger.info(f"Starting main agent execution...")
+    system_prompt = FIX_TASK_SYSTEM_PROMPT.format(tools_docs=tool_manager.get_tool_docs(),format_prompt=FORMAT_PROMPT_V0)
+    instance_prompt = FIX_TASK_INSTANCE_PROMPT_TEMPLATE.format(problem_statement=problem_statement)
+    start_time = time.time()
+    logs: List[str] = []
+    logs.append(f"cwd: {os.getcwd()}")
+    logger.info(f"Starting workflow execution with {MAX_FIX_TASK_STEPS} max steps: timeout: {timeout} seconds : run_id: {run_id}")
+    for step in range(MAX_FIX_TASK_STEPS):
+        logger.info(f"Execution step {step + 1}/{MAX_FIX_TASK_STEPS}")
+        
+        if time.time() - start_time > timeout:
+            cot.add_action(EnhancedCOT.Action(next_thought="global timeout reached",next_tool_name="",next_tool_args={},observation="",is_error=True,inference_error_counter={},request_data=[]))
+            break
+        messages: List[Dict[str, Any]] = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": instance_prompt},
+            ]
+        messages.extend(cot.to_str())
+        messages.append({"role": "system", "content": STOP_INSTRUCTION})
+
+        if cot.is_thought_repeated():
+            logger.info(f"[TEST_PATCH_FIND] Thought repeated, adding DO NOT REPEAT TOOL CALLS instruction")
+            last_thought = cot.thoughts[-1]
+            messages.append({"role": "user", "content": DO_NOT_REPEAT_TOOL_CALLS.format(previous_response=f"next_tool_name:{last_thought.next_tool_name}\n next_tool_args:{last_thought.next_tool_args}")})
+
+        try:
+            next_thought, next_tool_name, next_tool_args,raw_text,total_attempts,error_counter,messages = EnhancedNetwork.inference(messages, model=GLM_MODEL_NAME, run_id=run_id)
+        except Exception as e:
+            error_msg=f"\n\nERROR: {repr(e)} {traceback.format_exc()}"
+            logger.error(f"Inference error: {error_msg}")
+            cot.add_action(EnhancedCOT.Action(next_thought=error_msg,next_tool_name="",next_tool_args={},observation="",is_error=True,raw_response=raw_text,total_attempts=total_attempts),inference_error_counter=error_counter,request_data=messages)
+            break
+        logger.info(f"About to execute operation: {next_tool_name}")
+        try:
+            logger.info(f"next_thought: {next_thought}\nnext_tool_name: {next_tool_name}\nnext_tool_args: {next_tool_args}\n")
+            if '"' in next_tool_name or "'" in next_tool_name:
+                next_tool_name=next_tool_name.replace('"','')
+                next_tool_name=next_tool_name.replace("'","")
+                
+            next_observation = tool_manager.get_tool(next_tool_name)(**next_tool_args) if next_tool_args else tool_manager.get_tool(next_tool_name)()
+            logger.info(f"next_observation: {next_observation}")
+            cot.add_action(EnhancedCOT.Action(next_thought=next_thought,next_tool_name=next_tool_name,next_tool_args=next_tool_args,observation=next_observation,is_error=False,raw_response=raw_text,total_attempts=total_attempts,inference_error_counter=error_counter,request_data=messages))
+        except EnhancedToolManager.Error as e:
+            error_msg=f"observation: {e.message}"
+            logger.error(f"Tool error: {error_msg}")
+            cot.add_action(EnhancedCOT.Action(next_thought=next_thought,next_tool_name=next_tool_name,next_tool_args=next_tool_args,observation=error_msg,is_error=True,raw_response=raw_text,total_attempts=total_attempts,inference_error_counter=error_counter,request_data=messages))
+            continue
+        except Exception as e:
+            error_traceback=traceback.format_exc()
+            if isinstance(e,TypeError):
+                error_msg=f"observation: {str(e)}"
+            else:
+                error_msg=f"observation: {repr(e)} {error_traceback}"
+            logger.error(f"Tool error: {error_msg}")
+            cot.add_action(EnhancedCOT.Action(next_thought=next_thought,next_tool_name=next_tool_name,next_tool_args=next_tool_args,observation=error_msg,is_error=True,raw_response=raw_text,total_attempts=total_attempts,inference_error_counter=error_counter,request_data=messages))
+            continue
+        if next_tool_name == "finish":
+            logger.info('[CRITICAL] Workflow called finish operation')
+            break
+        print(f"[CRITICAL] Completed step {step + 1}, continuing to next step")
+    else:
+        # This happens if we exit the loop without breaking (reached MAX_STEPS)
+        cot.add_action(EnhancedCOT.Action(next_thought="global timeout reached",next_tool_name="",next_tool_args={},observation="",is_error=True))
+        logger.info(f"[CRITICAL] Workflow completed after reaching MAX_STEPS ({MAX_FIX_TASK_STEPS})")
+    logger.info(f"[CRITICAL] Workflow execution completed after {step + 1} steps")
+    logger.info(f"[CRITICAL] About to generate final patch...")
+    patch = tool_manager.get_final_git_patch()
+    logger.info(f"Final Patch Generated..: Length: {len(patch)}")
+    return patch
+
+def clean_filepath(file_path: str, repo_path: str, test_runner: str) -> str:
+    root_path = os.path.abspath(repo_path)
+    abs_filepath = os.path.abspath(file_path)
+    
+    module_path = os.path.splitext(abs_filepath)[0]
+    if module_path.startswith(root_path):
+        module_path = module_path[len(root_path):].lstrip(os.path.sep)
+
+    test_runner_dir = os.path.dirname(test_runner)
+    if test_runner_dir and module_path.startswith(test_runner_dir):
+        module_path = module_path[len(test_runner_dir):].lstrip(os.path.sep)
+
+    return module_path
+
+def filepath_to_module(file_path: str, repo_path: str, test_runner: str) -> str:
+    """Convert file path to Python module notation."""
+    root_path = os.path.abspath(repo_path)
+    abs_filepath = os.path.abspath(file_path)
+    
+    # Remove extension and make relative to repo
+    module_path = os.path.splitext(abs_filepath)[0]
+    if module_path.startswith(root_path):
+        module_path = module_path[len(root_path):].lstrip(os.path.sep)
+
+    # Adjust relative to test runner directory if needed
+    test_runner_dir = os.path.dirname(test_runner)
+    if test_runner_dir and module_path.startswith(test_runner_dir):
+        module_path = module_path[len(test_runner_dir):].lstrip(os.path.sep)
+
+    return module_path.replace(os.path.sep, '.')

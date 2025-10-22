@@ -89,7 +89,7 @@ DO NOT generate `observation:` in your response. It will be provided by user for
 Generate only SINGLE triplet of `next_thought`, `next_tool_name`, `next_tool_args` in your response.
 """)
 
-DEFAULT_PROXY_URL = os.getenv("SANDBOX_PROXY_URL", "http://localhost:8000")
+DEFAULT_PROXY_URL = os.getenv("SANDBOX_PROXY_URL", "http://sandbox_proxy")
 DEFAULT_TIMEOUT = int(os.getenv("AGENT_TIMEOUT", "2000"))
 
 PROBLEM_TYPE_CREATE = "CREATE"
@@ -1145,75 +1145,12 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
             error.message="Error saving file. "+error.message
             raise EnhancedToolManager.Error(EnhancedToolManager.Error.ErrorType.SYNTAX_ERROR.name,error.message)
  
-    @EnhancedToolManager.tool
-    def get_functions(self, function_paths: List[str]) -> Dict[str, str]:
-        '''
-        Get functions from a list of function paths.
-        Arguments:
-            function_paths: list of function paths (e.g. ["folder1/file1.py::class1::function1", "folder2/file2.py::class2::function2"])
-        Output:
-            dictionary of functions with function paths as keys and function bodies as values
-        '''
-        functions = {}
-        for function_path in function_paths:
-            parts = function_path.split("::")
-            file_path = parts[0]
-            function_name = "::".join(parts[1:])
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-                tree = ast.parse(content, filename=file_path)
-                visitor = FunctionVisitor(content)
-                visitor.visit(tree)
-                
-                if function_name in visitor.functions:
-                    functions[function_path] = visitor.functions[function_name].get("body", "")
-                else:
-                    functions[function_path] = f"Function {function_name} not found in {file_path}"
-            except FileNotFoundError:
-                functions[function_path] = f"File {file_path} not found"
-            except Exception as e:
-                functions[function_path] = f"Error processing {file_path}: {str(e)}"
-
-        return functions
-
-    @EnhancedToolManager.tool
-    def get_classes(self, class_paths: List[str])->Dict[str, str]:
-        '''
-        Get classes from a list of class paths.
-        Arguments:
-            class_paths: list of class paths (e.g. ["folder1/file1.py::class1", "folder2/file2.py::class2"])
-        Output:
-            dictionary of classes with class paths as keys and class bodies as values
-        '''
-        classes = {}
-        for class_path in class_paths:
-            parts = class_path.split("::")
-            file_path = parts[0]
-            class_name = "::".join(parts[1:])
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-                tree = ast.parse(content, filename=file_path)
-                visitor = ClassVisitor(content)
-                visitor.visit(tree)
-                if class_name in visitor.classes:
-                    classes[class_path] = visitor.classes[class_name].get("body", "")
-                else:
-                    classes[class_path] = f"Class {class_name} not found in {file_path}"
-            except FileNotFoundError:
-                classes[class_path] = f"File {file_path} not found"
-            except Exception as e:
-                classes[class_path] = f"Error processing {file_path}: {str(e)}"
-
-        return classes
 
     @EnhancedToolManager.tool
     def search_in_all_files_content(self, search_term: str, case_sensitive: bool = False) -> str:
         '''
         Search for a text pattern across all .py files in the project, excluding any file with "test" in its path.
         Use at the beginning of the workflow to locate all possible references to a function, class, or variable.
-        If more context is needed (e.g., surrounding functions, classes, etc.), follow up with get_classes or get_functions.
 
         Arguments:
             search_term: text pattern to locate (e.g., "def test_function", "*SomeClass*")
@@ -1622,11 +1559,6 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
 
                 # Any other module is considered disallowed
                 disallowed_modules.add(mod)
-
-        if disallowed_modules and False:
-            logger.error(f"Cannot run, third party dependencies detected: {sorted(disallowed_modules)}\n")
-            raise ToolManager.Error(ToolManager.Error.ErrorType.THIRD_PARTY_DEPENDENCIES.name,f"Error:Cannot run, third party dependencies detected: {sorted(disallowed_modules)}\n")
-
         
         result = subprocess.run(["python", file_path], capture_output=True, text=True, check=False, timeout=60)
         if result.returncode!=0:
@@ -1912,6 +1844,186 @@ def post_process_instruction(instruction: str) -> str:
     processed_instruction = re.sub(pattern, replace_text_block, instruction, flags=re.DOTALL)
     return processed_instruction
 
+
+
+def generate_test_files(problem_statement: str, files_to_test: str, code_skeleton: str) -> str:
+    retry = 0
+    while retry < 10:
+        try:
+            logger.info("Starting test cases generation")
+            
+            testcases = generate_testcases_with_multi_step_reasoning(problem_statement, files_to_test, code_skeleton)
+            
+            if testcases:
+                logger.info("Generated testcases successfully using multi-step reasoning")
+                return testcases
+            else:
+                logger.warning("Multi-step reasoning failed, falling back to single-step approach")
+                
+                # Fallback to original single-step approach if multi-step fails
+                messages = [
+                    {
+                        "role": "system",
+                        "content": GENERATE_INITIAL_TESTCASES_PROMPT
+                    },
+                    {
+                        "role": "user",
+                        "content": f"""Problem Statement:\n{problem_statement}\n\nPython files to test:\n{files_to_test}\n\nCode skeleton: \n{code_skeleton}\n\nGenerate the ground truth and edge case coveraging testcases."""
+                    }
+                ]
+                
+                response = EnhancedNetwork.make_request(messages, model=QWEN_MODEL_NAME)
+                
+                # Clean up the response
+                testcases = response.strip()
+                if testcases.startswith('```python'):
+                    testcases = testcases[9:]
+                if testcases.startswith('```'):
+                    testcases = testcases[3:]
+                if testcases.endswith('```'):
+                    testcases = testcases[:-3]
+                testcases = testcases.strip()
+                
+                logger.info("Generated testcases successfully using fallback approach")
+                return testcases
+            
+        except Exception as e:
+            logger.error(f"Error generating initial solution: {str(e)}")
+            retry += 1
+            time.sleep(2)
+    
+    if retry >= 10:
+        logger.error("Failed to generate initial solution")
+        return ""
+    return ""
+
+
+def generate_initial_solution(problem_statement: str, code_skeleton: str) -> str:
+    
+    models = determine_model_order(problem_statement)
+    
+    # Generate three different solutions
+    solutions = []
+    retry = 0
+    
+    while len(solutions) < 3 and retry < 10:
+        try:
+            logger.info(f"Generating solution {len(solutions) + 1}/3")
+            
+            # Try multi-step reasoning first
+            solution = generate_solution_with_multi_step_reasoning(problem_statement, code_skeleton)
+            
+            if solution:
+                solutions.append(solution)
+                logger.info(f"Generated solution {len(solutions)} using multi-step reasoning")
+            else:
+                # Fallback to single-step approach
+                messages = [
+                    {
+                        "role": "system",
+                        "content": GENERATE_INITIAL_SOLUTION_PROMPT
+                    },
+                    {
+                        "role": "user",
+                        "content": f"""Problem Statement:\n{problem_statement}\n\nInitial python files:\n{code_skeleton}\n\nGenerate the complete and correct implementation in python files."""
+                    }
+                ]
+                
+                response = EnhancedNetwork.make_request(messages, model=models[0])
+                
+                # Clean up the response
+                solution = response.strip()
+                if solution.startswith('```python'):
+                    solution = solution[9:]
+                if solution.startswith('```'):
+                    solution = solution[3:]
+                if solution.endswith('```'):
+                    solution = solution[:-3]
+                solution = solution.strip()
+                
+                if solution:
+                    solutions.append(solution)
+                    logger.info(f"Generated solution {len(solutions)} using fallback approach")
+            
+        except Exception as e:
+            logger.error(f"Error generating solution {len(solutions) + 1}: {str(e)}")
+            retry += 1
+            time.sleep(2)
+    
+    if not solutions:
+        logger.error("Failed to generate any solutions")
+        return ""
+    
+    # If we have only one solution, return it
+    if len(solutions) == 1:
+        logger.info("Only one solution generated, returning it")
+        return solutions[0]
+    
+    # Use LLM to choose the best solution among multiple options
+    logger.info(f"Generated {len(solutions)} solutions, asking LLM to choose the best one")
+    
+    # Create comparison prompt
+    comparison_prompt = f"""You are an expert Python developer tasked with evaluating and selecting the best solution from multiple options.
+
+Problem Statement:
+{problem_statement}
+
+Code Skeleton:
+{code_skeleton}
+
+Below are {len(solutions)} different solutions to this problem. Please analyze each solution and select the best one based on:
+1. Correctness and completeness based on problem statement
+2. Code quality and readability
+3. Adherence to Python best practices
+4. Proper handling of edge cases
+
+Solutions:
+
+"""
+    
+    for i, solution in enumerate(solutions, 1):
+        comparison_prompt += f"=== SOLUTION {i} ===\n{solution}\n\n"
+    
+    comparison_prompt += """Please respond with:
+1. The number of the best solution (1, 2, or 3)
+2. A brief explanation of why this solution is superior to the others
+
+Format your response as:
+BEST_SOLUTION: [number]
+REASON: [explanation]"""
+    
+    try:
+        comparison_messages = [
+            {
+                "role": "system", 
+                "content": "You are an expert Python developer who excels at code review and solution evaluation."
+            },
+            {
+                "role": "user",
+                "content": comparison_prompt
+            }
+        ]
+        
+        response = EnhancedNetwork.make_request(comparison_messages, model=models[0])
+        
+        # Parse the response to extract the selected solution
+        best_solution_match = re.search(r'BEST_SOLUTION:\s*(\d+)', response)
+        if best_solution_match:
+            selected_index = int(best_solution_match.group(1)) - 1  # Convert to 0-based index
+            if 0 <= selected_index < len(solutions):
+                logger.info(f"LLM selected solution {selected_index + 1} as the best")
+                return solutions[selected_index]
+            else:
+                logger.warning(f"Invalid solution index {selected_index + 1}, returning first solution")
+                return solutions[0]
+        else:
+            logger.warning("Could not parse LLM response, returning first solution")
+            return solutions[0]
+            
+    except Exception as e:
+        logger.error(f"Error in solution comparison: {str(e)}, returning first solution")
+        return solutions[0]
+
 def determine_model_order(problem_statement: str) -> list:
     """Determine model priority via LLM routing based on the problem statement.
 
@@ -1986,58 +2098,72 @@ def determine_model_order(problem_statement: str) -> list:
         logger.warning(f"[MODEL-ROUTER] Routing failed ({e}); using safe default order")
         return [QWEN_MODEL_NAME, DEEPSEEK_MODEL_NAME]
 
-def generate_initial_solution(problem_statement: str, code_skeleton: str) -> str:
-    models = determine_model_order(problem_statement)
 
+
+def generate_solution_with_multi_step_reasoning(problem_statement: str, code_skeleton: str) -> str:
     retry = 0
+    code_generation_messages = [
+        {
+            "role": "system",
+            "content": GENERATE_SOLUTION_WITH_MULTI_STEP_REASONING_PROMPT
+        },
+        {
+            "role": "user",
+            "content": f"Problem Statement:\n{problem_statement}\n\nInitial python files:\n{code_skeleton}\nGenerate the complete and correct implementation in python files.\n\nSTRICT REQUIREMENT: You **MUST** output the **file name** along with file content.\nexample:\n```python\na.py\ncontents of a.py\n\nb.py\ncontents of b.py\n```"
+        }
+    ]
+    
     while retry < 10:
         try:
-            logger.info("Starting multi-step reasoning solution generation")
+            code_response = EnhancedNetwork.make_request(code_generation_messages, model=QWEN_MODEL_NAME)
+            logger.info("Step 1 - Code Generation completed")
             
-            solution = generate_solution_with_multi_step_reasoning(problem_statement, code_skeleton)
+            loop_check_messages = [
+                {
+                    "role": "system",
+                    "content": INFINITE_LOOP_CHECK_PROMPT
+                },
+                {
+                    "role": "user",
+                    "content": f"Generated Code:\n{code_response}\n\nAnalyze this code for potential infinite loops and provide a corrected version if any issues are found. Return ONLY the final Python code."
+                }   
+            ]
             
-            if solution:
-                logger.info("Generated initial solution successfully using multi-step reasoning")
-                return solution
-            else:
-                logger.warning("Multi-step reasoning failed, falling back to single-step approach")
-                
-                # Fallback to original single-step approach if multi-step fails
-                messages = [
-                    {
-                        "role": "system",
-                        "content": GENERATE_INITIAL_SOLUTION_PROMPT
-                    },
-                    {
-                        "role": "user",
-                        "content": f"""Problem Statement:\n{problem_statement}\n\nInitial python files:\n{code_skeleton}\n\nGenerate the complete and correct implementation in python files."""
-                    }
-                ]
-                
-                response = EnhancedNetwork.make_request(messages, model=models[0])
-                
-                # Clean up the response
-                solution = response.strip()
-                if solution.startswith('```python'):
-                    solution = solution[9:]
-                if solution.startswith('```'):
-                    solution = solution[3:]
-                if solution.endswith('```'):
-                    solution = solution[:-3]
-                solution = solution.strip()
-                
-                logger.info("Generated initial solution successfully using fallback approach")
-                return solution
+            loop_check_response = EnhancedNetwork.make_request(loop_check_messages, model=QWEN_MODEL_NAME)
+            logger.info("Step 2 - Infinite Loop Check completed")
+
+            # Clean up the final response (use loop check response as it's the final validated version)
+            solution = loop_check_response.strip()
+            if solution.startswith('```python'):
+                solution = solution[9:]
+            if solution.startswith('```'):
+                solution = solution[3:]
+            if solution.endswith('```'):
+                solution = solution[:-3]
+            solution = solution.strip()
             
+            lines = solution.split("\n")
+            if lines[0].endswith(".py") == False:
+                retry += 1
+                code_generation_messages.append({"role": "assistant", "content": code_response})
+                code_generation_messages.append({"role": "user", "content": f"Include file name in the response. example:\n```python\na.py\ncontents of a.py\n\nb.py\ncontents of b.py\n```"})
+                print(f"Retrying because the first line is not a python file name:\n {solution}")
+                continue
+
+            logger.info("Multi-step reasoning solution generation completed successfully with infinite loop validation")
+            return solution
         except Exception as e:
-            logger.error(f"Error generating initial solution: {str(e)}")
             retry += 1
+            print(f"Exception in generate_solution_with_multi_step_reasoning: {e}")
             time.sleep(2)
     
     if retry >= 10:
-        logger.error("Failed to generate initial solution")
+        logger.error("Multi-step reasoning solution generation failed")
         return ""
+    
     return ""
+
+
 
 def generate_testcases_with_multi_step_reasoning(problem_statement: str, files_to_test: str, code_skeleton: str) -> str:
     retry = 0
@@ -2099,70 +2225,6 @@ def generate_testcases_with_multi_step_reasoning(problem_statement: str, files_t
         return ""
     
     return ""
-
-def generate_solution_with_multi_step_reasoning(problem_statement: str, code_skeleton: str) -> str:
-    retry = 0
-    code_generation_messages = [
-        {
-            "role": "system",
-            "content": GENERATE_SOLUTION_WITH_MULTI_STEP_REASONING_PROMPT
-        },
-        {
-            "role": "user",
-            "content": f"Problem Statement:\n{problem_statement}\n\nInitial python files:\n{code_skeleton}\nGenerate the complete and correct implementation in python files.\n\nSTRICT REQUIREMENT: You **MUST** output the **file name** along with file content.\nexample:\n```python\na.py\ncontents of a.py\n\nb.py\ncontents of b.py\n```"
-        }
-    ]
-    while retry < 10:
-        try:
-            code_response = EnhancedNetwork.make_request(code_generation_messages, model=QWEN_MODEL_NAME)
-            logger.info("Step 1 - Code Generation completed")
-            
-            loop_check_messages = [
-                {
-                    "role": "system",
-                    "content": INFINITE_LOOP_CHECK_PROMPT
-                },
-                {
-                    "role": "user",
-                    "content": f"Generated Code:\n{code_response}\n\nAnalyze this code for potential infinite loops and provide a corrected version if any issues are found. Return ONLY the final Python code."
-                }   
-            ]
-            
-            loop_check_response = EnhancedNetwork.make_request(loop_check_messages, model=QWEN_MODEL_NAME)
-            logger.info("Step 2 - Infinite Loop Check completed")
-
-            # Clean up the final response (use loop check response as it's the final validated version)
-            solution = loop_check_response.strip()
-            if solution.startswith('```python'):
-                solution = solution[9:]
-            if solution.startswith('```'):
-                solution = solution[3:]
-            if solution.endswith('```'):
-                solution = solution[:-3]
-            solution = solution.strip()
-            
-            lines = solution.split("\n")
-            if lines[0].endswith(".py") == False:
-                retry += 1
-                code_generation_messages.append({"role": "assistant", "content": code_response})
-                code_generation_messages.append({"role": "user", "content": f"Include file name in the response. example:\n```python\na.py\ncontents of a.py\n\nb.py\ncontents of b.py\n```"})
-                print(f"Retrying because the first line is not a python file name:\n {solution}")
-                continue
-
-            logger.info("Multi-step reasoning solution generation completed successfully with infinite loop validation")
-            return solution
-        except Exception as e:
-            retry += 1
-            print(f"Exception in generate_solution_with_multi_step_reasoning: {e}")
-            time.sleep(2)
-    
-    if retry >= 10:
-        logger.error("Multi-step reasoning solution generation failed")
-        return ""
-    
-    return ""
-
-
 
 def extract_and_write_files(initial_solution: str, base_dir: str = ".") -> list:
     import os
@@ -2277,8 +2339,6 @@ def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: s
             "get_file_content",
             "save_file",
             "get_approval_for_solution",
-            "get_functions",
-            "get_classes",
             "search_in_all_files_content",
             "search_in_specified_file_v2",
             "start_over",
@@ -2602,54 +2662,3 @@ def agent_main(input_dict: Dict[str, Any], repo_dir: str = "repo"):
     os.system("git reset --hard")
 
     return result
-
-def generate_test_files(problem_statement: str, files_to_test: str, code_skeleton: str) -> str:
-    retry = 0
-    while retry < 10:
-        try:
-            logger.info("Starting test cases generation")
-            
-            testcases = generate_testcases_with_multi_step_reasoning(problem_statement, files_to_test, code_skeleton)
-            
-            if testcases:
-                logger.info("Generated testcases successfully using multi-step reasoning")
-                return testcases
-            else:
-                logger.warning("Multi-step reasoning failed, falling back to single-step approach")
-                
-                # Fallback to original single-step approach if multi-step fails
-                messages = [
-                    {
-                        "role": "system",
-                        "content": GENERATE_INITIAL_TESTCASES_PROMPT
-                    },
-                    {
-                        "role": "user",
-                        "content": f"""Problem Statement:\n{problem_statement}\n\nPython files to test:\n{files_to_test}\n\nCode skeleton: \n{code_skeleton}\n\nGenerate the ground truth and edge case coveraging testcases."""
-                    }
-                ]
-                
-                response = EnhancedNetwork.make_request(messages, model=QWEN_MODEL_NAME)
-                
-                # Clean up the response
-                testcases = response.strip()
-                if testcases.startswith('```python'):
-                    testcases = testcases[9:]
-                if testcases.startswith('```'):
-                    testcases = testcases[3:]
-                if testcases.endswith('```'):
-                    testcases = testcases[:-3]
-                testcases = testcases.strip()
-                
-                logger.info("Generated testcases successfully using fallback approach")
-                return testcases
-            
-        except Exception as e:
-            logger.error(f"Error generating initial solution: {str(e)}")
-            retry += 1
-            time.sleep(2)
-    
-    if retry >= 10:
-        logger.error("Failed to generate initial solution")
-        return ""
-    return ""

@@ -19,10 +19,10 @@ from rich.prompt import Prompt
 
 console = Console()
 DEFAULT_API_BASE_URL = "https://platform-v2.ridges.ai"
-CONFIG_FILE = "miner/.env"
+# CONFIG_FILE = "miner/.env"
 
-load_dotenv(CONFIG_FILE)
-load_dotenv(".env")
+# load_dotenv(CONFIG_FILE)
+# load_dotenv(".env")
 
 validator_tracing = False
 if os.getenv("DD_API_KEY") and os.getenv("DD_APP_KEY") and os.getenv("DD_HOSTNAME") and os.getenv("DD_SITE") and os.getenv("DD_ENV") and os.getenv("DD_SERVICE"):
