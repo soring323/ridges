@@ -10,19 +10,9 @@ from autogen_agentchat.messages import TextMessage
 from autogen_agentchat.messages import ToolCallExecutionEvent,FunctionExecutionResult,ToolCallSummaryMessage
 import requests
 from typing import Union, get_args, get_origin
-
-import urllib.request as _urlreq
 from ast import literal_eval
-import math
-import pytest
 from typing import NamedTuple
 from collections import Counter
-
-AGENT_ID="m-3.4"
-
-
-
-
 import subprocess
 import ast, sys
 from typing import Callable, Dict, List, Optional, Set, Tuple
@@ -39,15 +29,9 @@ from enum import Enum
 import json
 import csv
 import logging
-import concurrent.futures
 import threading
 from collections import defaultdict
-import shutil
-
 import logging
-
-
-
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 from autogen_core.models import UserMessage
 import json
@@ -67,22 +51,19 @@ import re
 from autogen_agentchat import EVENT_LOGGER_NAME, TRACE_LOGGER_NAME
 import asyncio
 import threading
-from queue import Queue
-
-
 from typing import List, Literal, Optional
 
-## logging setup -------------------------------------------------------->>
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
-
-# Remove any existing handlers to avoid duplicates or default ones
+GLM_MODEL_NAME = "zai-org/GLM-4.5-FP8"
+GLM_MODEL_NAME_46="zai-org/GLM-4.6-FP8"
+KIMI_MODEL_NAME = "moonshotai/Kimi-K2-Instruct"
+DEEPSEEK_MODEL_NAME = "deepseek-ai/DeepSeek-V3-0324"
+QWEN_MODEL_NAME = "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"
+AGENT_MODELS=[GLM_MODEL_NAME,QWEN_MODEL_NAME,KIMI_MODEL_NAME,DEEPSEEK_MODEL_NAME]
 for h in list(logger.handlers):
     logger.removeHandler(h)
-
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(lineno)d - %(message)s')
-
-# Stream handler (stdout)
 stream_handler = logging.StreamHandler(sys.stdout)
 stream_handler.setLevel(logging.DEBUG)
 stream_handler.setFormatter(formatter)
@@ -96,36 +77,19 @@ file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 sys.stdout = open("agent_flow.log", "w", encoding="utf-8")
 
-
-#-------------------------------------------------------------------------------------->>
-
-## all global variables here -------------------------------------------------------->>
-DEFAULT_PROXY_URL = os.getenv("SANDBOX_PROXY_URL", "http://localhost:8000")
+DEFAULT_PROXY_URL = os.getenv("SANDBOX_PROXY_URL", "http://sandbox_proxy")
 DEFAULT_TIMEOUT = int(os.getenv("AGENT_TIMEOUT", "2200"))
 MAX_TEST_PATCH_TIMEOUT = int(os.getenv("MAX_STEPS_TEST_PATCH_FIND", "400"))
 
-GLM_MODEL_NAME = "zai-org/GLM-4.5-FP8"
-GLM_MODEL_NAME_46="zai-org/GLM-4.6-FP8"
-KIMI_MODEL_NAME = "moonshotai/Kimi-K2-Instruct"
-DEEPSEEK_MODEL_NAME = "deepseek-ai/DeepSeek-V3-0324"
-QWEN_MODEL_NAME = "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"
-#QWEN_MODEL_NAME=GLM_MODEL_NAME
-AGENT_MODELS=[GLM_MODEL_NAME,QWEN_MODEL_NAME,KIMI_MODEL_NAME,DEEPSEEK_MODEL_NAME]
 RUN_ID="nocache-1"
 JSON_LLM_USED=0
 JSON_LITERAL_USED=0
 DEBUG_MODE=True
 MARKDOWN_FAILED=0
 TOOL_CALL_FAILED=0
-MAX_EMBED_TOKENS=128000
-MAX_EMBED_CHARS=MAX_EMBED_TOKENS*4
 IS_SOLUTION_APPROVED=False
 DISABLE_TEST_FILE_REMOVAL=False
 TOO_MANY_SECTIONS_FOUND=0
-
-#--------------------------------------------------------->>
-
-
 
 def agent_main(input_dict: Dict[str, Any], repo_dir: str = "repo", test_mode: bool = False):
     """Legacy interface wrapper for backwards compatibility."""
@@ -171,18 +135,11 @@ def agent_main(input_dict: Dict[str, Any], repo_dir: str = "repo", test_mode: bo
             logger.error(f"Error: {e}")
             result=FixTaskEnhancedToolManager.get_final_git_patch()
             
-        
-
     if not DISABLE_TEST_FILE_REMOVAL:
         os.system("git reset --hard")
     logger.info("patch returned: {}".format(result))
-    logger.info("JSON_LLM_USED: {}".format(JSON_LLM_USED))
-    logger.info("JSON_LITERAL_USED: {}".format(JSON_LITERAL_USED))
-    logger.info("MARKDOWN_FAILED: {}".format(MARKDOWN_FAILED))
-    logger.info("TOO_MANY_SECTIONS_FOUND: {}".format(TOO_MANY_SECTIONS_FOUND))
+
     return result
-    
- 
 
 class CreateProblemSolver:
     
@@ -197,13 +154,11 @@ class CreateProblemSolver:
     - **Comprehensive Testing:** Think about all the edge cases. Ensure the solution handles all of them. Run comprehensive test to ensure solution fully satisfies all the requirements.
     - **Finish:** Call finish once the solution fully satisfies all the requirements.
 
-
     Tool Usage:-
     - Use run_code to create and run unittests.
     - Use apply_code_edit to fix the solution if it fails.
     - Use apply_code_edit to fix the test case if they are not as per the problem statement.
     - Use finish to finish the task.
-    
     
     Rules:-
     1. Test code must always import functionality from the repository—never duplicate or reimplement the code within the test itself.
@@ -246,7 +201,6 @@ class CreateProblemSolver:
     )
     
     INSTANCE_PROMPT=textwrap.dedent("""Problem Statement:\n{problem_statement}\n\nInitial python files:\n{code_skeleton}\n\nGenerate the complete and correct implementation in python files.""")
-    
     RESPONSE_FORMAT="""Return only the final python files code.
 
     Response Examples:
@@ -262,7 +216,6 @@ class CreateProblemSolver:
     Response Examples:
     [{"file_name":"a.py","code":"contents of a.py"},{"file_name":"b.py","content":"contents of b.py"}]
     """
-    
     RESPONSE_FORMAT_SOLUTION_EVAL="""
     Your response must not contain multiple THOUGHT or TOOL_CALL sections. You must respond in the following format. You must not add anything before THOUGHT section.
     ======THOUGHT
@@ -276,7 +229,6 @@ class CreateProblemSolver:
     ======TOOL_CALL
     {"name":"<tool_name>","arguments":{...}}
     """
-    
     TEST_CASE_GENERATOR_SYSTEM_PROMPT=textwrap.dedent("""You are an expert Python unittest testcase developer. 
     Important points:-
     - you have generation limit of 2048 tokens. Hence you must stop generating more test cases when you are near the limit.
@@ -303,8 +255,8 @@ class CreateProblemSolver:
         unittest.main()
     """)
     
+
     TEST_CASES_GEN_INSTANCE_PROMPT=textwrap.dedent("""Problem Statement:\n{problem_statement}\n\nCode skeleton: \n{code_skeleton}\n\nGenerate the complete and correct testcases.""")
-    
     TESTCASES_CHECK_PROMPT = textwrap.dedent(
     """
     You are an expert testcases reviewer specializing in invalid testcases detection and prevention. Your task is to analyze the generated test code if it's all valid for the problem statement.
@@ -312,7 +264,6 @@ class CreateProblemSolver:
     1. Read the problem statement carefully and note down all the requirements/edge cases/worflows/mathmatical formulas/data/etc.
     2. Derive expected output for each test case one by one. You must include working, reflection, reflection2, reflection3 and final expected output in your response for each test case.
     3. Reply with 'DONE' once you have verfied all the test cases.
-    
     
     For Example:
     Generated Test Case Code:
@@ -392,7 +343,6 @@ class CreateProblemSolver:
         resp=None
         next_tool_name=None
         global TOOL_CALL_FAILED
-        #logger.info(f"response: {response}")
         if response is None:
             logger.error("response NONE received..")
             return None
@@ -407,7 +357,6 @@ class CreateProblemSolver:
             elif json_obj:
                 try:
                     json_obj=json.loads(json_obj)
-                    #logger.info("calling tool: "+json_obj.get("name")+" with arguments: "+json.dumps(json_obj.get("arguments")))
                     resp=self.tool_map[json_obj.get("name")](**json_obj.get("arguments"))
                 except Exception as e:
                     TOOL_CALL_FAILED+=1
@@ -438,12 +387,10 @@ class CreateProblemSolver:
                         class_name = current_parent.name
                         break
                     current_parent = parent_map.get(current_parent)
-                #logger.info(f"node: {node}, name: {node.name}, type: {type(node)}, class: {class_name}")
                 body = list(node.body)
                 # drop leading docstring
                 if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant) and isinstance(body[0].value.value, str):
                     body = body[1:]
-                #logger.info(f"body: {body}, type: {type(body)}, len: {len(body)},type of body[0]: {type(body[0])}")
                 
                 if not body or (len(body) == 1 and isinstance(body[0], ast.Pass)):
                     return False, f"function {node.name} has empty body"
@@ -470,8 +417,6 @@ class CreateProblemSolver:
         
         self.tool_map={tool.__name__:tool for tool in self.tools}
         self.agent_initial_solution_eval=CustomAssistantAgent(system_message=CreateProblemSolver.SYSTEM_PROMPT_INITIAL_SOLUTION_EVAL.format(tools_docs=CustomAssistantAgent.Utils.get_tool_docs(self.tools),format_prompt=self.RESPONSE_FORMAT_SOLUTION_EVAL_2),model_name=QWEN_MODEL_NAME)
-        
-    
     
     def get_code_skeleton(self) -> str:
         # Initialize the result string
@@ -561,7 +506,6 @@ class CreateProblemSolver:
         
         pass
     
-    
     def extract_and_write_files(self,initial_solution: str, base_dir: str = ".") -> list:
         import os
         
@@ -624,17 +568,6 @@ class CreateProblemSolver:
         
         return created_files
     
-    
-    def remove_duplicate_solutions(self,results:list[str])->list[str]:
-        req_unq=[]
-        key_unq=[]
-        for r in results:
-            # tries to remove all comments and empty lines and spaces
-            if re.sub("#[^\n]*\n","\n",r).replace("\n","").replace(" ","") not in key_unq:
-                key_unq.append(re.sub("#[^\n]*\n","\n",r).replace("\n","").replace(" ",""))
-                req_unq.append(r)
-        return req_unq
-    
     async def generate_initial_solution(self):
         logger.info("Generating initial solution")
         agent=CustomAssistantAgent(system_message=self.SYSTEM_PROMPT.format(),model_name=QWEN_MODEL_NAME)
@@ -651,8 +584,6 @@ class CreateProblemSolver:
         return initial_solution
     
     async def generate_test_cases(self):
-        #generate test cases.
-       
         agent=CustomAssistantAgent(system_message=self.TEST_CASE_GENERATOR_SYSTEM_PROMPT.format(),model_name=QWEN_MODEL_NAME)
         response=await agent.solve_task(self.TEST_CASES_GEN_INSTANCE_PROMPT.format(problem_statement=self.problem_statement,code_skeleton=self.code_skeleton),response_format="",is_json=False,regex=None,post_process_func=self.ResponseValidator.check_syntax_error,max_attempts=10,is_parallel=False,disable_reset=False,return_type=str)
         
@@ -660,26 +591,7 @@ class CreateProblemSolver:
             logger.info("Failed to generate test cases")
             return None
         logger.info(response)
-        if False:
-            logger.info("Now verifying the test cases...")
-            agent=CustomAssistantAgent(system_message=self.TESTCASES_CHECK_PROMPT.format(),model_name=QWEN_MODEL_NAME)
-            no_steps=10
-            response=await agent.solve_task(self.INSTANCE_TESTCASES_CHECK_PROMPT.format(problem_statement=self.problem_statement,code_skeleton=self.code_skeleton,testcode_response=response),response_format="",is_json=False,regex=None,post_process_func=None,max_attempts=3,is_parallel=False,disable_reset=True,return_type=str)
-            no_of_rechecks=1
-            while True:
-                while "DONE" not in response:
-                    response=await agent.solve_task("continue for other test cases",response_format="",is_json=False,regex=None,post_process_func=None,max_attempts=3,is_parallel=False,disable_reset=True,return_type=str)
-                no_of_rechecks+=1
-                if no_of_rechecks<=1:
-                    response=await agent.solve_task(f"recheck all your test cases once again.. This is your attempt %{no_of_rechecks}th attempt",response_format="",is_json=False,regex=None,post_process_func=None,max_attempts=3,is_parallel=False,disable_reset=True,return_type=str)
-                else:
-                    break
-            response=await agent.solve_task(self.FINAL_OUTPUT_TEST_CHECK,response_format="",is_json=False,regex=None,post_process_func=None,max_attempts=3,is_parallel=False,disable_reset=True,return_type=str)
-        
-            if response is None or self.ResponseValidator.check_syntax_error(response,None)!="success":
-                logger.info("Failed to verify test cases")
-                return None
-    
+ 
         all_test_cases=[]
         for line in response.split("\n"):
             if "def test_" in line.strip() and "(" in line.strip():
@@ -754,9 +666,7 @@ class CreateProblemSolver:
         except Exception as e:
             logger.error(f"Error generating git patch: {e}")
             return f"Error generating git patch: {e}"
-
 class BugFixSolver:
-    
     FIX_TASK_SYSTEM_PROMPT = textwrap.dedent("""
     # Hey there! You're a Coding Assistant 🚀. I have uploaded all files of a python repository. Your current working directory is at the root of that repo. You will be provided with a problem statement and you need to make the necessary changes to fix the issue.
 
@@ -808,28 +718,7 @@ class BugFixSolver:
     # Now let's start. Here is the problem statement:
     {problem_statement}
     """)
-    
-    ONESHOT_SYSTEM_PROMPT = """
-    You are an autonomous programmer. The user will provide a bug report or 
-    feature request (the "problem") plus a compact summary of the most 
-    relevant repository files.  Your job is to return ONE *valid* unified 
-    diff patch that fixes the problem. If you have any questions, do not ask the user. 
-    Instead, solve it to the best of your ability with the knowledge you have.
-
-    You will be provided with a summary of the repository files that are most relevant to the problem.
-    Your patch must be valid and apply cleanly when run from the repository root.
-
-    STRICT FORMAT RULES
-    1. Return *only* the diff – no prose, no Markdown back-ticks.
-    2. The diff must start with 'diff --git a/<path> b/<path>' followed by 
-    the standard "--- a/<path>" and "+++ b/<path>" headers.
-    3. Use -u style context hunks that begin with lines like @@ -N,M +N,M @@.
-    4. Every changed file needs its own header block as in rule 2.
-    5. End the patch with a trailing newline.
-
-    Be exact: if the diff is syntactically malformed or wrapped in extra 
-    text the automated patch tool will fail.
-    """
+ 
     TIMEOUT=900
     MAX_FIX_TASK_STEPS=300
     
@@ -857,25 +746,19 @@ class BugFixSolver:
                     return "Patch failed to apply. Please reply with a corrected unified diff only."
             return "Invalid response format"
         
-            
-        
-            
-    
     def __init__(self,problem_statement:str,top_k:int=30):
         self.problem_statement=problem_statement
         self.top_k=top_k
-        self.tools=[FixTaskEnhancedToolManager.get_file_content,FixTaskEnhancedToolManager.save_file,FixTaskEnhancedToolManager.get_approval_for_solution,FixTaskEnhancedToolManager.get_functions,FixTaskEnhancedToolManager.get_classes,FixTaskEnhancedToolManager.search_in_all_files_content,
+        self.tools=[FixTaskEnhancedToolManager.get_file_content,FixTaskEnhancedToolManager.save_file,FixTaskEnhancedToolManager.get_approval_for_solution,FixTaskEnhancedToolManager.search_in_all_files_content,
                FixTaskEnhancedToolManager.search_in_specified_file_v2,FixTaskEnhancedToolManager.start_over,FixTaskEnhancedToolManager.run_code,FixTaskEnhancedToolManager.apply_code_edit,FixTaskEnhancedToolManager.generate_test_function,FixTaskEnhancedToolManager.finish]
         self.tool_map={tool.__name__:tool for tool in self.tools}
         
         self.agent=CustomAssistantAgent(system_message=self.FIX_TASK_SYSTEM_PROMPT.format(tools_docs=CustomAssistantAgent.Utils.get_tool_docs(self.tools),format_prompt=self.RESPONSE_FORMAT),model_name=GLM_MODEL_NAME)
-        #logger.info("system message: "+self.agent.system_message)
     
     def process_response(self,response):
         resp=None
         next_tool_name=None
         global TOOL_CALL_FAILED
-        #logger.info(f"response: {response}")
         if response is None:
             logger.error("response NONE received..")
             return None
@@ -890,7 +773,6 @@ class BugFixSolver:
             elif json_obj:
                 try:
                     json_obj=json.loads(json_obj)
-                    #logger.info("calling tool: "+json_obj.get("name")+" with arguments: "+json.dumps(json_obj.get("arguments")))
                     resp=self.tool_map[json_obj.get("name")](**json_obj.get("arguments"))
                 except Exception as e:
                     TOOL_CALL_FAILED+=1
@@ -908,7 +790,6 @@ class BugFixSolver:
             files_to_test_for_p2p=[]
         return files_to_test_for_p2p
     async def solve_problem(self):
-        
         
         logger.info(f"Starting main agent execution...")
         
@@ -970,245 +851,7 @@ class BugFixSolver:
         
         logger.info(f"Final patch: {final_patch}")
         return final_patch
-    async def solve_problem_one_go(self):
-        code_chunks = self._collect_code_chunks()
-        chunk_texts=[c.text for c in code_chunks]
-        PRE_FILTER_TOP = int(os.getenv("PREFILTER_TOP", "50"))  # Reduced from 200 for faster processing
-
-        if len(chunk_texts) > PRE_FILTER_TOP:
-            # Simple TF-IDF scoring
-            problem_words = set(self.problem_statement.lower().split())
-            chunk_scores = []
-            
-            for chunk_text in chunk_texts:
-                chunk_words = set(chunk_text.lower().split())
-                common_words = problem_words.intersection(chunk_words)
-                score = len(common_words) / max(len(problem_words), 1)
-                chunk_scores.append(score)
-            
-            # Keep top chunks by TF-IDF score
-            sorted_indices = sorted(range(len(chunk_scores)), key=lambda i: -chunk_scores[i])
-            top_indices = sorted_indices[:PRE_FILTER_TOP]
-            
-            code_chunks = [code_chunks[i] for i in top_indices]
-            chunk_texts = [chunk_texts[i] for i in top_indices]
-
-            # --------------------------------------------------------------------
-            # Embed problem text and all chunks ----------------------------------
-            # --------------------------------------------------------------------
-
-            query_vec = Network._remote_embed(self.problem_statement)
-            chunk_vecs: List[List[float]] = [None] * len(chunk_texts)  # type: ignore
-
-            MAX_WORKERS = min(8, int(os.getenv("EMBED_CONCURRENCY", "8")))  # Increased concurrency
-
-            print(f"[Agent] Embedding {len(chunk_texts)} chunks with {MAX_WORKERS} workers")
-            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-                fut_to_idx = {pool.submit(Network.safe_remote_embed, txt): idx for idx, txt in enumerate(chunk_texts)}
-
-                for fut in concurrent.futures.as_completed(fut_to_idx):
-                    idx = fut_to_idx[fut]
-                    try:
-                        chunk_vecs[idx] = fut.result()
-                    except Exception as exc:
-                        # Log and keep zero vector; retrieval will simply rank it low.
-                        print(f"[agent] embedding error (chunk {idx}): {exc}")
-                        chunk_vecs[idx] = Network.ZERO_VEC
-
-            sims = [ self.Utils._cosine(vec, query_vec) for vec in chunk_vecs ]
-
-            # --------------------------------------------------------------------
-            # Light path-based bonus if filename is mentioned in the problem text --
-            # --------------------------------------------------------------------
-            prob_lower = self.problem_statement.lower()
-            for idx, ch in enumerate(code_chunks):
-                base = os.path.basename(ch.file).lower()
-                if base in prob_lower or base.split(".")[0] in prob_lower:
-                    sims[idx] += 0.2
-
-            sorted_idx = sorted(range(len(sims)), key=lambda i: -sims[i])
-            logger.info(f"[Agent] Sorted indices: {sorted_idx}")
-            TARGET_TOKENS = 6_000  # Reduced from 12_000 for faster processing
-            token_budget = int(TARGET_TOKENS * 0.85)
-            token_total = 0
-            top_idx: list[int] = []
-            for idx in sorted_idx:
-                tok = self.Utils._guess_tokens(chunk_texts[idx])
-                logger.info(f"[Agent] Token: {tok}")
-                if token_total + tok > token_budget:
-                    break
-                token_total += tok
-                top_idx.append(idx)
-
-            # Fallback to at most top_k if budget yields too many
-            if len(top_idx) > self.top_k:
-                top_idx = top_idx[:self.top_k]
-            logger.info(f"[Agent] Top indices: {top_idx}")
-            summary_parts: list[str] = []
-            for idx in top_idx:
-                ch = code_chunks[idx]
-                body = ch.text[:5000]
-                tag = self.Utils._lang_tag(ch.file)
-                header = f"### {ch.file}:L{ch.start_line}-{ch.end_line}"
-                summary_parts.append(f"{header}\n```{tag}\n{body}\n```")
-
-            repo_summary = "\n\n".join(summary_parts)
-
-            # --------------------------------------------------------------------
-            # Build initial conversation messages.
-            # --------------------------------------------------------------------
-
-            print(f"[Agent] Repository summary: {len(repo_summary)} chars, {len(top_idx)} chunks, {token_total} tokens")
-            print(f"[Agent] repo_summary:\n{repo_summary}")
-
-            #"""OUTPUT RULES (VERY IMPORTANT, STRICT)
-            #• You MUST end your reply with a *raw* JSON object with "code_response" property – nothing else.
-            #• Must hold the unified diff from rules 1-5 *verbatim*.
-            #Example: {"code_response": "diff --git a/foo.py b/foo.py\n..."}"""
-            #You must directly return the diff in the code_response section.
-            #                                        Must hold the unified diff from rules 1-5 *verbatim*.
-            #                                        Strictly follow the response format given below.
-            #                                       Do not add any other text before or after the CODE_RESPONSE section.
-            #                                        OUTPUT:
-            #                                        ========CODE_RESPONSE
-            #                                        diff --git a/foo.py b/foo.py
-            #                                        ...
-            proxy_resp = await self.agent.solve_task(self.problem_statement+"\n\n"+"Repository summary (top files):\n\n"+repo_summary, response_format="""OUTPUT RULES (VERY IMPORTANT, STRICT)
-            • You MUST end your reply with a *raw* JSON object with "thought" and "code_response" property – nothing else.
-            • Must hold the unified diff from rules 1-5 *verbatim*.
-            • Do not include any other text other than the JSON object.
-            Example: {"thought":"your thought process","code_response": "diff --git a/foo.py b/foo.py\n..."}""", is_json=True, regex=None, post_process_func=self.ResponseValidator._check_syntax_and_format, max_attempts=3, is_parallel=False, disable_reset=False)
-
-            logger.info(f"[agent] Proxy response received: {proxy_resp}")
-            code_resp = proxy_resp.get("code_response",None)
-            if not code_resp:
-                return None
-            
-            patch_text = self.Utils._sanitize_patch(code_resp)
-            logger.info(f"[agent] Sanitized patch : {patch_text}")
-
-            result = self.Utils._apply_patch(patch_text)
-            return patch_text
-
-    def _collect_code_chunks(self,root: str = ".") -> List[Chunk]:
-        """Collect function-level code chunks from Python files."""
-        chunks: List[Chunk] = []
-        
-        for root, _, files in os.walk(root):
-            # Skip hidden directories and common non-source dirs
-            if any(part.startswith('.') for part in Path(root).parts):
-                continue
-            if root.endswith(('__pycache__', 'node_modules', '.git')):
-                continue
-                
-            for file in files:
-                if not file.endswith('.py'):
-                    continue
-                    
-                file_path = os.path.join(root, file)
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                except (UnicodeDecodeError, PermissionError):
-                    continue
-                    
-                try:
-                    tree = ast.parse(content, filename=file_path)
-                except SyntaxError:
-                    continue
-                    
-                for node in ast.walk(tree):
-                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                        start_line = getattr(node, 'lineno', 1)
-                        end_line = getattr(node, 'end_lineno', start_line)
-                        
-                        if end_line is None:
-                            # Fallback: count lines in the node
-                            lines = content.split('\n')
-                            if start_line <= len(lines):
-                                node_text = '\n'.join(lines[start_line-1:])
-                                end_line = start_line + node_text.count('\n')
-                            else:
-                                end_line = start_line
-                        
-                        # Extract the actual source lines
-                        lines = content.split('\n')
-                        if start_line <= len(lines) and end_line <= len(lines):
-                            chunk_text = '\n'.join(lines[start_line-1:end_line])
-                            
-                            # Skip if chunk is too large
-                            if len(chunk_text) > MAX_EMBED_CHARS:
-                                continue
-                                
-                            chunks.append(Chunk(
-                                file=file_path,
-                                start_line=start_line,
-                                end_line=end_line,
-                                text=chunk_text
-                            ))
-                            
-                # Also add the entire file as a chunk if it's reasonably sized
-                if len(content) <= MAX_EMBED_CHARS and content.strip():
-                    chunks.append(Chunk(
-                        file=file_path,
-                        start_line=1,
-                        end_line=content.count('\n') + 1,
-                        text=content
-                    ))
-        
-        return chunks
-    
     class Utils:
-        @classmethod
-        def _lang_tag(cls,path: str) -> str:
-            """Return language tag for syntax highlighting."""
-            ext = os.path.splitext(path)[1].lower()
-            lang_map = {
-                '.py': 'python',
-                '.js': 'javascript',
-                '.ts': 'typescript',
-                '.java': 'java',
-                '.cpp': 'cpp',
-                '.c': 'c',
-                '.h': 'c',
-                '.hpp': 'cpp',
-                '.cs': 'csharp',
-                '.go': 'go',
-                '.rs': 'rust',
-                '.php': 'php',
-                '.rb': 'ruby',
-                '.swift': 'swift',
-                '.kt': 'kotlin',
-                '.scala': 'scala',
-                '.r': 'r',
-                '.m': 'matlab',
-                '.sh': 'bash',
-                '.sql': 'sql',
-                '.html': 'html',
-                '.css': 'css',
-                '.xml': 'xml',
-                '.yaml': 'yaml',
-                '.yml': 'yaml',
-                '.json': 'json',
-                '.md': 'markdown',
-                '.txt': 'text',
-            }
-            return lang_map.get(ext, 'text')
-        def _cosine(u: List[float], v: List[float]) -> float:
-            """Compute cosine similarity between two vectors."""
-            nu = math.sqrt(sum(x * x for x in u))
-            nv = math.sqrt(sum(x * x for x in v))
-
-            if nu == 0 or nv == 0:
-                return 0.0
-
-            return sum(x * y for x, y in zip(u, v)) / (nu * nv)
-        
-        def _guess_tokens(text: str) -> int:
-            """Rough token count estimate: ~0.75 tokens per word."""
-            return int(len(text.split()) * 0.75)
-        
-        
         def _sanitize_patch(patch: str) -> str:
             """Return *patch* stripped of markdown/code-fence chatter.
 
@@ -1248,11 +891,7 @@ class BugFixSolver:
                 if line.startswith(("+", "-", " ")):
                     cleaned_lines.append(line)
                     continue
-                # Ignore everything else (markdown, commentary, empty lines outside hunks).
 
-            # Post-process header lines: ensure 'a/' and 'b/' prefixes so a default
-            # `patch -p1` invocation resolves correctly when run from the repository
-            # root.  We intentionally *do not* touch paths pointing to /dev/null.
             for idx, ln in enumerate(cleaned_lines):
                 if ln.startswith("--- ") and not ln.startswith("--- a/") and not ln.startswith("--- /dev/null"):
                     cleaned_lines[idx] = "--- a/" + ln[4:]
@@ -1260,7 +899,6 @@ class BugFixSolver:
                     cleaned_lines[idx] = "+++ b/" + ln[4:]
 
             return "\n".join(cleaned_lines) + "\n"
-        
         
         def _dry_run_patch(patch: str) -> tuple[bool, str]:
             """Validate patch without applying it."""
@@ -1332,22 +970,10 @@ class BugFixSolver:
                 except:
                     pass
     
-
-
 class ProblemTypeClassifierAgent:
     
     PROBLEM_TYPE_CREATE="CREATE"
     PROBLEM_TYPE_FIX="FIX"
-    
-    
-    SYSTEM_PROMPT='''
-    You are the problem type checker that will categories problem type into:
-
-    1. CREATE: If the problem statement is about creating a new functionality from scratch.
-    2. FIX: If the problem statement is about fixing a bug, creating a new functionality or improving the existing codebase.
-
-    Only respond with the "FIX" or "CREATE".
-    '''
     
     @classmethod
     def get_directory_tree(cls,start_path: str = '.') -> str:
@@ -1435,7 +1061,6 @@ class ProblemTypeClassifierAgent:
             response=await agent.solve_task("Invalid response, please respond problem_type with the 'FIX' or 'CREATE'.",response_format="=======THOUGHT\n<<your thought>>\n=======PROBLEM_TYPE\n<<problem type>>",is_json=False,regex=None,post_process_func=None,max_attempts=10,is_parallel=False,disable_reset=True,return_type=Union[tuple[str,str],str])
             logger.info("classifier response: {}".format(response))
 
-
 class CustomAssistantAgent(AssistantAgent):
     
     class ResponseValidator:
@@ -1513,7 +1138,6 @@ class CustomAssistantAgent(AssistantAgent):
         self.agent_name=agent_name
         self.model_name=model_name
         self.system_message=system_message
-        #self.register_hook("process_all_messages_before_reply",CustomAssistantAgent.Utils.drop_last_assistant)
         self.model_client = CustomOpenAIModelClient(model_name=self.model_name, api_key="", base_url=DEFAULT_PROXY_URL,agent_prefix="test_generator")
         if not tools:
             self.agent:AssistantAgent=AssistantAgent(
@@ -1603,7 +1227,6 @@ class CustomAssistantAgent(AssistantAgent):
             MARKDOWN_FAILED+=1
             raise ValueError(f"Invalid return type: {return_type}")
                     
-        
     async def solve_task(self,task:str,response_format:str,is_json:bool,regex:str,post_process_func:Callable=None,max_attempts:int=3,is_parallel:bool=False,disable_reset:bool=False,return_type=None):
         # write code here to make the request to assistant agent , fetch response, check the response format matches with regex shared. If not it must through an error and ask to regenerate. It must then convert the reponse to json if is_json is True else return. Also, if there is any error in parsing json it must send an error to LLM and ask to regerate. The LLM must have less than 3 attempts to generate the response successfully.
         
@@ -1637,11 +1260,9 @@ class CustomAssistantAgent(AssistantAgent):
                     result: TaskResult=await Console(agent.run_stream(task=full_task))
                 except Exception as e:
                     logger.info(f"Agent call failed: {type(e)}:{e}, sleeping for 2 seconds before retrying..")
-                    logger.exception("Exception in agent call:")
                     time.sleep(2)
                     continue
                 
-                # Find the last non-summary message
                 last_message = None
                 try:
                     for m in result.messages[::-1]:
@@ -1666,7 +1287,6 @@ class CustomAssistantAgent(AssistantAgent):
                     logger.info(f"assistant attempt {attempts} error: {error}")
                     continue
                     
-                    
                 if CustomOpenAIModelClient.Utils.is_empty_response(candidate_text) or CustomOpenAIModelClient.Utils.is_network_error(candidate_text):
                     full_task="network error. please try again."
                     continue
@@ -1675,11 +1295,6 @@ class CustomAssistantAgent(AssistantAgent):
                     full_task=f"Response did not match the required response format. You need to respond with this format: {response_format}"
                     logger.info(f"assistant attempt {attempts} failed regex. Text: {candidate_text[:2000]}")
                     continue
-                
-                #if "Error: " in candidate_text:
-                #    full_task=candidate_text
-                #    logger.info(f"assistant attempt {attempts} error: {candidate_text}")
-                #    continue
                 
                 if not is_json:
                     cleaned=self.model_client.Utils._strip_code_fences(candidate_text)
@@ -1737,9 +1352,6 @@ class CustomAssistantAgent(AssistantAgent):
             
             return None
 
-
-
-
 class CustomOpenAIModelClient(OpenAIChatCompletionClient):
     class Utils:
         
@@ -1748,7 +1360,6 @@ class CustomOpenAIModelClient(OpenAIChatCompletionClient):
         def parse_response(raw_text:str):
             global JSON_LLM_USED,JSON_LITERAL_USED
             raw_text2=raw_text
-            #logger.info("raw_text:{}".format(raw_text))
             raw_text=CustomOpenAIModelClient.Utils._strip_code_fences(raw_text)
             try:
                 if CustomOpenAIModelClient.Utils.is_json_string(raw_text):
@@ -1789,7 +1400,6 @@ class CustomOpenAIModelClient(OpenAIChatCompletionClient):
                         
                         tool_calls=raw_text.get("tool_calls")
                         try:
-                            #logger.info("found tool calls")
                             tool_calls=[{"id":stable_tool_call_id(call.get("name"),call.get("arguments")),"type":"function","function":{"name":call.get("name"),"arguments":json.dumps(call.get("arguments") if isinstance(call.get("arguments"), (dict, list)) else {"input":call.get("arguments")})}} for call in tool_calls]
                             content_text=""
                         except Exception as e:
@@ -1804,8 +1414,6 @@ class CustomOpenAIModelClient(OpenAIChatCompletionClient):
                         content_text=json.dumps(raw_text)
                     
                 else:
-                    #logger.info("json but not a tool call")
-                    #logger.info("json but not a tool call, json load succeeded")
                     content_text=json.dumps(raw_text)
             else:
                 if (raw_text[0]=="\"" or raw_text[0]=="'") and (raw_text[-1]=="\"" or raw_text[-1]=="'"):
@@ -1824,8 +1432,6 @@ class CustomOpenAIModelClient(OpenAIChatCompletionClient):
 
         def is_network_error(response:str)->bool:
             return  "<|reserved_token_" in response or "API request failed with status 429" in response or "Read timed out" in response or "Network unreachable" in response or "Connection refused" in response
-        
-        
 
         def _strip_code_fences(text: str) -> str:
             if re.search("^=+\s*[A-Z_]+$",text,re.MULTILINE): # ignore if its a markdown text #^=+\s*[A-Z_]+$
@@ -1880,15 +1486,11 @@ class CustomOpenAIModelClient(OpenAIChatCompletionClient):
         self._client._client._event_hooks['request'] = [self.request_modify]
         self._client._client._event_hooks['response'] = [self.response_modify]
     
-    
-    
-    
     async def request_modify(self,request):
         
         self.parsing_error=None
 
         await request.aread()
-
         
         try:
             raw = request.content.decode('utf-8') if request.content else '{}'
@@ -1914,7 +1516,7 @@ class CustomOpenAIModelClient(OpenAIChatCompletionClient):
             "messages": messages,
             "run_id": RUN_ID, 
             "temperature": 0.0,
-            "agent_id": self.agent_prefix+":"+AGENT_ID
+            "agent_id": self.agent_prefix
         }
         new_bytes = json.dumps(new_body).encode('utf-8')
  
@@ -2036,9 +1638,6 @@ def ensure_git_initialized():
     finally:
         os.chdir(original_cwd)
 
-
-
-
 class Chunk(NamedTuple):
     file: str
     start_line: int
@@ -2046,8 +1645,6 @@ class Chunk(NamedTuple):
     text: str
 
 class Network:
-    _EMBED_CACHE: Dict[str, List[float]] = {}
-    ZERO_VEC: List[float] = [0.0] * 1024  # embedding for empty input
     class ErrorType(Enum):
         EMPTY_RESPONSE=1
         RESERVED_TOKEN_PRESENT=2
@@ -2106,8 +1703,6 @@ class Network:
                 return None
             return cls.fix_json_string_with_llm(json_string,attempt)
             
-            
-            
     @classmethod
     def make_request(cls,messages:list,attempt:int=0)->str:
         url = f"{DEFAULT_PROXY_URL.rstrip('/')}/api/inference"
@@ -2117,7 +1712,6 @@ class Network:
                 "run_id": RUN_ID,
                 "messages": messages,
                 "temperature": 0.0,
-                "agent_id": AGENT_ID
             }
 
         headers = {
@@ -2229,10 +1823,6 @@ class Network:
             result_json[arguments[i]]=value
         return result_json
     
-    
-    
-
-    
     @classmethod
     def inference(cls, messages: List[Dict[str, Any]], run_id: str = "1",return_json:bool=False) -> dict:
         """Prod inference with caching"""
@@ -2311,70 +1901,6 @@ class Network:
 
         return next_thought, next_tool_name, next_tool_args,error_msg
     
-    @classmethod
-    def _remote_embed(cls,text: str) -> List[float]:
-        """Return embedding vector for *text* via the proxy /api/embedding endpoint.
-
-        Caches results in-memory to avoid duplicate HTTP calls.
-        """
-        print(f"[Agent] Embedding request: {len(text)} chars")
-        # Short-circuit empty or whitespace-only inputs.
-        if not text.strip():
-            return cls._EMBED_CACHE.setdefault("", [0.0] * 1024)
-
-        # Retry–shrink loop to satisfy 512-token limit
-        attempt_text = text
-        for _ in range(2):  # original + 1 retry after halving
-            tokens = attempt_text.split()
-            if len(tokens) > MAX_EMBED_TOKENS:
-                attempt_text = " ".join(tokens[:MAX_EMBED_TOKENS])
-
-            url = f"{DEFAULT_PROXY_URL.rstrip('/')}/api/embedding"
-            req = _urlreq.Request(
-                url,
-                data=json.dumps({"input": attempt_text, "run_id": RUN_ID}, ensure_ascii=False).encode(),
-                method="POST",
-                headers={"Content-Type": "application/json"},
-            )
-
-            try:
-                with _urlreq.urlopen(req, timeout=60) as resp:  # Reduced timeout from 300 to 60
-                    data_raw = resp.read()
-                    data = json.loads(data_raw.decode())
-                    print(f"[Agent] Embedding response: {len(data)} bytes")
-
-                    if isinstance(data, list):
-                        vec = data[0] if (len(data) == 1 and isinstance(data[0], list)) else data
-                        cls._EMBED_CACHE[text] = vec
-                        return vec
-                    if isinstance(data, dict) and "embedding" in data:
-                        vec = data["embedding"]
-                        cls._EMBED_CACHE[text] = vec
-                        return vec
-
-                    # If we received a validation error about tokens, halve and retry
-                    if isinstance(data, dict) and data.get("error_type") == "Validation":
-                        attempt_text = " ".join(tokens[: len(tokens) // 2])
-                        continue
-
-                    return cls.ZERO_VEC
-            except Exception as e:
-                print(f"[Agent] Embedding error: {e}")
-                return cls.ZERO_VEC
-
-        return cls.ZERO_VEC
-    
-    @classmethod
-    def safe_remote_embed(cls,text, max_retries=3):  # Reduced retries from 5 to 3
-        for attempt in range(max_retries):
-            try:
-                return cls._remote_embed(text)
-            except Exception as e:
-                sleep_time = 2  # Reduced sleep time from 10 to 2 seconds
-                print(f"Rate limited, retrying in {sleep_time:.1f}s...")
-                time.sleep(sleep_time)
-        return cls.ZERO_VEC
-
 
 class FixTaskEnhancedToolManager:
     generated_test_files=[]
@@ -2529,73 +2055,11 @@ class FixTaskEnhancedToolManager:
             logger.error(f"Error saving file. {error}")
             return f"Error saving file. {error}"
  
-    def get_functions(function_paths: List[str]) -> Dict[str, str]:
-        '''
-        Get functions from a list of function paths.
-        Arguments:
-            function_paths: list of function paths (e.g. ["folder1/file1.py::class1::function1", "folder2/file2.py::class2::function2"])
-        Output:
-            dictionary of functions with function paths as keys and function bodies as values
-        '''
-        functions = {}
-        for function_path in function_paths:
-            parts = function_path.split("::")
-            file_path = parts[0]
-            function_name = "::".join(parts[1:])
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-                tree = ast.parse(content, filename=file_path)
-                visitor = FunctionVisitor(content)
-                visitor.visit(tree)
-                
-                if function_name in visitor.functions:
-                    functions[function_path] = visitor.functions[function_name].get("body", "")
-                else:
-                    functions[function_path] = f"Function {function_name} not found in {file_path}"
-            except FileNotFoundError:
-                functions[function_path] = f"File {file_path} not found"
-            except Exception as e:
-                functions[function_path] = f"Error processing {file_path}: {str(e)}"
-
-        return functions
-
-    def get_classes(class_paths: List[str])->Dict[str, str]:
-        '''
-        Get classes from a list of class paths.
-        Arguments:
-            class_paths: list of class paths (e.g. ["folder1/file1.py::class1", "folder2/file2.py::class2"])
-        Output:
-            dictionary of classes with class paths as keys and class bodies as values
-        '''
-        classes = {}
-        for class_path in class_paths:
-            parts = class_path.split("::")
-            file_path = parts[0]
-            class_name = "::".join(parts[1:])
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-                tree = ast.parse(content, filename=file_path)
-                visitor = ClassVisitor(content)
-                visitor.visit(tree)
-                if class_name in visitor.classes:
-                    classes[class_path] = visitor.classes[class_name].get("body", "")
-                else:
-                    classes[class_path] = f"Class {class_name} not found in {file_path}"
-            except FileNotFoundError:
-                classes[class_path] = f"File {file_path} not found"
-            except Exception as e:
-                classes[class_path] = f"Error processing {file_path}: {str(e)}"
-
-        return classes
-
     def search_in_all_files_content(search_term: str, case_sensitive: bool = False) -> str:
         '''
         Search for a text pattern across all .py files in the project, excluding any file with "test" in its path.
         Use at the beginning of the workflow to locate all possible references to a function, class, or variable.
-        If more context is needed (e.g., surrounding functions, classes, etc.), follow up with get_classes or get_functions.
-
+        
         Arguments:
             search_term: text pattern to locate (e.g., "def test_function", "*SomeClass*")
             case_sensitive: flag to determine if the search should be case-sensitive
@@ -2739,7 +2203,6 @@ class FixTaskEnhancedToolManager:
         os.system("git reset --hard")
         logger.info(f"problem_with_old_approach: {problem_with_old_approach}")
         logger.info(f"new_apprach_to_try: {new_apprach_to_try}")
-        logger.info("===========================")
         return "Done, codebase reverted to initial state. You can start over with new approach."
         
     def get_final_git_patch(initial_checkpoint:str=None) -> str:
@@ -2805,9 +2268,6 @@ class FixTaskEnhancedToolManager:
         except Exception as e:
             logger.exception("Error generating git patch")
             return f"Error generating git patch: {e}"
-    
-
-    
 
     def run_code(content:str,file_path:str)->str:
         '''
@@ -2849,8 +2309,6 @@ class FixTaskEnhancedToolManager:
                 if mod in sys.builtin_module_names:
                     continue
 
-               
-
                 # Skip relative imports ("from . import foo") which have level > 0
                 if isinstance(node, ast.ImportFrom) and node.level and node.level > 0:
                     continue
@@ -2884,7 +2342,6 @@ class FixTaskEnhancedToolManager:
             logger.error(f"Cannot run, third party dependencies detected: {sorted(disallowed_modules)}\n")
             raise ToolManager.Error(ToolManager.Error.ErrorType.THIRD_PARTY_DEPENDENCIES.name,f"Error:Cannot run, third party dependencies detected: {sorted(disallowed_modules)}\n")
 
-        
         result = subprocess.run(["python", file_path], capture_output=True, text=True, check=False, timeout=60)
         if result.returncode!=0:
             logger.error(f"Error running code: {result.stderr}\n")
@@ -3250,8 +2707,6 @@ class ClassVisitor(ast.NodeVisitor):
         }
         self.generic_visit(node)
 
-
-
 class TestModeDetector:
     TEST_RUNNER=None
     TEST_RUNNER_MODE=None
@@ -3380,7 +2835,6 @@ class TestModeDetector:
             logger.error(f"Error determining test runner mode: {e}")
             return "FILE"
         
-
 def create_checkpoint(repo_path: str, checkpoint_name: str) -> dict:
     
     import subprocess
@@ -3472,7 +2926,6 @@ def create_checkpoint(repo_path: str, checkpoint_name: str) -> dict:
             "status": "error",
             "message": f"Unexpected error: {str(e)}"
         }
-
 
 def switch_checkpoint(repo_path: str, checkpoint_name: str, save_current: bool = True) -> dict:
    
@@ -3567,7 +3020,6 @@ def switch_checkpoint(repo_path: str, checkpoint_name: str, save_current: bool =
             "message": f"Unexpected error: {str(e)}"
         }
 
-
 def restore_stashed_changes(repo_path: str, stash_index: int = 0, remove_after_apply: bool = True) -> dict:
     
     import subprocess
@@ -3653,90 +3105,3 @@ def restore_stashed_changes(repo_path: str, stash_index: int = 0, remove_after_a
             "status": "error",
             "message": f"Unexpected error: {str(e)}"
         }
-
-
-def list_stashes(repo_path: str) -> dict:
-    """
-    List all stashed changes in the repository.
-    
-    Args:
-        repo_path: Path to the git repository
-        
-    Returns:
-        dict: Contains status, count, and list of stashes with their descriptions
-        
-    Example:
-        result = list_stashes("/path/to/repo")
-        if result["status"] == "success":
-            print(f"Found {result['count']} stash(es)")
-            for stash in result['stashes']:
-                print(f"  {stash['index']}: {stash['message']}")
-    """
-    import subprocess
-    import os
-    import re
-    
-    try:
-        # Validate that the path is a git repository
-        if not os.path.exists(os.path.join(repo_path, ".git")):
-            return {
-                "status": "error",
-                "message": f"Not a git repository: {repo_path}"
-            }
-        
-        # Change to repository directory
-        original_dir = os.getcwd()
-        os.chdir(repo_path)
-        
-        # Get stash list
-        result = subprocess.run(
-            ["git", "stash", "list"],
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        
-        os.chdir(original_dir)
-        
-        if not result.stdout.strip():
-            return {
-                "status": "success",
-                "count": 0,
-                "stashes": [],
-                "message": "No stashes found"
-            }
-        
-        # Parse stash list
-        stashes = []
-        for line in result.stdout.strip().split('\n'):
-            # Format: stash@{0}: WIP on branch: message
-            match = re.match(r'stash@\{(\d+)\}: (.+)', line)
-            if match:
-                stashes.append({
-                    'index': int(match.group(1)),
-                    'reference': f"stash@{{{match.group(1)}}}",
-                    'message': match.group(2)
-                })
-        
-        return {
-            "status": "success",
-            "count": len(stashes),
-            "stashes": stashes,
-            "message": f"Found {len(stashes)} stash(es)"
-        }
-        
-    except subprocess.CalledProcessError as e:
-        if 'original_dir' in locals():
-            os.chdir(original_dir)
-        return {
-            "status": "error",
-            "message": f"Git command failed: {e.stderr if e.stderr else str(e)}"
-        }
-    except Exception as e:
-        if 'original_dir' in locals():
-            os.chdir(original_dir)
-        return {
-            "status": "error",
-            "message": f"Unexpected error: {str(e)}"
-        }
-    

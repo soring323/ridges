@@ -1,23 +1,26 @@
 from __future__ import annotations
 import ast
+import sys
 import json
 import os
-import requests
+import re
+import inspect
+import random
 import subprocess
-import ast, sys
 import textwrap
 import time
 import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from json import JSONDecodeError
-import re
-import inspect
-import random
-from enum import Enum
-import json
 import csv
 import logging
+import io
+import contextlib
+import tempfile
+from datetime import datetime
+import requests
+from enum import Enum
 from uuid import uuid4
 
 DEFAULT_PROXY_URL = os.getenv("SANDBOX_PROXY_URL", "http://localhost:8000")
@@ -772,20 +775,28 @@ class EnhancedNetwork:
     
     @classmethod
     def is_valid_response(cls,raw_text:str)->bool:
-        if type(raw_text) is dict and raw_text.get("error",None) is not None and raw_text.get("error")!="":
-            return False,cls.ErrorType.EMPTY_RESPONSE.name
-        if not raw_text.strip().endswith("}") and not raw_text.strip().endswith("}]"):
-            return False, "Incomplete response, your response must be shorter to fit within context limit"
-        if len(raw_text)==0:
+        # Accept dicts as valid unless they include a non-empty "error" field
+        if isinstance(raw_text, dict):
+            if raw_text.get("error"):
+                return False, cls.ErrorType.EMPTY_RESPONSE.name
+            return True, None
+
+        if raw_text is None:
             return False, cls.ErrorType.EMPTY_RESPONSE.name
-        if "<|reserved_token_" in raw_text:
+
+        text = str(raw_text).strip()
+        if not text:
+            return False, cls.ErrorType.EMPTY_RESPONSE.name
+        if "<|reserved_token_" in text:
             return False, cls.ErrorType.RESERVED_TOKEN_PRESENT.name
-        if 'API request failed with status 429' in raw_text:
+        if 'API request failed with status 429' in text:
             return False, cls.ErrorType.RATE_LIMIT_EXCEEDED.name
-        if 'Read timed out' in raw_text:
+        if 'Read timed out' in text:
             return False, cls.ErrorType.TIMEOUT.name
-        if 'Network unreachable' in raw_text or 'Connection refused' in raw_text:
+        if 'Network unreachable' in text or 'Connection refused' in text:
             return False, cls.ErrorType.NETWORK_ERROR.name
+
+        # Heuristic: accept typical LLM outputs rather than strict trailing-character checks
         return True, None
 
     @classmethod
@@ -813,23 +824,72 @@ class EnhancedNetwork:
     
     @classmethod
     def make_request(cls,messages:list,model:str,attempt:int=0, temperature:float=0.0)->str:
+        # Centralized request with client-side prompt shrinking and a graceful
+        # retry when upstream reports the input is too large.
         global run_id
         url = f"{DEFAULT_PROXY_URL.rstrip('/')}/api/inference"
         print("[REQUEST] run_id:", run_id)
 
-        request_data = {
-                "run_id": run_id if run_id else str(uuid4()),
-                "messages": messages,
-                "temperature": temperature,
-            }
+        def _estimate_tokens_from_messages(msgs: list) -> int:
+            # crude estimate: 1 token ≈ 4 characters (approx for many languages)
+            total_chars = 0
+            for m in msgs:
+                try:
+                    total_chars += len(str(m.get('content', '') or ''))
+                except Exception:
+                    total_chars += 0
+            return max(1, int(total_chars / 4))
 
-        headers = {
-            "Content-Type": "application/json"
+        def _shrink_messages(msgs: list, max_messages: int = 10, per_message_chars: int = 2000) -> list:
+            if not msgs:
+                return msgs
+            # keep leading system messages, then only the last `max_messages` conversation turns
+            leading = [m for m in msgs if m.get('role') == 'system']
+            tail = [m for m in msgs if m.get('role') != 'system'][-max_messages:]
+            shrunk = []
+            for m in leading + tail:
+                content = m.get('content', '') or ''
+                if len(content) > per_message_chars:
+                    content = content[:per_message_chars] + "\n...[truncated]"
+                shrunk.append({'role': m.get('role'), 'content': content})
+            return shrunk
+
+        # Build request payload
+        request_data = {
+            "run_id": run_id if run_id else str(uuid4()),
+            "messages": messages,
+            "temperature": temperature,
+            'model': model
         }
-        request_data['model'] = model
-        
+
+        headers = {"Content-Type": "application/json"}
+
+        # Check estimated token usage and pre-shrink if dangerously large
+        try:
+            estimated_tokens = _estimate_tokens_from_messages(messages)
+            model_limit = int(os.getenv('KINDNESS_MODEL_CONTEXT_TOKENS', str(131072)))
+            # if estimated tokens exceed 90% of model limit, shrink aggressively
+            if estimated_tokens > int(0.9 * model_limit):
+                logger.warning(f"Estimated tokens ({estimated_tokens}) exceed 90% of model limit ({model_limit}); shrinking messages client-side")
+                messages = _shrink_messages(messages, max_messages=int(os.getenv('KINDNESS_SHRINK_MAX_MESSAGES','6')), per_message_chars=int(os.getenv('KINDNESS_PER_MESSAGE_CHARS','1500')))
+                request_data['messages'] = messages
+        except Exception:
+            logger.exception("Failed to estimate or shrink messages; proceeding without shrink")
+
+        # Attempt the request; on 400 errors that look like context-length issues, retry once with truncated messages
         try:
             response = requests.post(url, json=request_data, timeout=120, headers=headers)
+            if response.status_code == 400:
+                body = (response.text or '').lower()
+                if ('context length' in body) or ('longer than the model' in body) or ('input (' in body and 'longer than' in body) or ('exceed' in body and 'context' in body):
+                    logger.warning('Received 400 from inference proxy indicating input too large; retrying with aggressive truncation')
+                    # aggressive shrink and retry once
+                    try:
+                        shrunk = _shrink_messages(messages, max_messages=int(os.getenv('KINDNESS_AGGRESSIVE_MAX_MESSAGES','4')), per_message_chars=int(os.getenv('KINDNESS_AGGRESSIVE_PER_MESSAGE_CHARS','800')))
+                        request_data['messages'] = shrunk
+                        response = requests.post(url, json=request_data, timeout=120, headers=headers)
+                    except Exception as ee:
+                        logger.exception(f"Retry after shrink failed: {ee}")
             response.raise_for_status()
         except requests.exceptions.Timeout:
             logger.error(f"Request timeout after 120 seconds for model {model}")
@@ -838,19 +898,25 @@ class EnhancedNetwork:
             logger.error(f"Connection error for model {model}: {e}")
             return f"ERROR: Connection failed for model {model}"
         except requests.exceptions.HTTPError as e:
+            # Return body where available for upstream handling/logging
+            body_text = ''
+            try:
+                body_text = e.response.text
+            except Exception:
+                body_text = str(e)
             logger.error(f"HTTP error for model {model}: {e}")
-            return f"ERROR: HTTP error {e.response.status_code} for model {model}"
+            return f"ERROR: HTTP error {getattr(e.response, 'status_code', 'unknown')} for model {model}: {body_text[:500]}"
         except requests.exceptions.RequestException as e:
             logger.error(f"Request error for model {model}: {e}")
             return f"ERROR: Request failed for model {model}"
-        
+
         try:
             response_json = response.json()
         except JSONDecodeError as e:
             logger.error(f"Invalid JSON response for model {model}: {e}")
-            logger.error(f"Response content: {response.text[:500]}...")
+            logger.error(f"Response content: {getattr(response, 'text', '')[:500]}...")
             return f"ERROR: Invalid JSON response for model {model}"
-        
+
         try:
             is_oai_interface= type(response_json) is dict and response_json.get('choices') is not None and len(response_json.get('choices'))>0 and response_json.get('choices')[0].get('message') is not None
             if is_oai_interface:
@@ -1138,21 +1204,34 @@ class Utils:
         try:
             return json.loads(json_string)
         except Exception as e:
+            # safer fallback for python literal structures (dict/list/tuples)
             try:
-                return eval(json_string)
-            except Exception as e:
-                logger.info(f"unable to fix manually, trying with llm")
-                fixed_json=EnhancedNetwork.fix_json_string_with_llm(json_string)
+                from ast import literal_eval
+                return literal_eval(json_string)
+            except Exception:
+                logger.info("literal_eval failed, trying LLM-based JSON fix")
+                fixed_json = EnhancedNetwork.fix_json_string_with_llm(json_string)
                 if fixed_json:
                     return fixed_json
-                else:
-                    raise JSONDecodeError("Invalid JSON", json_string, 0)
+                raise JSONDecodeError("Invalid JSON", json_string, 0)
                 
     @classmethod
     def log_to_failed_messages(cls,text_resp:str):
-        with open("../failed_messages.csv","a") as f:
-                writer=csv.writer(f)
+        out_dir = os.path.join(os.getcwd(), "logs")
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            path = os.path.join(out_dir, "failed_messages.csv")
+            with open(path, "a", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f)
                 writer.writerow([text_resp])
+        except Exception:
+            # best-effort fallback to relative path
+            try:
+                with open("../failed_messages.csv", "a", encoding="utf-8", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([text_resp])
+            except Exception:
+                logger.exception("Unable to write failed message to log file")
 
 class FixTaskEnhancedToolManager(EnhancedToolManager):
 
@@ -1452,9 +1531,201 @@ Think of this as "scratch paper" - helpful for debugging, but the real test is r
         Output:
             Returns the stdout/stderr from the executed files.
         '''
+        # Optionally capture runtime failure state snapshots and attach to the enhanced output.
+        capture_flag = os.getenv("KINDNESS_CAPTURE_RUNTIME_STATE", "0") == "1"
+        send_flag = os.getenv("KINDNESS_SEND_STATE_TO_LLM", "0") == "1"
+
         if self.test_runner == "pytest":
             print("CMD: pytest ", file_paths)
-            result = subprocess.run(["pytest"] + file_paths, shell=True, capture_output=True, text=True, timeout=90)
+            # If capture_flag is enabled, run pytest in-process with a small plugin
+            if capture_flag:
+                try:
+                    # Local simple pytest plugin to capture locals on failing tests
+                    class FailureStateCollector:
+                        def __init__(self):
+                            self.failures: List[dict] = []
+
+                        def pytest_runtest_makereport(self, item, call):
+                            # only inspect the actual test call phase
+                            if call.when != "call":
+                                return
+                            if not getattr(call, 'excinfo', None):
+                                return
+                            try:
+                                tb = call.excinfo.traceback
+                            except Exception:
+                                tb = None
+
+                            user_frame = None
+                            last_entry = None
+                            if tb:
+                                # Try to find the first user frame (skip pytest internals)
+                                for entry in reversed(tb):
+                                    last_entry = entry
+                                    try:
+                                        path = str(entry.path)
+                                    except Exception:
+                                        path = ''
+                                    if 'site-packages' in path or 'pytest' in path:
+                                        continue
+                                    user_frame = getattr(entry, '_frame', None)
+                                    break
+                                if user_frame is None and last_entry is not None:
+                                    user_frame = getattr(last_entry, '_frame', None)
+
+                            # environment-controlled heuristics
+                            max_vars = int(os.getenv('KINDNESS_LOCALS_TOP_N', '10'))
+                            per_var_max = int(os.getenv('KINDNESS_PER_VAR_REPR', '300'))
+                            overall_max_chars = int(os.getenv('KINDNESS_MAX_STATE_CHARS', '5000'))
+                            include_referenced = os.getenv('KINDNESS_INCLUDE_REFERENCED_VARS', '1') == '1'
+
+                            referenced_names = set()
+                            failing_line_text = None
+                            if last_entry is not None:
+                                try:
+                                    p = str(last_entry.path)
+                                    ln = getattr(last_entry, 'lineno', None)
+                                    if p and ln:
+                                        try:
+                                            with open(p, 'r', encoding='utf-8') as _f:
+                                                lines = _f.readlines()
+                                            if 0 < ln <= len(lines):
+                                                failing_line_text = lines[ln-1].strip()
+                                        except Exception:
+                                            failing_line_text = None
+                                except Exception:
+                                    failing_line_text = None
+
+                            if failing_line_text and include_referenced:
+                                # find simple variable-like tokens in the failing line
+                                import re
+                                for m in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\b", failing_line_text):
+                                    referenced_names.add(m.group(1))
+
+                            locals_candidates = []
+                            if user_frame is not None:
+                                for k, v in list(user_frame.f_locals.items()):
+                                    if k.startswith('__'):
+                                        continue
+                                    # redact likely secrets
+                                    if re.search(r'(token|password|passwd|secret|key|apikey|credential|auth|cookie)', k, re.I):
+                                        val = '<redacted>'
+                                    else:
+                                        try:
+                                            raw = repr(v)
+                                        except Exception:
+                                            raw = f'<unreprable:{type(v).__name__}>'
+                                        # per-variable truncation
+                                        val = raw[:per_var_max]
+                                    locals_candidates.append((k, type(v).__name__, val))
+
+                            # pick variables: referenced first, then by repr length
+                            selected = []
+                            if include_referenced and referenced_names:
+                                for name in referenced_names:
+                                    for idx, (k, tname, val) in enumerate(locals_candidates):
+                                        if k == name:
+                                            selected.append((k, tname, val))
+                                            locals_candidates[idx] = None
+                                            break
+                                # remove None
+                                locals_candidates = [x for x in locals_candidates if x]
+
+                            # fill up to max_vars by largest repr
+                            locals_candidates.sort(key=lambda x: len(x[2]) if x else 0, reverse=True)
+                            for k_t_v in locals_candidates:
+                                if len(selected) >= max_vars:
+                                    break
+                                selected.append(k_t_v)
+
+                            # ensure overall size limit
+                            total_chars = 0
+                            locals_snapshot = {}
+                            for k, tname, val in selected:
+                                if total_chars + len(val) > overall_max_chars:
+                                    # truncate to fit remaining budget
+                                    remaining = max(0, overall_max_chars - total_chars)
+                                    if remaining <= 0:
+                                        break
+                                    val = val[:remaining]
+                                locals_snapshot[k] = {'type': tname, 'repr': Utils.limit_strings(val, n=1000)}
+                                total_chars += len(val)
+
+                            failure = {
+                                'nodeid': getattr(item, 'nodeid', None) if item is not None else None,
+                                'file': str(getattr(item, 'fspath', None)) if item is not None else None,
+                                'when': getattr(call, 'when', None),
+                                'exc_type': type(call.excinfo.value).__name__ if getattr(call, 'excinfo', None) else None,
+                                'exc_msg': str(call.excinfo.value) if getattr(call, 'excinfo', None) else None,
+                                'traceback': ''.join(traceback.format_exception(call.excinfo.type, call.excinfo.value, call.excinfo.tb)) if getattr(call, 'excinfo', None) else None,
+                                'locals': locals_snapshot,
+                                'failing_line': failing_line_text,
+                                'captured_at': datetime.utcnow().isoformat() + 'Z'
+                            }
+                            self.failures.append(failure)
+
+                    # Run pytest programmatically and capture stdout/stderr
+                    import pytest as _pytest
+                    collector = FailureStateCollector()
+                    args = []
+                    args.extend(list(file_paths))
+                    # Keep exit on errors; collect verbose output
+                    args.extend(['-q', '-p', 'no:warnings'])
+                    buf_out = io.StringIO()
+                    buf_err = io.StringIO()
+                    with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                        # pytest.main returns an exit code
+                        exit_code = _pytest.main(args=args, plugins=[collector])
+                    output = buf_out.getvalue() + buf_err.getvalue()
+                    # attach captured failures into enhanced output if any
+                    enhanced_output = self._enhance_test_output(output, file_paths)
+                    if collector.failures:
+                        try:
+                            summary = json.dumps(collector.failures, ensure_ascii=False)
+                        except Exception:
+                            summary = str(collector.failures)
+                        # save locally
+                        try:
+                            tmpdir = tempfile.mkdtemp(prefix='kindness_fail_')
+                            path = os.path.join(tmpdir, 'failure_states.json')
+                            with open(path, 'w', encoding='utf-8') as f:
+                                f.write(summary)
+                            logger.info(f'Captured failure state written to {path}')
+                        except Exception:
+                            logger.exception('Unable to write failure state to tmp file')
+
+                        if send_flag:
+                            enhanced_output = enhanced_output + "\n\n" + "RUNTIME_FAILURE_STATES_JSON:\n" + summary
+
+                    has_failures = any(indicator in output for indicator in ["FAIL:", "expected failures"])
+                    failure_count = 0
+                    if has_failures:
+                        import re
+                        fail_patterns = [
+                            r'(\d+)\s+failed',
+                            r'FAILED.*\(failures=(\d+)\)',
+                        ]
+                        for pattern in fail_patterns:
+                            match = re.search(pattern, output, re.IGNORECASE)
+                            if match:
+                                failure_count = int(match.group(1))
+                                break
+                        if failure_count == 0:
+                            failure_count = output.count("FAIL:")
+
+                    self.last_test_results = {
+                        'has_failures': has_failures,
+                        'failure_count': failure_count,
+                        'file_paths': file_paths,
+                        'captured_failures': collector.failures
+                    }
+                    return enhanced_output
+                except Exception as e:
+                    logger.exception(f"Error running pytest with FailureStateCollector: {e}")
+                    # fallback to subprocess mode below
+            # Run pytest directly without using a shell to avoid quoting/injection issues
+            cmd = ["pytest"] + list(file_paths)
+            result = subprocess.run(cmd, shell=False, capture_output=True, text=True, timeout=90)
             output = (result.stdout or "") + (result.stderr or "")
         elif self.test_runner == "unittest":
             print("CMD: python ", file_paths)
@@ -1514,6 +1785,49 @@ Think of this as "scratch paper" - helpful for debugging, but the real test is r
         }
         
         return enhanced_output
+
+    def format_failure_states_for_prompt(self, max_chars: int = 3000) -> Optional[str]:
+        """
+        Create a compact, safe summary of captured failure states suitable for including
+        in an LLM prompt. The summary is JSON-like text and is truncated to max_chars.
+        """
+        if not hasattr(self, 'last_test_results'):
+            return None
+        failures = self.last_test_results.get('captured_failures') or []
+        if not failures:
+            return None
+
+        summary = []
+        for f in failures:
+            locals_list = []
+            for k, v in (f.get('locals') or {}).items():
+                if isinstance(v, dict):
+                    t = v.get('type')
+                    r = v.get('repr')
+                else:
+                    t = type(v).__name__
+                    r = str(v)
+                locals_list.append(f"{k} ({t}): {r}")
+
+            entry = {
+                'nodeid': f.get('nodeid'),
+                'file': f.get('file'),
+                'failing_line': f.get('failing_line'),
+                'exc_type': f.get('exc_type'),
+                'exc_msg': (f.get('exc_msg') or '')[:200],
+                'locals': locals_list[:20]
+            }
+            summary.append(entry)
+
+        try:
+            text = json.dumps(summary, ensure_ascii=False)
+        except Exception:
+            text = str(summary)
+
+        if len(text) > max_chars:
+            text = text[:max_chars] + '...'
+
+        return "RUNTIME_FAILURE_SUMMARY_JSON:\n" + text
     
     @EnhancedToolManager.tool
     def search_in_all_files_content(self, search_term: str, case_sensitive: bool = False) -> str:
@@ -1928,7 +2242,8 @@ Think of this as "scratch paper" - helpful for debugging, but the real test is r
         '''
         if self.test_runner == "pytest":
             print("CMD: pytest ", file_paths)
-            result = subprocess.run(["pytest"] + file_paths, shell=True, capture_output=True, text=True, timeout=90)
+            cmd = ["pytest"] + list(file_paths)
+            result = subprocess.run(cmd, shell=False, capture_output=True, text=True, timeout=90)
             output = (result.stdout or "") + (result.stderr or "")
         elif self.test_runner == "unittest":
             print("CMD: python ", file_paths)
@@ -2402,10 +2717,15 @@ def process_fix_task(input_dict: Dict[str, Any]):
     patch_text = ""  # Initialize to avoid UnboundLocalError
     
     repo_path = os.getenv("REPO_PATH", "/sandbox/repo")
-    repod_dir = repo_path.split('/')[-1]
-    repod_path = repo_path[:-len(repod_dir)-1]
-    if os.path.exists(repod_dir):
-        os.chdir(repod_dir)
+    # Prefer changing to the explicit REPO_PATH if it exists. Avoid chdir to a basename
+    # which may accidentally match something in the current working directory.
+    try:
+        if os.path.exists(repo_path):
+            os.chdir(repo_path)
+        else:
+            logger.debug(f"REPO_PATH '{repo_path}' not found; staying in current working directory: {os.getcwd()}")
+    except Exception as e:
+        logger.warning(f"Unable to change directory to REPO_PATH '{repo_path}': {e}")
 
     set_env_for_agent()
     cwd = os.getcwd()
@@ -2940,6 +3260,14 @@ def fix_task_solve_for_fixing_workflow(problem_statement: str, *, timeout: int, 
             ]
         
         messages.extend(cot.to_str())
+        # If the tool manager has captured failure states, include a compact summary for the LLM
+        try:
+            failure_prompt = tool_manager.format_failure_states_for_prompt(max_chars=int(os.getenv("KINDNESS_PROMPT_MAX_CHARS","2000")))
+            if failure_prompt:
+                messages.append({"role": "user", "content": failure_prompt})
+        except Exception as e:
+            logger.debug(f"Unable to format failure states for prompt: {e}")
+
         messages.append({"role": "system", "content": STOP_INSTRUCTION})
     
         if cot.is_thought_repeated():
@@ -3229,6 +3557,13 @@ def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: s
             ]
         
         messages.extend(cot.to_str())
+        # If the tool manager has captured failure states, include a compact summary for the LLM
+        try:
+            failure_prompt = tool_manager.format_failure_states_for_prompt(max_chars=int(os.getenv("KINDNESS_PROMPT_MAX_CHARS","2000")))
+            if failure_prompt:
+                messages.append({"role": "user", "content": failure_prompt})
+        except Exception as e:
+            logger.debug(f"Unable to format failure states for prompt: {e}")
 
         messages.append({"role": "system", "content": STOP_INSTRUCTION})
     
