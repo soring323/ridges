@@ -20,6 +20,7 @@ Strategy:
 
 import os
 import sys
+import json
 import subprocess
 import textwrap
 import requests
@@ -438,27 +439,57 @@ def detect_problem_type(problem_statement: str) -> str:
 # CREATE Mode - Test-Driven Development
 # ============================================================================
 
-def post_workflow(problem_statement: str, solution_files: Dict[str, str], timeout: int, start_time: float, mode: str = "CREATE") -> str:
+def create_mode(problem_statement: str, timeout: int) -> str:
     """
-    Unified post workflow for both CREATE and FIX modes.
+    CREATE mode: Generate solution with test-driven iterative refinement.
     
     Strategy:
-    1. Run tests iteratively
-    2. Fix failures with fix_test_failures
-    3. If stuck → try alternative architecture
-    4. Repeat until success or timeout
-    
-    Args:
-        problem_statement: The problem to solve
-        solution_files: Current solution files
-        timeout: Timeout in seconds
-        start_time: Start time for timeout calculation
-        mode: "CREATE" or "FIX" for logging purposes
-    
-    Returns:
-        Git diff patch
+    1. Generate initial solution (1x, not 3x)
+    2. Generate comprehensive tests (1x, not 15x)
+    3. Run tests → get failures
+    4. Fix failures iteratively with test feedback
+    5. Repeat until tests pass or max iterations
     """
-    print(f"\n[POST WORKFLOW] Starting test-driven refinement ({mode} mode)...")
+    print("\n" + "="*80)
+    print("CREATE MODE - Test-Driven Development")
+    print("="*80)
+    
+    start_time = time.time()
+
+    code_skeleton = get_code_skeleton()
+    
+    # Step 1: Generate initial solution
+    print("\n[STEP 1] Generating initial solution...")
+    solution_files = generate_solution(problem_statement)
+    
+    if not solution_files:
+        print("[ERROR] Failed to generate solution")
+        return ""
+    
+    created_files = write_files(solution_files)
+    print(f"[STEP 1] Created {len(created_files)} solution files")
+    
+    # Step 2: Generate tests
+    print("\n[STEP 2] Generating test suite...")
+    test_cases = generate_test_files(problem_statement, created_files, code_skeleton)
+    print(test_cases)
+    # Extract and write files from test cases
+    test_files = extract_and_write_files(test_cases)
+    if not test_files:
+        print("[ERROR] Failed to generate tests")
+        return get_git_diff()
+    print(f"Created or Updated {len(test_files)} files: {test_files}")
+    
+    # Run initial tests to see what we're working with
+    print("[STEP 2] Running initial tests to establish baseline...")
+    success, output = run_tests()
+    initial_results = parse_test_results(output)
+    print(f"[STEP 2] Baseline: {initial_results['passed']}/{initial_results['total']} tests passing")
+    if initial_results['total'] > 0:
+        print(f"[STEP 2] Test coverage: {len(initial_results['passed_tests'])} passing, {len(initial_results['failed_tests'])} failing")
+    
+    # Step 3: Iterative refinement
+    print("\n[STEP 3] Test-driven refinement...")
     
     previous_failed = set()
     stuck_count = 0
@@ -468,7 +499,7 @@ def post_workflow(problem_statement: str, solution_files: Dict[str, str], timeou
     
     for iteration in range(MAX_ITERATIONS):
         if time.time() - start_time > timeout - 60:
-            print("[TIMEOUT] Stopping refinement")
+            print(f"[TIMEOUT] Stopping refinement")
             break
         
         print(f"\n--- Iteration {iteration + 1}/{MAX_ITERATIONS} ---")
@@ -490,7 +521,7 @@ def post_workflow(problem_statement: str, solution_files: Dict[str, str], timeou
         
         # Show first few error details
         if test_results['error_details']:
-            print("[ERRORS] Sample failures:")
+            print(f"[ERRORS] Sample failures:")
             for i, error in enumerate(test_results['error_details'][:3]):
                 print(f"  {i+1}. {error['test']}")
                 for line in error['error'].split('\n')[:2]:
@@ -624,8 +655,6 @@ def post_workflow(problem_statement: str, solution_files: Dict[str, str], timeou
                         continue
                 else:
                     print(f"[STUCK] Could not generate alternative #{alternatives_tried}")
-                    # Reset stuck_count to try normal fixes before attempting another alternative
-                    stuck_count = 0
                     
             elif stuck_count >= 2 and alternatives_tried >= max_alternatives:
                 print(f"\n[STUCK] Tried {alternatives_tried} alternatives, all failed. Stopping.")
@@ -650,63 +679,12 @@ def post_workflow(problem_statement: str, solution_files: Dict[str, str], timeou
     if tried_architectures:
         print(f"\n[SUMMARY] Tried {len(tried_architectures)} alternative architecture(s):")
         for arch_name, score in tried_architectures.items():
-            print(f"  - {arch_name}: {score} tests passed")
+            print(f"  - {arch_name}: {score}/{initial_results['total']} tests passed")
     
     # Return final patch
     patch = get_git_diff()
     print(f"\n[COMPLETE] Generated patch ({len(patch)} bytes)")
     return patch
-
-def create_mode(problem_statement: str, timeout: int) -> str:
-    """
-    CREATE mode: Generate solution then run post workflow.
-    
-    Strategy:
-    1. Generate initial solution
-    2. Generate comprehensive tests
-    3. Run post workflow (unified with FIX mode)
-    """
-    print("\n" + "="*80)
-    print("CREATE MODE - Test-Driven Development")
-    print("="*80)
-    
-    start_time = time.time()
-
-    code_skeleton = get_code_skeleton()
-    
-    # Step 1: Generate initial solution
-    print("\n[STEP 1] Generating initial solution...")
-    solution_files = generate_solution(problem_statement)
-    
-    if not solution_files:
-        print("[ERROR] Failed to generate solution")
-        return ""
-    
-    created_files = write_files(solution_files)
-    print(f"[STEP 1] Created {len(created_files)} solution files")
-    
-    # Step 2: Generate tests
-    print("\n[STEP 2] Generating test suite...")
-    test_cases = generate_test_files(problem_statement, created_files, code_skeleton)
-    print(test_cases)
-    # Extract and write files from test cases
-    test_files = extract_and_write_files(test_cases)
-    if not test_files:
-        print("[ERROR] Failed to generate tests")
-        return get_git_diff()
-    print(f"Created or Updated {len(test_files)} files: {test_files}")
-    
-    # Run initial tests to see what we're working with
-    print("[STEP 2] Running initial tests to establish baseline...")
-    success, output = run_tests()
-    initial_results = parse_test_results(output)
-    print(f"[STEP 2] Baseline: {initial_results['passed']}/{initial_results['total']} tests passing")
-    if initial_results['total'] > 0:
-        print(f"[STEP 2] Test coverage: {len(initial_results['passed_tests'])} passing, {len(initial_results['failed_tests'])} failing")
-    
-    # Step 3: Run unified post workflow
-    print("\n[STEP 3] Running post workflow...")
-    return post_workflow(problem_statement, solution_files, timeout, start_time, mode="CREATE")
 
 def generate_solution(problem_statement: str) -> Dict[str, str]:
     """Generate initial solution with better reasoning."""
@@ -866,27 +844,27 @@ def analyze_edge_case_from_test(test_name: str, test_output: str) -> str:
     
     # Negative conditions (should NOT happen)
     if "should_not" in test_name or "shouldnt" in test_name or "not_be" in test_name:
-        insights.append("**Edge Case**: Test name contains 'should_not' - something should NOT happen in this scenario")
+        insights.append(f"**Edge Case**: Test name contains 'should_not' - something should NOT happen in this scenario")
     
     # "Only" conditions (exclusive behavior)
     if "only_" in test_name or "_only" in test_name:
-        insights.append("**Requirement**: Test name contains 'only' - behavior should happen exclusively under certain conditions")
+        insights.append(f"**Requirement**: Test name contains 'only' - behavior should happen exclusively under certain conditions")
     
     # Change/update patterns
     if "change" in test_name and "but" in test_name:
-        insights.append("**Edge Case**: Test name has 'change...but' pattern - some changes should not trigger certain effects")
+        insights.append(f"**Edge Case**: Test name has 'change...but' pattern - some changes should not trigger certain effects")
     
     # Multiple/many patterns (handling multiple items)
     if "multiple" in test_name or "many" in test_name:
-        insights.append("**Edge Case**: Test involves multiple items - check for proper handling of collections")
+        insights.append(f"**Edge Case**: Test involves multiple items - check for proper handling of collections")
     
     # Empty/zero patterns
     if "empty" in test_name or "zero" in test_name or "no_" in test_name:
-        insights.append("**Edge Case**: Test involves empty/zero case - boundary condition")
+        insights.append(f"**Edge Case**: Test involves empty/zero case - boundary condition")
     
     # Already/duplicate patterns
     if "already" in test_name or "duplicate" in test_name or "twice" in test_name:
-        insights.append("**Edge Case**: Test involves repeated operations - check for idempotency or duplicate handling")
+        insights.append(f"**Edge Case**: Test involves repeated operations - check for idempotency or duplicate handling")
     
     # Parse test name for semantic meaning (convert snake_case to readable)
     readable_name = test_name.replace('_', ' ').replace('test ', '')
@@ -1132,7 +1110,7 @@ Propose 3 COMPLETELY DIFFERENT architectural approaches that could solve this pr
 For each alternative, explain:
 - Architecture name and core concept
 - Key design principles
-- Why this approach addresses the root cause
+- Why can this approach solve the current problem
 - Trade-offs and considerations
 
 **CRITICAL INSIGHT FROM FAILING TEST:**
@@ -1242,7 +1220,7 @@ filename.py
 Generate the alternative architecture now:"""
 
     try:
-        print("[ALTERNATIVE] Requesting architectural redesign from LLM...")
+        print(f"[ALTERNATIVE] Requesting architectural redesign from LLM...")
         # Lower temperature for more deterministic, focused solutions
         # Higher attempts = lower temperature (more focused on proven patterns)
         temp = max(0.3, 0.8 - (attempt * 0.15))  # 0.8 → 0.65 → 0.5 → 0.35 → 0.3
@@ -1381,12 +1359,14 @@ def extract_test_code_context(test_output: str) -> str:
 
 def fix_mode(problem_statement: str, timeout: int) -> str:
     """
-    FIX mode: Assume implementation exists, then run post workflow.
+    FIX mode: Iterative debugging with test feedback.
     
     Strategy:
-    1. Find relevant existing code
-    2. Generate/find tests if needed
-    3. Run post workflow (unified with CREATE mode)
+    1. Understand the problem and locate relevant code
+    2. Generate focused test to reproduce issue
+    3. Apply fix
+    4. Run tests to verify
+    5. Repeat until fixed
     """
     print("\n" + "="*80)
     print("FIX MODE - Iterative Debugging")
@@ -1394,28 +1374,195 @@ def fix_mode(problem_statement: str, timeout: int) -> str:
     
     start_time = time.time()
     
-    # Step 1: Analyze problem and find relevant files (implementation already exists)
-    print("\n[STEP 1] Finding relevant code...")
+    # Step 1: Analyze problem and find relevant files
+    print("\n[STEP 1] Analyzing problem...")
     relevant_files = find_relevant_files(problem_statement)
     print(f"[STEP 1] Found {len(relevant_files)} relevant files")
     
-    if not relevant_files:
-        print("[ERROR] No relevant files found")
-        return ""
-    
-    # Step 2: Generate reproduction test if needed
-    print("\n[STEP 2] Setting up tests...")
+    # Step 2: Generate reproduction test
+    print("\n[STEP 2] Generating reproduction test...")
     test_file = generate_reproduction_test(problem_statement, relevant_files)
     
     if test_file:
         write_files(test_file)
         print("[STEP 2] Created reproduction test")
-    else:
-        print("[STEP 2] Using existing tests")
     
-    # Step 3: Run unified post workflow
-    print("\n[STEP 3] Running post workflow...")
-    return post_workflow(problem_statement, relevant_files, timeout, start_time, mode="FIX")
+    # Step 3: Iterative fixing with alternative architecture support
+    print("\n[STEP 3] Iterative fixing...")
+    
+    previous_failed = set()
+    stuck_count = 0
+    max_alternatives = 5
+    alternatives_tried = 0
+    tried_architectures = {}  # Track: {architecture_name: test_score}
+    
+    for iteration in range(MAX_ITERATIONS):
+        if time.time() - start_time > timeout - 60:
+            print(f"[TIMEOUT] Stopping fixes")
+            break
+        
+        print(f"\n--- Iteration {iteration + 1}/{MAX_ITERATIONS} ---")
+        
+        # Run tests
+        success, output = run_tests()
+        test_results = parse_test_results(output)
+        
+        print(f"[TESTS] {test_results['passed']}/{test_results['total']} passed, {test_results['failed']} failed")
+        if test_results['passed_tests']:
+            print(f"[TESTS] ✓ Passed: {', '.join(test_results['passed_tests'][:5])}" + 
+                  (f" (+{len(test_results['passed_tests'])-5} more)" if len(test_results['passed_tests']) > 5 else ""))
+        if test_results['failed_tests']:
+            print(f"[TESTS] ✗ Failed: {', '.join(test_results['failed_tests'][:3])}" + 
+                  (f" (+{len(test_results['failed_tests'])-3} more)" if len(test_results['failed_tests']) > 3 else ""))
+        
+        if success:
+            print("[SUCCESS] All tests passed!")
+            break
+        
+        # Check if we're stuck (same failures for 2+ iterations)
+        current_failed = set(test_results['failed_tests'])
+        if current_failed == previous_failed and len(current_failed) > 0:
+            stuck_count += 1
+            if stuck_count >= 2 and alternatives_tried < max_alternatives:
+                print(f"\n[STUCK] Same {len(current_failed)} test(s) failing for {stuck_count} iterations")
+                print(f"[STUCK] Trying alternative architecture #{alternatives_tried + 1}/{max_alternatives}...")
+                
+                # Save current best solution
+                best_solution = relevant_files.copy()
+                best_score = test_results['passed']
+                print(f"[BACKUP] Saved current solution: {best_score}/{test_results['total']} passed")
+                
+                # Try alternative architecture
+                alternative = try_alternative_architecture(
+                    problem_statement, 
+                    output, 
+                    relevant_files,
+                    test_results,
+                    attempt=alternatives_tried + 1
+                )
+                
+                if alternative:
+                    # Extract architecture name
+                    arch_name = alternative.pop('__architecture_name__', f"Architecture #{alternatives_tried + 1}")
+                    
+                    # Check if we've tried this architecture before (semantic similarity)
+                    is_duplicate = False
+                    for tried_name in tried_architectures.keys():
+                        if are_architectures_similar(arch_name, tried_name):
+                            is_duplicate = True
+                            print(f"[ALTERNATIVE #{alternatives_tried + 1}] ⚠️ Similar to '{tried_name}' (already tried), skipping...")
+                            break
+                    
+                    if is_duplicate:
+                        # Don't count as attempt, stay in alternative-seeking mode
+                        # Keep stuck count high to try next alternative
+                        stuck_count = 2
+                        continue
+                    
+                    # Now we're actually using this alternative, increment counter
+                    alternatives_tried += 1
+                    
+                    print(f"[ALTERNATIVE #{alternatives_tried}] Architecture: {arch_name}")
+                    print(f"[ALTERNATIVE #{alternatives_tried}] Generated new architecture, iterating to improve...")
+                    relevant_files.update(alternative)
+                    write_files(alternative)
+                    
+                    # Give alternative architecture iterations to improve
+                    # Always give at least 3 iterations, up to 4 max
+                    alt_iterations = max(3, min(4, MAX_FIX_STEPS - iteration - 1))
+                    print(f"[ALTERNATIVE #{alternatives_tried}] Running {alt_iterations} refinement iterations...")
+                    
+                    alt_stuck = 0
+                    alt_prev_failed = set()
+                    
+                    for alt_iter in range(alt_iterations):
+                        alt_success, alt_output = run_tests()
+                        alt_results = parse_test_results(alt_output)
+                        print(f"[ALTERNATIVE #{alternatives_tried}] Iteration {alt_iter+1}/{alt_iterations}: {alt_results['passed']}/{alt_results['total']} passed")
+                        
+                        if alt_results['failed_tests']:
+                            print(f"[ALTERNATIVE #{alternatives_tried}] ✗ Failed: {', '.join(alt_results['failed_tests'][:3])}" + 
+                                  (f" (+{len(alt_results['failed_tests'])-3} more)" if len(alt_results['failed_tests']) > 3 else ""))
+                        
+                        if alt_success:
+                            print(f"[ALTERNATIVE #{alternatives_tried}] ✓ All tests passed!")
+                            break
+                        
+                        # Check if alternative is also stuck
+                        alt_curr_failed = set(alt_results['failed_tests'])
+                        if alt_curr_failed == alt_prev_failed:
+                            alt_stuck += 1
+                            if alt_stuck >= 2:
+                                print(f"[ALTERNATIVE #{alternatives_tried}] Stuck on same {len(alt_curr_failed)} test(s), stopping early")
+                                break
+                        else:
+                            alt_stuck = 0
+                        alt_prev_failed = alt_curr_failed
+                        
+                        # Try to fix alternative architecture
+                        print(f"[ALTERNATIVE #{alternatives_tried}] Analyzing failures and generating fix...")
+                        alt_fixed = apply_fix(problem_statement, alt_output, relevant_files)
+                        if alt_fixed:
+                            relevant_files.update(alt_fixed)
+                            write_files(alt_fixed)
+                        else:
+                            print(f"[ALTERNATIVE #{alternatives_tried}] Could not generate fix")
+                            break
+                    
+                    # Final test of alternative
+                    final_success, final_output = run_tests()
+                    final_results = parse_test_results(final_output)
+                    
+                    # Record this architecture attempt
+                    tried_architectures[arch_name] = final_results['passed']
+                    
+                    print(f"\n[COMPARISON] Original: {best_score}/{test_results['total']} | {arch_name}: {final_results['passed']}/{final_results['total']}")
+                    
+                    # Keep the better solution
+                    if final_results['passed'] > best_score:
+                        print(f"[ALTERNATIVE #{alternatives_tried}] ✓ Better! Continuing with '{arch_name}'...")
+                        stuck_count = 0
+                        previous_failed = set(final_results['failed_tests'])
+                        continue
+                    else:
+                        print(f"[ALTERNATIVE #{alternatives_tried}] ✗ Not better, reverting...")
+                        relevant_files.update(best_solution)
+                        write_files(best_solution)
+                        stuck_count = 0
+                        previous_failed = current_failed
+                        continue
+                else:
+                    print(f"[STUCK] Could not generate alternative #{alternatives_tried}")
+                    
+            elif stuck_count >= 2 and alternatives_tried >= max_alternatives:
+                print(f"\n[STUCK] Tried {alternatives_tried} alternatives, all failed. Stopping.")
+                break
+        else:
+            stuck_count = 0
+        previous_failed = current_failed
+        
+        # Apply fix
+        print("[FIXING] Applying fix...")
+        fixed = apply_fix(problem_statement, output, relevant_files)
+        
+        if not fixed:
+            print("[WARNING] Could not generate fix")
+            break
+        
+        # Update files
+        write_files(fixed)
+        relevant_files.update(fixed)
+    
+    # Show summary of tried architectures
+    if tried_architectures:
+        print(f"\n[SUMMARY] Tried {len(tried_architectures)} alternative architecture(s):")
+        for arch_name, score in tried_architectures.items():
+            print(f"  - {arch_name}: {score} tests passed")
+    
+    # Return final patch
+    patch = get_git_diff()
+    print(f"\n[COMPLETE] Generated patch ({len(patch)} bytes)")
+    return patch
 
 def find_relevant_files(problem_statement: str) -> Dict[str, str]:
     """Find files relevant to the problem."""
@@ -1500,6 +1647,11 @@ Generate the test:"""
     except Exception as e:
         print(f"[ERROR] Test generation failed: {e}")
         return {}
+
+def apply_fix(problem_statement: str, test_output: str, current_files: Dict[str, str]) -> Dict[str, str]:
+    """Apply fix based on test failures - unified with fix_test_failures."""
+    # Reuse the better CoT-based fix_test_failures function
+    return fix_test_failures(problem_statement, test_output, current_files)
 
 # ============================================================================
 # Main Entry Point
@@ -1622,7 +1774,7 @@ def generate_testcases_with_multi_step_reasoning(problem_statement: str, files_t
             testcases = testcases.strip()
             
             lines = testcases.split("\n")
-            if not lines[0].endswith(".py"):
+            if lines[0].endswith(".py") == False:
                 retry += 1
                 test_generation_messages.append({"role": "assistant", "content": testcode_checked_response})
                 test_generation_messages.append({"role": "user", "content": f"Include file name in the response. example:\n```python\ntest_a.py\ncontents of test_a.py\n\ntest_b.py\ncontents of test_b.py\n```"})
