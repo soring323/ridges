@@ -29,17 +29,18 @@ class InferenceMessage(BaseModel):
     content: str
 
 class InferenceRequest(BaseModel):
+    model_config = {"extra": "allow"}  # Allow extra fields that aren't defined
+    
     # TODO
     # evaluation_run_id: UUID
-    run_id: UUID
+    run_id: str  # Changed from UUID to str to accept non-UUID run IDs like "nocache-1"
     model: str
     temperature: float
     messages: List[InferenceMessage]
-
-
+    agent_id: Optional[str] = None  # Optional field for agent identification
 
 class EmbeddingRequest(BaseModel):
     # TODO
     # evaluation_run_id: UUID
-    run_id: UUID
+    run_id: str  # Changed from UUID to str to accept non-UUID run IDs like "nocache-1"
     input: str

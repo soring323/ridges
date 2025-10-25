@@ -296,7 +296,7 @@ The problem statement bug is just ONE bug. If your fix creates OTHER bugs (faili
 ## Your Validation Method
 
 **PRIMARY (The Only Thing That Matters):**
-- `run_repo_tests_for_fixing(file_paths=['./tests/...'])` on existing test files
+- `run_repo_tests(file_paths=['./tests/...'])` on existing test files
 - These tests were passing BEFORE you started
 - They MUST pass AFTER you finish
 - This is your SUCCESS CRITERIA
@@ -305,7 +305,7 @@ The problem statement bug is just ONE bug. If your fix creates OTHER bugs (faili
 - `generate_validation_test()` + `run_validation_test()` 
 - ONLY use if the problem statement bug has no existing test
 - This validates your specific fix works
-- BUT: Even if this passes, you're NOT done until run_repo_tests_for_fixing passes
+- BUT: Even if this passes, you're NOT done until run_repo_tests passes
 
 ## The Critical Truth
 
@@ -315,18 +315,18 @@ Result: You FAILED. The codebase is WORSE than before.
 ## Your Workflow
 1. **Read problem statement** - understand the bug
 2. **Find and fix** the root cause
-3. **Run run_repo_tests_for_fixing()** - validate NO tests are broken
+3. **Run run_repo_tests()** - validate NO tests are broken
 4. **If ANY test fails** - you broke it, fix it or revise your approach
 5. **(Optional) Generate validation test** - only if problem statement has no test
 6. **Call submit_solution** - only when ALL tests pass
 
 ## The Rules (No Exceptions)
 
-1. After code change → run run_repo_tests_for_fixing()
+1. After code change → run run_repo_tests()
 2. If even ONE test fails → YOU broke it (no excuses about "unrelated")
 3. Cannot call submit_solution with failing tests → it will be REJECTED automatically
 4. "Problem statement fixed but tests fail" → YOU FAILED
-5. "My validation test passed" → IRRELEVANT if run_repo_tests_for_fixing fails
+5. "My validation test passed" → IRRELEVANT if run_repo_tests fails
 
 ## Common Wrong Excuses (DO NOT MAKE THESE)
 
@@ -1333,7 +1333,7 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
         4. That's it!
         DO NOT use TestCase classes
         
-        WARNING: This is NOT your success criteria! You MUST run run_repo_tests_for_fixing() and pass ALL existing tests.
+        WARNING: This is NOT your success criteria! You MUST run run_repo_tests() and pass ALL existing tests.
         Arguments:
             test_code: MINIMAL Python code (imports + direct function calls + print/assert)
             description: what you're testing
@@ -1385,11 +1385,11 @@ To run this validation test, use:
 ⚠️ CRITICAL REMINDERS:
 1. This test is for YOUR debugging only - NOT your success criteria
 2. Passing this test does NOT mean you're done!
-3. You MUST still run run_repo_tests_for_fixing() on existing tests
+3. You MUST still run run_repo_tests() on existing tests
 4. You MUST pass ALL existing repository tests before calling finish_for_fixing
 5. This test will NOT be included in the final patch
 
-Think of this as "scratch paper" - helpful for debugging, but the real test is run_repo_tests_for_fixing()!"""
+Think of this as "scratch paper" - helpful for debugging, but the real test is run_repo_tests()!"""
 
     @EnhancedToolManager.tool
     def get_file_content(self,file_path: str, search_start_line: int = None, search_end_line: int = None, search_term: str = None)->str:
@@ -1523,7 +1523,7 @@ Think of this as "scratch paper" - helpful for debugging, but the real test is r
         return classes
 
     @EnhancedToolManager.tool
-    def run_repo_tests_for_fixing(self,file_paths:List[str])->str:
+    def run_repo_tests(self,file_paths:List[str])->str:
         '''
         Runs the tests for the repository. This tool will only run the tests for the files provided.
         Arguments:
@@ -1531,304 +1531,27 @@ Think of this as "scratch paper" - helpful for debugging, but the real test is r
         Output:
             Returns the stdout/stderr from the executed files.
         '''
-        # Optionally capture runtime failure state snapshots and attach to the enhanced output.
-        capture_flag = os.getenv("KINDNESS_CAPTURE_RUNTIME_STATE", "0") == "1"
-        send_flag = os.getenv("KINDNESS_SEND_STATE_TO_LLM", "0") == "1"
 
-        if self.test_runner == "pytest":
-            print("CMD: pytest ", file_paths)
-            # If capture_flag is enabled, run pytest in-process with a small plugin
-            if capture_flag:
-                try:
-                    # Local simple pytest plugin to capture locals on failing tests
-                    class FailureStateCollector:
-                        def __init__(self):
-                            self.failures: List[dict] = []
-
-                        def pytest_runtest_makereport(self, item, call):
-                            # only inspect the actual test call phase
-                            if call.when != "call":
-                                return
-                            if not getattr(call, 'excinfo', None):
-                                return
-                            try:
-                                tb = call.excinfo.traceback
-                            except Exception:
-                                tb = None
-
-                            user_frame = None
-                            last_entry = None
-                            if tb:
-                                # Try to find the first user frame (skip pytest internals)
-                                for entry in reversed(tb):
-                                    last_entry = entry
-                                    try:
-                                        path = str(entry.path)
-                                    except Exception:
-                                        path = ''
-                                    if 'site-packages' in path or 'pytest' in path:
-                                        continue
-                                    user_frame = getattr(entry, '_frame', None)
-                                    break
-                                if user_frame is None and last_entry is not None:
-                                    user_frame = getattr(last_entry, '_frame', None)
-
-                            # environment-controlled heuristics
-                            max_vars = int(os.getenv('KINDNESS_LOCALS_TOP_N', '10'))
-                            per_var_max = int(os.getenv('KINDNESS_PER_VAR_REPR', '300'))
-                            overall_max_chars = int(os.getenv('KINDNESS_MAX_STATE_CHARS', '5000'))
-                            include_referenced = os.getenv('KINDNESS_INCLUDE_REFERENCED_VARS', '1') == '1'
-
-                            referenced_names = set()
-                            failing_line_text = None
-                            if last_entry is not None:
-                                try:
-                                    p = str(last_entry.path)
-                                    ln = getattr(last_entry, 'lineno', None)
-                                    if p and ln:
-                                        try:
-                                            with open(p, 'r', encoding='utf-8') as _f:
-                                                lines = _f.readlines()
-                                            if 0 < ln <= len(lines):
-                                                failing_line_text = lines[ln-1].strip()
-                                        except Exception:
-                                            failing_line_text = None
-                                except Exception:
-                                    failing_line_text = None
-
-                            if failing_line_text and include_referenced:
-                                # find simple variable-like tokens in the failing line
-                                import re
-                                for m in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\b", failing_line_text):
-                                    referenced_names.add(m.group(1))
-
-                            locals_candidates = []
-                            if user_frame is not None:
-                                for k, v in list(user_frame.f_locals.items()):
-                                    if k.startswith('__'):
-                                        continue
-                                    # redact likely secrets
-                                    if re.search(r'(token|password|passwd|secret|key|apikey|credential|auth|cookie)', k, re.I):
-                                        val = '<redacted>'
-                                    else:
-                                        try:
-                                            raw = repr(v)
-                                        except Exception:
-                                            raw = f'<unreprable:{type(v).__name__}>'
-                                        # per-variable truncation
-                                        val = raw[:per_var_max]
-                                    locals_candidates.append((k, type(v).__name__, val))
-
-                            # pick variables: referenced first, then by repr length
-                            selected = []
-                            if include_referenced and referenced_names:
-                                for name in referenced_names:
-                                    for idx, (k, tname, val) in enumerate(locals_candidates):
-                                        if k == name:
-                                            selected.append((k, tname, val))
-                                            locals_candidates[idx] = None
-                                            break
-                                # remove None
-                                locals_candidates = [x for x in locals_candidates if x]
-
-                            # fill up to max_vars by largest repr
-                            locals_candidates.sort(key=lambda x: len(x[2]) if x else 0, reverse=True)
-                            for k_t_v in locals_candidates:
-                                if len(selected) >= max_vars:
-                                    break
-                                selected.append(k_t_v)
-
-                            # ensure overall size limit
-                            total_chars = 0
-                            locals_snapshot = {}
-                            for k, tname, val in selected:
-                                if total_chars + len(val) > overall_max_chars:
-                                    # truncate to fit remaining budget
-                                    remaining = max(0, overall_max_chars - total_chars)
-                                    if remaining <= 0:
-                                        break
-                                    val = val[:remaining]
-                                locals_snapshot[k] = {'type': tname, 'repr': Utils.limit_strings(val, n=1000)}
-                                total_chars += len(val)
-
-                            failure = {
-                                'nodeid': getattr(item, 'nodeid', None) if item is not None else None,
-                                'file': str(getattr(item, 'fspath', None)) if item is not None else None,
-                                'when': getattr(call, 'when', None),
-                                'exc_type': type(call.excinfo.value).__name__ if getattr(call, 'excinfo', None) else None,
-                                'exc_msg': str(call.excinfo.value) if getattr(call, 'excinfo', None) else None,
-                                'traceback': ''.join(traceback.format_exception(call.excinfo.type, call.excinfo.value, call.excinfo.tb)) if getattr(call, 'excinfo', None) else None,
-                                'locals': locals_snapshot,
-                                'failing_line': failing_line_text,
-                                'captured_at': datetime.utcnow().isoformat() + 'Z'
-                            }
-                            self.failures.append(failure)
-
-                    # Run pytest programmatically and capture stdout/stderr
-                    import pytest as _pytest
-                    collector = FailureStateCollector()
-                    args = []
-                    args.extend(list(file_paths))
-                    # Keep exit on errors; collect verbose output
-                    args.extend(['-q', '-p', 'no:warnings'])
-                    buf_out = io.StringIO()
-                    buf_err = io.StringIO()
-                    with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
-                        # pytest.main returns an exit code
-                        exit_code = _pytest.main(args=args, plugins=[collector])
-                    output = buf_out.getvalue() + buf_err.getvalue()
-                    # attach captured failures into enhanced output if any
-                    enhanced_output = self._enhance_test_output(output, file_paths)
-                    if collector.failures:
-                        try:
-                            summary = json.dumps(collector.failures, ensure_ascii=False)
-                        except Exception:
-                            summary = str(collector.failures)
-                        # save locally
-                        try:
-                            tmpdir = tempfile.mkdtemp(prefix='kindness_fail_')
-                            path = os.path.join(tmpdir, 'failure_states.json')
-                            with open(path, 'w', encoding='utf-8') as f:
-                                f.write(summary)
-                            logger.info(f'Captured failure state written to {path}')
-                        except Exception:
-                            logger.exception('Unable to write failure state to tmp file')
-
-                        if send_flag:
-                            enhanced_output = enhanced_output + "\n\n" + "RUNTIME_FAILURE_STATES_JSON:\n" + summary
-
-                    has_failures = any(indicator in output for indicator in ["FAIL:", "expected failures"])
-                    failure_count = 0
-                    if has_failures:
-                        import re
-                        fail_patterns = [
-                            r'(\d+)\s+failed',
-                            r'FAILED.*\(failures=(\d+)\)',
-                        ]
-                        for pattern in fail_patterns:
-                            match = re.search(pattern, output, re.IGNORECASE)
-                            if match:
-                                failure_count = int(match.group(1))
-                                break
-                        if failure_count == 0:
-                            failure_count = output.count("FAIL:")
-
-                    self.last_test_results = {
-                        'has_failures': has_failures,
-                        'failure_count': failure_count,
-                        'file_paths': file_paths,
-                        'captured_failures': collector.failures
-                    }
-                    return enhanced_output
-                except Exception as e:
-                    logger.exception(f"Error running pytest with FailureStateCollector: {e}")
-                    # fallback to subprocess mode below
-            # Run pytest directly without using a shell to avoid quoting/injection issues
-            cmd = ["pytest"] + list(file_paths)
-            result = subprocess.run(cmd, shell=False, capture_output=True, text=True, timeout=90)
-            output = (result.stdout or "") + (result.stderr or "")
-        elif self.test_runner == "unittest":
-            print("CMD: python ", file_paths)
-            output = ""
-            for file_path in file_paths:
-                result = subprocess.run(
-                    ["python", file_path],
-                    capture_output=True,
-                    text=True,
-                    timeout=60
-                )
-                current_output = (result.stdout or "") + (result.stderr or "")
-                output += current_output
-        else:
-            if self.test_runner_mode == "MODULE":
-                modules = [filepath_to_module(f, os.getcwd(), self.test_runner) for f in file_paths]
-                # cmd = f"{self.test_runner} {' '.join(modules)}"
-                cmd = f"{self.test_runner} {' '.join(modules)} -v 2"
-                print("CMD: ", cmd)
-                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=90)
-                output = (result.stdout or "") + (result.stderr or "")
-            else:
-                files_to_test = [clean_filepath(f, os.getcwd(), self.test_runner) for f in file_paths]
-                # cmd = f"{self.test_runner} {' '.join(files_to_test)}"
-                cmd = f"{self.test_runner} {' '.join(files_to_test)} -v 2"
-                print("CMD: ", cmd)
-                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=90)
-                output = (result.stdout or "") + (result.stderr or "")
+        logger.info(f"run_repo_test called with file_paths: {file_paths}")
         
-        enhanced_output = self._enhance_test_output(output, file_paths)
-        has_failures = any(indicator in output for indicator in ["FAIL:", "expected failures"])
-        failure_count = 0
-        if has_failures:
-            import re
-            
-            fail_patterns = [
-                r'(\d+)\s+failed',
-                r'FAILED.*\(failures=(\d+)\)',
-            ]
-            for pattern in fail_patterns:
-                match = re.search(pattern, output, re.IGNORECASE)
-                if match:
-                    failure_count = int(match.group(1))
-                    break
-            
-            if failure_count == 0:
-                failure_count = output.count("FAIL:")
-            
-            expected_failure_match = re.search(r'expected failures[=\s]+(\d+)', output, re.IGNORECASE)
-            if expected_failure_match:
-                failure_count += int(expected_failure_match.group(1))
+        engine = NeuronExecutionEngine()
+        output = ""
+
+        for file_path in file_paths:
+            failures = engine.run_tests_with_context(file_path)
+            for failure in failures:
+                output += "\n" + engine.analyze_failure(failure)
         
-        self.last_test_results = {
-            'has_failures': has_failures,
-            'failure_count': failure_count,
-            'file_paths': file_paths
-        }
+        # self.last_test_results = {
+        #     'has_failures': has_failures,
+        #     'failure_count': failure_count,
+        #     'file_paths': file_paths
+        # }
+
+        logger.info(f"run_repo_test output: {output}")
         
-        return enhanced_output
+        return output.strip() if output else "All tests passed successfully."
 
-    def format_failure_states_for_prompt(self, max_chars: int = 3000) -> Optional[str]:
-        """
-        Create a compact, safe summary of captured failure states suitable for including
-        in an LLM prompt. The summary is JSON-like text and is truncated to max_chars.
-        """
-        if not hasattr(self, 'last_test_results'):
-            return None
-        failures = self.last_test_results.get('captured_failures') or []
-        if not failures:
-            return None
-
-        summary = []
-        for f in failures:
-            locals_list = []
-            for k, v in (f.get('locals') or {}).items():
-                if isinstance(v, dict):
-                    t = v.get('type')
-                    r = v.get('repr')
-                else:
-                    t = type(v).__name__
-                    r = str(v)
-                locals_list.append(f"{k} ({t}): {r}")
-
-            entry = {
-                'nodeid': f.get('nodeid'),
-                'file': f.get('file'),
-                'failing_line': f.get('failing_line'),
-                'exc_type': f.get('exc_type'),
-                'exc_msg': (f.get('exc_msg') or '')[:200],
-                'locals': locals_list[:20]
-            }
-            summary.append(entry)
-
-        try:
-            text = json.dumps(summary, ensure_ascii=False)
-        except Exception:
-            text = str(summary)
-
-        if len(text) > max_chars:
-            text = text[:max_chars] + '...'
-
-        return "RUNTIME_FAILURE_SUMMARY_JSON:\n" + text
-    
     @EnhancedToolManager.tool
     def search_in_all_files_content(self, search_term: str, case_sensitive: bool = False) -> str:
         '''
@@ -1901,7 +1624,7 @@ Think of this as "scratch paper" - helpful for debugging, but the real test is r
         if not hasattr(self, 'last_test_results'):
             raise EnhancedToolManager.Error(
                 EnhancedToolManager.Error.ErrorType.INVALID_TOOL_CALL.name,
-                "❌ ERROR: You must run run_repo_tests_for_fixing() before submitting your solution!\n\n"
+                "❌ ERROR: You must run run_repo_tests() before submitting your solution!\n\n"
                 "You cannot submit without verifying that all repository tests pass."
             )
         
@@ -1911,7 +1634,7 @@ Think of this as "scratch paper" - helpful for debugging, but the real test is r
                 EnhancedToolManager.Error.ErrorType.INVALID_TOOL_CALL.name,
                 f"❌ ERROR: Cannot submit solution - {failing_count} test(s) are still FAILING!\n\n"
                 f"Last test run showed failures. You MUST fix all failing tests before submitting.\n"
-                f"Run run_repo_tests_for_fixing() again after fixing the issues to verify all tests pass.\n\n"
+                f"Run run_repo_tests() again after fixing the issues to verify all tests pass.\n\n"
                 f"DO NOT try to submit with failing tests - this will always be rejected!"
             )
         
@@ -2231,47 +1954,6 @@ Think of this as "scratch paper" - helpful for debugging, but the real test is r
             logger.error(f"Error extracting test data: {e}")
             return None
         
-    @EnhancedToolManager.tool
-    def run_repo_tests(self,file_paths:List[str])->str:
-        '''
-        Runs the tests for the repository. This tool will only run the tests for the files provided.
-        Arguments:
-            file_paths: path of the files to run the tests for.
-        Output:
-            Returns the stdout/stderr from the executed files.
-        '''
-        if self.test_runner == "pytest":
-            print("CMD: pytest ", file_paths)
-            cmd = ["pytest"] + list(file_paths)
-            result = subprocess.run(cmd, shell=False, capture_output=True, text=True, timeout=90)
-            output = (result.stdout or "") + (result.stderr or "")
-        elif self.test_runner == "unittest":
-            print("CMD: python ", file_paths)
-            output = ""
-            for file_path in file_paths:
-                result = subprocess.run(
-                    ["python", file_path],
-                    capture_output=True,
-                    text=True,
-                    timeout=60
-                )
-                current_output = (result.stdout or "") + (result.stderr or "")
-                output += current_output
-        else:
-            if self.test_runner_mode == "MODULE":
-                modules = [filepath_to_module(f, os.getcwd(), self.test_runner) for f in file_paths]
-                cmd = f"{self.test_runner} {' '.join(modules)}"
-                print("CMD: ", cmd)
-                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=90)
-                output = (result.stdout or "") + (result.stderr or "")
-            else:
-                files_to_test = [clean_filepath(f, os.getcwd(), self.test_runner) for f in file_paths]
-                cmd = f"{self.test_runner} {' '.join(files_to_test)}"
-                print("CMD: ", cmd)
-                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=90)
-                output = (result.stdout or "") + (result.stderr or "")
-        return output
-
     def _enhance_test_output(self, test_output: str, file_paths: List[str]) -> str:
         try:
             has_failures = any(indicator in test_output for indicator in 
@@ -2559,10 +2241,10 @@ Think of this as "scratch paper" - helpful for debugging, but the real test is r
                 output += "This validation test passing does NOT mean you are done!\n"
                 output += "This is NOT your success criteria!\n\n"
                 output += "⚠️ YOU MUST NOW:\n"
-                output += "1. Run run_repo_tests_for_fixing() on the relevant existing test files\n"
+                output += "1. Run run_repo_tests() on the relevant existing test files\n"
                 output += "2. Ensure ALL existing repository tests PASS (ZERO failures)\n"
                 output += "3. If ANY test fails, you MUST fix it or revise your entire approach\n"
-                output += "4. ONLY call finish_for_fixing after run_repo_tests_for_fixing shows ZERO failures\n\n"
+                output += "4. ONLY call finish_for_fixing after run_repo_tests shows ZERO failures\n\n"
                 output += "❌ DO NOT call finish_for_fixing just because this validation test passed!\n"
                 output += "❌ DO NOT think 'the original issue is fixed, so I'm done'!\n"
                 output += "❌ DO NOT ignore failing repository tests with excuses like 'edge cases' or 'unrelated'!\n"
@@ -2571,7 +2253,7 @@ Think of this as "scratch paper" - helpful for debugging, but the real test is r
             else:
                 output += "❌ Validation test FAILED\n\n"
                 output += "This means your fix has issues. Debug and fix them.\n"
-                output += "After fixing, you MUST ALSO run run_repo_tests_for_fixing() to verify existing tests pass!\n"
+                output += "After fixing, you MUST ALSO run run_repo_tests() to verify existing tests pass!\n"
             
             return output
             
@@ -3226,7 +2908,7 @@ def fix_task_solve_for_fixing_workflow(problem_statement: str, *, timeout: int, 
             "search_in_all_files_content",
             "search_in_specified_file_v2",
             "start_over",
-            "run_repo_tests_for_fixing",
+            "run_repo_tests",
             "run_code",
             "generate_validation_test",
             "run_validation_test",
@@ -3260,14 +2942,6 @@ def fix_task_solve_for_fixing_workflow(problem_statement: str, *, timeout: int, 
             ]
         
         messages.extend(cot.to_str())
-        # If the tool manager has captured failure states, include a compact summary for the LLM
-        try:
-            failure_prompt = tool_manager.format_failure_states_for_prompt(max_chars=int(os.getenv("KINDNESS_PROMPT_MAX_CHARS","2000")))
-            if failure_prompt:
-                messages.append({"role": "user", "content": failure_prompt})
-        except Exception as e:
-            logger.debug(f"Unable to format failure states for prompt: {e}")
-
         messages.append({"role": "system", "content": STOP_INSTRUCTION})
     
         if cot.is_thought_repeated():
@@ -3291,8 +2965,14 @@ def fix_task_solve_for_fixing_workflow(problem_statement: str, *, timeout: int, 
             if '"' in next_tool_name or "'" in next_tool_name:
                 next_tool_name=next_tool_name.replace('"','')
                 next_tool_name=next_tool_name.replace("'","")
-                
+            
+            logger.info("next_tool_name========>: ", next_tool_name)
+            if next_tool_name == "run_repo_tests":
+                logger.info("[CRITICAL] Workflow called run_repo_tests operation")
+                logger.info(f"next_tool args: {next_tool_args}")
+                # next_tool_args = {"file_path": os.getcwd()}
             next_observation = tool_manager.get_tool(next_tool_name)(**next_tool_args) if next_tool_args else tool_manager.get_tool(next_tool_name)()
+            logger.info("next_observation========>: ", next_observation)
             logger.info(f"next_observation: {next_observation}")
             cot.add_action(EnhancedCOT.Action(next_thought=next_thought,next_tool_name=next_tool_name,next_tool_args=next_tool_args,observation=next_observation,is_error=False,raw_response=raw_text,total_attempts=total_attempts,inference_error_counter=error_counter,request_data=messages))
         except EnhancedToolManager.Error as e:
@@ -3557,14 +3237,6 @@ def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: s
             ]
         
         messages.extend(cot.to_str())
-        # If the tool manager has captured failure states, include a compact summary for the LLM
-        try:
-            failure_prompt = tool_manager.format_failure_states_for_prompt(max_chars=int(os.getenv("KINDNESS_PROMPT_MAX_CHARS","2000")))
-            if failure_prompt:
-                messages.append({"role": "user", "content": failure_prompt})
-        except Exception as e:
-            logger.debug(f"Unable to format failure states for prompt: {e}")
-
         messages.append({"role": "system", "content": STOP_INSTRUCTION})
     
         if cot.is_thought_repeated():
@@ -3680,3 +3352,682 @@ def generate_initial_solution(problem_statement: str, code_skeleton: str) -> str
 def git_reset():
     pass
     # os.system("git reset --hard")
+
+import pytest
+import threading
+
+class ExecutionTracer:
+    """Traces execution to capture variable states"""
+    
+    def __init__(self, src_dir: str):
+        self.src_dir = os.path.abspath(src_dir)
+        self.captured_frames = []
+        self.is_tracing = False
+        self._lock = threading.Lock()
+        
+    def should_trace_file(self, filename: str) -> bool:
+        """Check if file should be traced"""
+        if not filename or filename == '<string>':
+            return False
+        
+        abs_filename = os.path.abspath(filename)
+        
+        # Must be in src directory
+        if not abs_filename.startswith(self.src_dir):
+            return False
+        
+        # Skip test files
+        basename = os.path.basename(filename)
+        if 'test_' in basename or '_test' in basename:
+            return False
+        
+        return filename.endswith('.py')
+    
+    def trace_calls(self, frame, event, arg):
+        """Trace function"""
+        if not self.is_tracing:
+            return None
+            
+        filename = frame.f_code.co_filename
+        
+        if event in ('call', 'line', 'return') and self.should_trace_file(filename):
+            try:
+                local_copy = frame.f_locals.copy()
+            except:
+                local_copy = {}
+            
+            frame_info = {
+                'event': event,
+                'file': filename,
+                'function': frame.f_code.co_name,
+                'line': frame.f_lineno,
+                'locals': self._serialize_locals(local_copy)
+            }
+            with self._lock:
+                self.captured_frames.append(frame_info)
+        
+        return self.trace_calls
+    
+    def _serialize_locals(self, local_vars: Dict[str, Any]) -> Dict[str, str]:
+        """Serialize local variables with detailed object inspection"""
+        from functools import partial
+        
+        def serialize_value(val, depth=0, max_depth=2):
+            """Recursively serialize a value with detailed inspection"""
+            if depth > max_depth:
+                return f"<{type(val).__name__}>"
+            
+            try:
+                # Primitives
+                if isinstance(val, (str, int, float, bool, type(None))):
+                    return repr(val)
+                
+                # Collections
+                elif isinstance(val, (list, tuple)):
+                    if len(val) == 0:
+                        return repr(val)
+                    # Serialize first few items with detail
+                    items = [serialize_value(item, depth+1) for item in val[:3]]
+                    result = f"[{', '.join(items)}"
+                    if len(val) > 3:
+                        result += f", ...{len(val)-3} more"
+                    result += "]"
+                    return result if len(result) < 300 else result[:300] + "..."
+                
+                elif isinstance(val, dict):
+                    if len(val) == 0:
+                        return "{}"
+                    items = [f"{repr(k)}: {serialize_value(v, depth+1)}" for k, v in list(val.items())[:3]]
+                    result = f"{{{', '.join(items)}"
+                    if len(val) > 3:
+                        result += f", ...{len(val)-3} more"
+                    result += "}"
+                    return result if len(result) < 300 else result[:300] + "..."
+                
+                elif isinstance(val, set):
+                    items = [serialize_value(item, depth+1) for item in list(val)[:3]]
+                    result = f"{{{', '.join(items)}"
+                    if len(val) > 3:
+                        result += f", ...{len(val)-3} more"
+                    result += "}"
+                    return result if len(result) < 300 else result[:300] + "..."
+                
+                # Functions and methods
+                elif callable(val):
+                    if isinstance(val, partial):
+                        func_name = getattr(val.func, '__name__', str(val.func))
+                        args_repr = f"args={val.args}" if val.args else ""
+                        kwargs_repr = f"kwargs={val.keywords}" if val.keywords else ""
+                        parts = [p for p in [args_repr, kwargs_repr] if p]
+                        return f"<partial({func_name}, {', '.join(parts)})>"
+                    else:
+                        func_name = getattr(val, '__name__', '?')
+                        module = getattr(val, '__module__', '')
+                        if module and module != '__main__':
+                            return f"<function {module}.{func_name}>"
+                        return f"<function {func_name}>"
+                
+                # Objects with __dict__
+                else:
+                    type_name = type(val).__name__
+                    try:
+                        # Try to get meaningful attributes
+                        obj_dict = vars(val) if hasattr(val, '__dict__') else {}
+                        if obj_dict:
+                            # Get non-private attributes
+                            public_attrs = {k: serialize_value(v, depth+1) 
+                                          for k, v in obj_dict.items() 
+                                          if not k.startswith('_')}
+                            if public_attrs:
+                                attrs_str = ', '.join(f"{k}={v}" for k, v in list(public_attrs.items())[:5])
+                                if len(public_attrs) > 5:
+                                    attrs_str += f", ...{len(public_attrs)-5} more attrs"
+                                result = f"<{type_name}({attrs_str})>"
+                                return result if len(result) < 400 else result[:400] + "...>"
+                    except:
+                        pass
+                    
+                    # Try repr as fallback
+                    try:
+                        repr_str = repr(val)
+                        if not repr_str.startswith('<') and len(repr_str) < 200:
+                            return repr_str
+                    except:
+                        pass
+                    
+                    return f"<{type_name}>"
+            
+            except Exception as e:
+                return f"<Error: {type(val).__name__}>"
+        
+        serialized = {}
+        for name, value in local_vars.items():
+            if name.startswith('__'):
+                continue
+            serialized[name] = serialize_value(value)
+        
+        return serialized
+    
+    def start(self):
+        with self._lock:
+            self.captured_frames = []
+            self.is_tracing = True
+        # Set trace for current thread
+        sys.settrace(self.trace_calls)
+        # Set trace for all new threads created after this point
+        threading.settrace(self.trace_calls)
+    
+    def stop(self):
+        with self._lock:
+            self.is_tracing = False
+        sys.settrace(None)
+        threading.settrace(None)
+        with self._lock:
+            return self.captured_frames.copy()
+
+
+class StandaloneLocalVariableCapture:
+    """Standalone plugin that can be injected programmatically"""
+    
+    def __init__(self, src_dir: str = None):
+        """
+        Initialize the plugin
+        
+        Args:
+            src_dir: Directory to trace. If None, will try to auto-detect
+                    Common locations: "src", "lib", or project root
+        """
+        self.src_dir = src_dir or self._auto_detect_src_dir()
+        self.failed_tests = []
+        self.current_tracer = None
+        
+        import logging
+        self.logger = logging.getLogger(__name__)
+        self.logger.setLevel(logging.DEBUG)
+        
+        # Add console handler if not already present
+        if not self.logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setLevel(logging.DEBUG)
+            formatter = logging.Formatter('%(levelname)s - %(message)s')
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
+        
+        self.logger.info(f"🔧 Plugin initialized! src_dir={self.src_dir}")
+    
+    def _auto_detect_src_dir(self) -> str:
+        """Auto-detect source directory"""
+        project_root = Path.cwd()
+        
+        # Check common source directories
+        for candidate in ['src', 'lib', 'app', 'source', 'repo']:
+            candidate_path = project_root / candidate
+            if candidate_path.exists() and candidate_path.is_dir():
+                # Check if it has Python files
+                if any(candidate_path.glob('*.py')):
+                    return str(candidate_path)
+        
+        # Default to project root
+        return str(project_root)
+    
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_runtest_call(self, item):
+        """
+        CALLED FOR EVERY TEST - during the 'call' phase (actual test execution)
+        This is where we start tracing before the test runs
+        """
+        self.logger.info(f"📞 pytest_runtest_call called for: {item.nodeid}")
+        
+        self.current_tracer = ExecutionTracer(self.src_dir)
+        self.current_tracer.start()
+        self.logger.debug(f"   ✓ Started tracing src_dir: {self.src_dir}")
+        
+        try:
+            yield
+        finally:
+            if self.current_tracer:
+                frames = self.current_tracer.stop()
+                self.logger.debug(f"   ✓ Stopped tracing. Captured {len(frames)} frames")
+    
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_runtest_makereport(self, item, call):
+        """
+        CALLED 3 TIMES PER TEST - for 'setup', 'call', 'teardown' phases
+        We only process the 'call' phase when it fails
+        """
+        self.logger.debug(f"📊 pytest_runtest_makereport called: {item.nodeid} (phase: {call.when})")
+        
+        outcome = yield
+        report = outcome.get_result()
+        
+        self.logger.debug(f"   Report: when={report.when}, passed={report.passed}, failed={report.failed}")
+        
+        if report.when == "call" and report.failed:
+            self.logger.info(f"❌ Test FAILED: {item.nodeid}")
+            self._capture_failure(item, call, report)
+    
+    def _capture_failure(self, item, call, report):
+        """Capture failure context"""
+        self.logger.info(f"💾 Capturing failure data for: {item.nodeid}")
+        
+        failure_info = {
+            'test_name': item.nodeid,
+            'test_function': item.name,
+            'file': str(item.fspath),
+            'line': item.location[1],
+            'error_message': str(call.excinfo.value),
+            'error_type': call.excinfo.typename,
+            'test_locals': {},
+            'source_file_locals': {},
+            'source_execution_trace': [],
+            'traceback_lines': [],
+            'failing_code_line': None,
+            'assertion_details': {}
+        }
+        
+        # Get test locals and traceback details
+        if call.excinfo:
+            tb = call.excinfo.traceback
+            if tb:
+                last_frame = tb[-1]
+                failure_info['test_locals'] = self._serialize_locals(
+                    last_frame.frame.f_locals
+                )
+                self.logger.debug(f"   ✓ Captured {len(failure_info['test_locals'])} test variables")
+                
+                # Capture traceback lines
+                try:
+                    tb_lines = []
+                    for entry in tb:
+                        tb_lines.append({
+                            'file': str(entry.path),
+                            'line': entry.lineno,
+                            'function': entry.frame.f_code.co_name,
+                            'code': entry.statement.strip() if hasattr(entry, 'statement') else None
+                        })
+                    failure_info['traceback_lines'] = tb_lines
+                    
+                    # Get the actual failing line
+                    if tb_lines:
+                        last_entry = tb_lines[-1]
+                        failure_info['failing_code_line'] = last_entry.get('code')
+                except Exception as e:
+                    self.logger.debug(f"   Could not capture traceback lines: {e}")
+                
+                # Parse assertion error for expected vs actual
+                if call.excinfo.typename == 'AssertionError':
+                    try:
+                        error_str = str(call.excinfo.value)
+                        # Try to parse pytest's assertion rewrite format
+                        if 'assert' in error_str.lower():
+                            failure_info['assertion_details'] = {
+                                'full_message': error_str
+                            }
+                            # Look for comparison patterns
+                            if '==' in error_str or '!=' in error_str:
+                                lines = error_str.split('\n')
+                                for line in lines:
+                                    if 'where' in line.lower() or '==' in line or '!=' in line:
+                                        if 'left' not in failure_info['assertion_details']:
+                                            failure_info['assertion_details']['comparison_info'] = line.strip()
+                    except:
+                        pass
+        
+        # Get source execution data
+        if self.current_tracer and self.current_tracer.captured_frames:
+            failure_info['source_execution_trace'] = self.current_tracer.captured_frames
+            self.logger.debug(f"   ✓ Captured {len(self.current_tracer.captured_frames)} trace frames")
+            
+            # Extract final variable states
+            source_locals = {}
+            for frame in self.current_tracer.captured_frames:
+                if frame['event'] == 'return':
+                    source_locals.update(frame['locals'])
+            
+            if not source_locals:
+                for frame in self.current_tracer.captured_frames:
+                    source_locals.update(frame['locals'])
+            
+            failure_info['source_file_locals'] = source_locals
+            self.logger.debug(f"   ✓ Captured {len(source_locals)} source variables")
+        else:
+            self.logger.warning(f"   ⚠️ No trace frames captured - check src_dir: {self.src_dir}")
+        
+        self.failed_tests.append(failure_info)
+        self.logger.info(f"   ✓ Failure data captured successfully")
+    
+    def _serialize_locals(self, local_vars: Dict[str, Any]) -> Dict[str, str]:
+        """Serialize locals with detailed object inspection"""
+        from functools import partial
+        
+        def serialize_value(val, depth=0, max_depth=2):
+            """Recursively serialize a value with detailed inspection"""
+            if depth > max_depth:
+                return f"<{type(val).__name__}>"
+            
+            try:
+                # Primitives
+                if isinstance(val, (str, int, float, bool, type(None))):
+                    return repr(val)
+                
+                # Collections
+                elif isinstance(val, (list, tuple)):
+                    if len(val) == 0:
+                        return repr(val)
+                    # Serialize first few items with detail
+                    items = [serialize_value(item, depth+1) for item in val[:3]]
+                    result = f"[{', '.join(items)}"
+                    if len(val) > 3:
+                        result += f", ...{len(val)-3} more"
+                    result += "]"
+                    return result if len(result) < 300 else result[:300] + "..."
+                
+                elif isinstance(val, dict):
+                    if len(val) == 0:
+                        return "{}"
+                    items = [f"{repr(k)}: {serialize_value(v, depth+1)}" for k, v in list(val.items())[:3]]
+                    result = f"{{{', '.join(items)}"
+                    if len(val) > 3:
+                        result += f", ...{len(val)-3} more"
+                    result += "}"
+                    return result if len(result) < 300 else result[:300] + "..."
+                
+                elif isinstance(val, set):
+                    items = [serialize_value(item, depth+1) for item in list(val)[:3]]
+                    result = f"{{{', '.join(items)}"
+                    if len(val) > 3:
+                        result += f", ...{len(val)-3} more"
+                    result += "}"
+                    return result if len(result) < 300 else result[:300] + "..."
+                
+                # Functions and methods
+                elif callable(val):
+                    if isinstance(val, partial):
+                        func_name = getattr(val.func, '__name__', str(val.func))
+                        args_repr = f"args={val.args}" if val.args else ""
+                        kwargs_repr = f"kwargs={val.keywords}" if val.keywords else ""
+                        parts = [p for p in [args_repr, kwargs_repr] if p]
+                        return f"<partial({func_name}, {', '.join(parts)})>"
+                    else:
+                        func_name = getattr(val, '__name__', '?')
+                        module = getattr(val, '__module__', '')
+                        if module and module != '__main__':
+                            return f"<function {module}.{func_name}>"
+                        return f"<function {func_name}>"
+                
+                # Objects with __dict__
+                else:
+                    type_name = type(val).__name__
+                    try:
+                        # Try to get meaningful attributes
+                        obj_dict = vars(val) if hasattr(val, '__dict__') else {}
+                        if obj_dict:
+                            # Get non-private attributes
+                            public_attrs = {k: serialize_value(v, depth+1) 
+                                          for k, v in obj_dict.items() 
+                                          if not k.startswith('_')}
+                            if public_attrs:
+                                attrs_str = ', '.join(f"{k}={v}" for k, v in list(public_attrs.items())[:5])
+                                if len(public_attrs) > 5:
+                                    attrs_str += f", ...{len(public_attrs)-5} more attrs"
+                                result = f"<{type_name}({attrs_str})>"
+                                return result if len(result) < 400 else result[:400] + "...>"
+                    except:
+                        pass
+                    
+                    # Try repr as fallback
+                    try:
+                        repr_str = repr(val)
+                        if not repr_str.startswith('<') and len(repr_str) < 200:
+                            return repr_str
+                    except:
+                        pass
+                    
+                    return f"<{type_name}>"
+            
+            except Exception as e:
+                return f"<Error: {type(val).__name__}>"
+        
+        serialized = {}
+        for name, value in local_vars.items():
+            if name.startswith('__'):
+                continue
+            serialized[name] = serialize_value(value)
+        
+        return serialized
+    
+    def get_results(self):
+        return self.failed_tests
+    
+    def save_to_file(self, filepath: str):
+        with open(filepath, 'w') as f:
+            json.dump(self.failed_tests, f, indent=2)
+
+
+# Example Neuron Execution Engine
+class NeuronExecutionEngine:
+    """AI coding agent execution engine"""
+    
+    def run_tests_with_context(self, test_path: str = "tests/"):
+        """Run pytest and capture failure context"""
+        # import subprocess
+        
+        # result = subprocess.run(
+        #     ['pytest', test_path, '-v'],
+        #     capture_output=True,
+        #     text=True
+        # )
+        
+        # print(result.stdout)
+        # print(result.stderr)
+        # if self.src_dir:
+        #     src_full_path = str(self.project_root / self.src_dir)
+        # else:
+        #     src_full_path = None  # Auto-detect
+        plugin = StandaloneLocalVariableCapture(src_dir=None)
+        pytest.main([
+            str(test_path),
+            '-v',
+            '-s',
+            '--tb=short',
+            '-p', 'no:cacheprovider'
+        ], plugins=[plugin])
+        
+        # Get failures directly from the plugin instead of reading from file
+        return plugin.get_results()
+    
+    def analyze_failure(self, failure_info: Dict[str, Any]):
+        """Analyze failure context for AI agent with structured LLM-friendly format"""
+        output_lines = []
+        output_lines.append("="*80)
+        logger.info(f"🔍 Analyzing: {failure_info['test_name']}")
+        
+        # Header with test identification
+        test_name = failure_info['test_name']
+        test_func = failure_info.get('test_function', test_name.split('::')[-1])
+        output_lines.append(f"### FAILED TEST: {test_name}")
+        output_lines.append("")
+        
+        # Error summary with failing code
+        error_type = failure_info['error_type']
+        error_msg = failure_info['error_message']
+        output_lines.append(f"**Error Type**: {error_type}")
+        output_lines.append(f"**Error Message**: {error_msg}")
+        
+        # Show the actual failing line of code
+        if failure_info.get('failing_code_line'):
+            output_lines.append(f"**Failing Line**: `{failure_info['failing_code_line']}`")
+        
+        # Show assertion details if available
+        if failure_info.get('assertion_details'):
+            assertion_info = failure_info['assertion_details']
+            if assertion_info.get('comparison_info'):
+                output_lines.append(f"**Comparison**: {assertion_info['comparison_info']}")
+        
+        output_lines.append("")
+        
+        # Context guidance based on error type
+        if error_type == "AssertionError":
+            output_lines.append("💡 **What This Means**: The test expected a different result than what your code produced.")
+            output_lines.append("   ACTION: Compare the 'expected' vs 'actual' values in test variables below.")
+        elif error_type == "IndexError":
+            output_lines.append("💡 **What This Means**: Code tried to access an index that doesn't exist in a list/array.")
+            output_lines.append("   ACTION: Check list lengths and index values in the variables below.")
+        elif error_type == "KeyError":
+            output_lines.append("💡 **What This Means**: Code tried to access a dictionary key that doesn't exist.")
+            output_lines.append("   ACTION: Check dictionary contents and the key being accessed.")
+        elif error_type == "AttributeError":
+            output_lines.append("💡 **What This Means**: Code tried to access an attribute/method that doesn't exist on an object.")
+            output_lines.append("   ACTION: Check object types and available attributes.")
+        elif error_type == "TypeError":
+            output_lines.append("💡 **What This Means**: Wrong type of value was used (e.g., using int where string expected).")
+            output_lines.append("   ACTION: Check types of variables involved in the operation.")
+        else:
+            output_lines.append(f"💡 **What This Means**: {error_type} occurred during test execution.")
+        output_lines.append("")
+        
+        # Source code state at failure
+        if failure_info['source_file_locals']:
+            output_lines.append("### 📊 SOURCE CODE STATE (Your Implementation)")
+            output_lines.append("These are the actual runtime values in your code when the error occurred:")
+            output_lines.append("")
+            
+            # Group variables by type for better readability
+            primitives = {}
+            collections = {}
+            objects = {}
+            
+            for var, val in failure_info['source_file_locals'].items():
+                val_str = str(val)
+                if val_str.startswith(('[', '{', '(')) or 'list' in val_str.lower():
+                    collections[var] = val
+                elif val_str.startswith('<') and '(' in val_str:
+                    objects[var] = val
+                else:
+                    primitives[var] = val
+            
+            if primitives:
+                output_lines.append("**Simple Values:**")
+                for var, val in primitives.items():
+                    output_lines.append(f"  • {var} = {val}")
+                output_lines.append("")
+            
+            if collections:
+                output_lines.append("**Collections (lists, dicts, etc):**")
+                for var, val in collections.items():
+                    output_lines.append(f"  • {var} = {val}")
+                output_lines.append("")
+            
+            if objects:
+                output_lines.append("**Objects (with their internal state):**")
+                for var, val in objects.items():
+                    output_lines.append(f"  • {var} = {val}")
+                output_lines.append("")
+        
+        # Test expectations
+        test_locals = {k: v for k, v in failure_info['test_locals'].items() 
+                       if not k.startswith('@') and not k.startswith('_')}
+        
+        if test_locals:
+            output_lines.append("### 🎯 TEST CONTEXT (What the test was checking)")
+            output_lines.append("These variables show what the test set up and what it expected:")
+            output_lines.append("")
+            for var_name, var_value in test_locals.items():
+                output_lines.append(f"  • {var_name} = {var_value}")
+            output_lines.append("")
+        
+        # Execution trace summary
+        if failure_info['source_execution_trace']:
+            trace_count = len(failure_info['source_execution_trace'])
+            output_lines.append(f"### 🔄 EXECUTION TRACE ({trace_count} events)")
+            output_lines.append("This shows the sequence of function calls in your code:")
+            output_lines.append("")
+            
+            # Show function call sequence
+            functions_called = []
+            last_func = None
+            for frame in failure_info['source_execution_trace']:
+                if frame['event'] == 'call':
+                    func_name = frame['function']
+                    if func_name != last_func:
+                        functions_called.append(func_name)
+                        last_func = func_name
+            
+            if functions_called:
+                output_lines.append("**Function Call Sequence:**")
+                output_lines.append("  " + " → ".join(functions_called[:10]))
+                if len(functions_called) > 10:
+                    output_lines.append(f"  ... and {len(functions_called) - 10} more function calls")
+                output_lines.append("")
+            
+            # Show key return values
+            return_frames = [f for f in failure_info['source_execution_trace'] if f['event'] == 'return']
+            if return_frames:
+                output_lines.append("**Key Return Values:**")
+                shown = 0
+                for frame in return_frames[-5:]:  # Show last 5 returns
+                    func = frame['function']
+                    locals_dict = frame.get('locals', {})
+                    # Look for return-related variables
+                    interesting_vars = {k: v for k, v in locals_dict.items() 
+                                      if not k.startswith('_') and k in ['result', 'output', 'value', 'ret', 'return_value']}
+                    if interesting_vars or shown < 3:  # Show at least first 3
+                        output_lines.append(f"  • {func}() returned with: {interesting_vars or 'locals hidden'}")
+                        shown += 1
+                output_lines.append("")
+        
+        # Traceback path
+        if failure_info.get('traceback_lines'):
+            tb_lines = failure_info['traceback_lines']
+            # Only show non-test files (source code)
+            source_tb = [t for t in tb_lines if 'test' not in t.get('file', '').lower()]
+            if source_tb:
+                output_lines.append("### 🗺️ ERROR LOCATION")
+                output_lines.append("The error originated in your source code at:")
+                output_lines.append("")
+                for entry in source_tb[-3:]:  # Show last 3 source frames
+                    file_name = entry['file'].split('/')[-1]
+                    func = entry['function']
+                    line = entry['line']
+                    code = entry.get('code', '???')
+                    output_lines.append(f"  📍 {file_name}:{line} in {func}()")
+                    output_lines.append(f"     → {code}")
+                output_lines.append("")
+        
+        # Pattern-based suggestions
+        output_lines.append("### 💡 COMMON FIXES FOR THIS ERROR TYPE")
+        if error_type == "IndexError":
+            output_lines.append("- Check if list is empty before accessing: `if my_list: value = my_list[0]`")
+            output_lines.append("- Verify loop range: use `range(len(list))` or `enumerate(list)`")
+            output_lines.append("- Check list length matches expected: add `.append()` calls if needed")
+        elif error_type == "AssertionError":
+            output_lines.append("- Look at the **Comparison** line above to see expected vs actual")
+            output_lines.append("- Check if return value or computation is correct")
+            output_lines.append("- Verify edge cases: empty inputs, zero values, boundary conditions")
+        elif error_type == "KeyError":
+            output_lines.append("- Use `.get(key, default)` instead of `[key]` for safe access")
+            output_lines.append("- Check if key should have been added earlier: `dict[key] = value`")
+            output_lines.append("- Verify spelling and case of dictionary keys")
+        elif error_type == "AttributeError":
+            output_lines.append("- Check if object was initialized properly in `__init__`")
+            output_lines.append("- Verify you're calling the right method name (check spelling)")
+            output_lines.append("- Ensure object is the expected type (not None)")
+        elif error_type == "TypeError":
+            output_lines.append("- Check types of inputs: use `type(variable)` or `isinstance()`")
+            output_lines.append("- Convert types if needed: `int()`, `str()`, `list()`")
+            output_lines.append("- Verify function signature matches how you're calling it")
+        output_lines.append("")
+        
+        # Action items
+        output_lines.append("### ✅ STEP-BY-STEP DEBUGGING PROCESS")
+        output_lines.append("1. **Read the failing line**: See exactly which line crashed")
+        output_lines.append("2. **Understand the error**: Review error type and suggested fixes above")
+        output_lines.append("3. **Compare states**: Check SOURCE CODE STATE vs TEST CONTEXT")
+        output_lines.append("4. **Find the bug**: Identify which variable has the wrong value")
+        output_lines.append("5. **Trace backwards**: Use execution trace to find where it went wrong")
+        output_lines.append("6. **Apply the fix**: Update your implementation with the correction")
+        output_lines.append("7. **Verify**: Ensure the fix handles all edge cases")
+        output_lines.append("")
+        output_lines.append("="*80)
+        
+        return "\n".join(output_lines)
