@@ -32,18 +32,22 @@ DEFAULT_TEST_PROBLEMS = [
     # "affine-cipher",
     # "beer-song", 
     "react",
-    # "react",
-    # "react",
-    # "react",
-    #"robot-name",
-    #"rest-api",      # Test: JSON string format detection
-    #"book-store",    # Test: Unit conversion (cents vs dollars)
-    #"scale-generator",
-    #"grep",
-    #"pov",
+    "react",
+    "react",
+    "react",
+    "react",
+    "react",
+    "react",
+    "react",
+    # "robot-name",
+    # "rest-api",      # Test: JSON string format detection
+    # "book-store",    # Test: Unit conversion (cents vs dollars)
+    # "scale-generator",
+    # "grep",
+    # "pov",
     
     # SWE Benchmark problems
-    #"astropy__astropy-14369"
+    # "astropy__astropy-14369"
     #"django__diango-10554",
     #"django__django-12325"
     #"django__django-11885"
