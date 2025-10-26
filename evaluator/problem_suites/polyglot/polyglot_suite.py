@@ -6,7 +6,6 @@ import shutil
 import requests
 import traceback
 import utils.logger as logger
-import validator.config as config
 
 from uuid import UUID
 from typing import List, Tuple
@@ -23,7 +22,7 @@ from utils.diff import get_file_diff, apply_diff_to_local_repo, validate_diff_fo
 
 
 class PolyglotSuite(ProblemSuite):
-    def __init__(self, dataset_path):
+    def __init__(self, dataset_path: str):
         super().__init__(dataset_path)
 
 
@@ -158,7 +157,7 @@ class PolyglotSuite(ProblemSuite):
 
 
             return sandbox_manager.initialize_sandbox(
-                name=f"eval-sandbox-{problem.name}",
+                name=f"eval-sandbox-{problem.name}-{evaluation_run_id}",
                 python_script_path=os.path.join(os.path.dirname(__file__), "TEST_RUNNER.py"),
                 input_data=[test.model_dump() for test in problem.tests],
                 on_mount=_on_mount
@@ -185,7 +184,7 @@ class PolyglotSuite(ProblemSuite):
             try:
                 sandbox_result_with_logs = sandbox_manager.run_sandbox(eval_sandbox, timeout_seconds=timeout_seconds)
                 timed_out = False
-            # TODO ADAM: Docker bug
+            # NOTE ADAM: Docker bug
             # except TimeoutError:
             except requests.exceptions.ConnectionError:
                 timed_out = True

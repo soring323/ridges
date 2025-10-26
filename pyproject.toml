@@ -64,3 +64,6 @@ line-length = 120
 [tool.isort]
 line_length = 120
 profile = "black"
+
+[tool.setuptools]
+py-modules = []

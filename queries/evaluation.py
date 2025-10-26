@@ -1,9 +1,6 @@
 import uuid
-from datetime import datetime
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from uuid import UUID
-
-import asyncpg
 
 import utils.logger as logger
 from queries.evaluation_run import create_evaluation_run, get_all_evaluation_runs_in_evaluation_id
@@ -11,12 +8,12 @@ from queries.evaluation_set import get_latest_set_id, get_all_problem_names_in_s
 from models.evaluation import Evaluation, EvaluationStatus, HydratedEvaluation
 from models.evaluation_run import EvaluationRun, EvaluationRunStatus, EvaluationRunErrorCode
 from models.evaluation_set import EvaluationSetGroup
-from utils.database import db_operation, db_transaction
+from utils.database import db_operation, DatabaseConnection
 
 
 
 @db_operation
-async def create_evaluation(conn: asyncpg.Connection, agent_id: UUID, validator_hotkey: str, set_id: int) -> UUID:
+async def create_evaluation(conn: DatabaseConnection, agent_id: UUID, validator_hotkey: str, set_id: int) -> UUID:
     evaluation_id = uuid.uuid4()
 
     await conn.execute(
@@ -41,8 +38,10 @@ async def create_evaluation(conn: asyncpg.Connection, agent_id: UUID, validator_
 
 
 
-@db_transaction
-async def create_new_evaluation_and_evaluation_runs(conn: asyncpg.Connection, agent_id: UUID, validator_hotkey: str, set_id: int = None) -> Tuple[Evaluation, List[EvaluationRun]]:
+# @db_transaction
+# TODO ADAM: this probably needs to be a real transaction
+@db_operation
+async def create_new_evaluation_and_evaluation_runs(conn: DatabaseConnection, agent_id: UUID, validator_hotkey: str, set_id: int = None) -> Tuple[Evaluation, List[EvaluationRun]]:
     if set_id is None:
         set_id = await get_latest_set_id()
     
@@ -70,7 +69,7 @@ async def create_new_evaluation_and_evaluation_runs(conn: asyncpg.Connection, ag
 
 
 @db_operation
-async def get_evaluation_by_id(conn: asyncpg.Connection, evaluation_id: UUID) -> Evaluation:
+async def get_evaluation_by_id(conn: DatabaseConnection, evaluation_id: UUID) -> Evaluation:
     response = await conn.fetchrow(
         """
         SELECT *
@@ -85,8 +84,8 @@ async def get_evaluation_by_id(conn: asyncpg.Connection, evaluation_id: UUID) ->
 
 
 @db_operation
-async def get_hydrated_evaluation_by_id(conn: asyncpg.Connection, evaluation_id: UUID) -> HydratedEvaluation:
-    response = await conn.fetchrow(
+async def get_hydrated_evaluation_by_id(conn: DatabaseConnection, evaluation_id: UUID) -> Optional[HydratedEvaluation]:
+    result = await conn.fetchrow(
         """
         SELECT *
         FROM evaluations_hydrated
@@ -95,12 +94,31 @@ async def get_hydrated_evaluation_by_id(conn: asyncpg.Connection, evaluation_id:
         evaluation_id,
     )
 
-    return HydratedEvaluation(**response)
+    if result is None:
+        return None
+
+    return HydratedEvaluation(**result)
+
+@db_operation
+async def get_hydrated_evaluation_by_evaluation_run_id(conn: DatabaseConnection, evaluation_run_id: UUID) -> Optional[HydratedEvaluation]:
+    result = await conn.fetchrow(
+        """
+        SELECT *
+        FROM evaluations_hydrated
+        WHERE evaluation_id = (SELECT evaluation_id FROM evaluation_runs WHERE evaluation_run_id = $1 LIMIT 1)
+        """,
+        evaluation_run_id,
+    )
+
+    if result is None:
+        return None
+    
+    return HydratedEvaluation(**result)
 
 
 
 @db_operation
-async def get_evaluations_for_agent_id(conn: asyncpg.Connection, agent_id: UUID) -> list[Evaluation]:
+async def get_evaluations_for_agent_id(conn: DatabaseConnection, agent_id: UUID) -> list[Evaluation]:
     results = await conn.fetch(
         """
         SELECT * FROM evaluations
@@ -114,7 +132,7 @@ async def get_evaluations_for_agent_id(conn: asyncpg.Connection, agent_id: UUID)
 
 
 @db_operation
-async def update_unfinished_evaluation_runs_in_evaluation_id_to_errored(conn: asyncpg.Connection, evaluation_id: UUID, error_message: str) -> None:
+async def update_unfinished_evaluation_runs_in_evaluation_id_to_errored(conn: DatabaseConnection, evaluation_id: UUID, error_message: str) -> None:
     await conn.execute(
         f"""
         UPDATE evaluation_runs
@@ -138,7 +156,7 @@ async def update_unfinished_evaluation_runs_in_evaluation_id_to_errored(conn: as
 
 # Used to perform cleanup after a platform crash
 @db_operation
-async def set_all_unfinished_evaluation_runs_to_errored(conn: asyncpg.Connection, error_message: str) -> None:
+async def set_all_unfinished_evaluation_runs_to_errored(conn: DatabaseConnection, error_message: str) -> None:
     await conn.execute(
         f"""
         UPDATE evaluation_runs
@@ -162,7 +180,7 @@ async def set_all_unfinished_evaluation_runs_to_errored(conn: asyncpg.Connection
 
 
 @db_operation
-async def update_evaluation_finished_at(conn: asyncpg.Connection, evaluation_id: UUID) -> None:
+async def update_evaluation_finished_at(conn: DatabaseConnection, evaluation_id: UUID) -> None:
     await conn.execute(
         """
         UPDATE evaluations
@@ -175,7 +193,7 @@ async def update_evaluation_finished_at(conn: asyncpg.Connection, evaluation_id:
 
 
 @db_operation
-async def get_num_successful_validator_evaluations_for_agent_id(conn: asyncpg.Connection, agent_id: UUID) -> int:
+async def get_num_successful_validator_evaluations_for_agent_id(conn: DatabaseConnection, agent_id: UUID) -> int:
     result = await conn.fetchrow(
         f"""
         SELECT COUNT(*) as num_successful_validator_evaluations

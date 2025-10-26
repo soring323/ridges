@@ -10,10 +10,12 @@ import utils.logger as logger
 import validator.config as config
 
 from typing import Any, Dict, Optional
-from utils.git import COMMIT_HASH, pull_local_repo
+from api.endpoints.validator_models import *
 from models.problem import ProblemTestResultStatus
+from utils.git import COMMIT_HASH, reset_local_repo
 from evaluator.models import EvaluationRunException
 from utils.system_metrics import get_system_metrics
+from models.evaluation_set import EvaluationSetProblem
 from evaluator.sandbox.sandbox_manager import SandboxManager
 from evaluator.problem_suites.problem_suite import ProblemSuite
 from validator.http_utils import get_ridges_platform, post_ridges_platform
@@ -31,7 +33,6 @@ max_evaluation_run_log_size_bytes = None
 
 
 
-
 # The sandbox manager and problem suites
 sandbox_manager = None
 polyglot_suite = None
@@ -46,7 +47,7 @@ async def disconnect(reason: str):
     
     try:
         logger.info("Disconnecting validator...")
-        await post_ridges_platform("/validator/disconnect", {"reason": reason}, bearer_token=session_id)
+        await post_ridges_platform("/validator/disconnect", ValidatorDisconnectRequest(reason=reason), bearer_token=session_id)
         logger.info("Disconnected validator")
     except Exception as e:
         logger.error(f"Error in disconnect(): {type(e).__name__}: {e}")
@@ -62,7 +63,7 @@ async def send_heartbeat_loop():
         while True:
             logger.info("Sending heartbeat...")
             system_metrics = await get_system_metrics()
-            await post_ridges_platform("/validator/heartbeat", {"system_metrics": system_metrics.model_dump()}, bearer_token=session_id, quiet=2)
+            await post_ridges_platform("/validator/heartbeat", ValidatorHeartbeatRequest(system_metrics=system_metrics), bearer_token=session_id, quiet=2)
             await asyncio.sleep(config.SEND_HEARTBEAT_INTERVAL_SECONDS)
     except Exception as e:
         logger.error(f"Error in send_heartbeat_loop(): {type(e).__name__}: {e}")
@@ -77,7 +78,7 @@ async def set_weights_loop():
 
         weights_mapping = await get_ridges_platform("/scoring/weights", quiet=1)
 
-        from validator.set_weights import set_weights_from_mapping # importing here because this is probably gonna be removed/renamed
+        from validator.set_weights import set_weights_from_mapping # TODO ADAM: importing here because this is probably gonna be removed/renamed
         await set_weights_from_mapping(weights_mapping)
 
         await asyncio.sleep(config.SET_WEIGHTS_INTERVAL_SECONDS)
@@ -89,11 +90,14 @@ async def set_weights_loop():
 # and eval_logs, which are only sent on some state transitions.
 async def update_evaluation_run(evaluation_run_id: str, problem_name: str, updated_status: EvaluationRunStatus, extra: Dict[str, Any] = {}):
     logger.info(f"Updating evaluation run {evaluation_run_id} for problem {problem_name} to {updated_status.value}...")
-    await post_ridges_platform("/validator/update-evaluation-run", {
-        "evaluation_run_id": evaluation_run_id,
-        "updated_status": updated_status.value,
+    
+    await post_ridges_platform("/validator/update-evaluation-run", ValidatorUpdateEvaluationRunRequest(
+        evaluation_run_id=evaluation_run_id,
+        updated_status=updated_status,
         **(extra or {})
-    }, bearer_token=session_id, quiet=2)
+    ), bearer_token=session_id, quiet=2)
+
+
 
 # Truncates a log if required
 def truncate_logs_if_required(log: str) -> str:
@@ -259,35 +263,32 @@ async def _run_evaluation_run(evaluation_run_id: str, problem_name: str, agent_c
 
 
 # Run an evaluation, automatically dispatches all runs to either _simulate_run_evaluation_run or _run_evaluation_run
-async def _run_evaluation(request_evaluation_response):
-    agent_code = request_evaluation_response['agent_code']
-    evaluation_runs = request_evaluation_response['evaluation_runs']
-
+async def _run_evaluation(request_evaluation_response: ValidatorRequestEvaluationResponse):
     logger.info("Received evaluation:")
-    logger.info(f"  # of evaluation runs: {len(evaluation_runs)}")
+    logger.info(f"  # of evaluation runs: {len(request_evaluation_response.evaluation_runs)}")
 
-    for evaluation_run in evaluation_runs:
-        logger.info(f"    {evaluation_run['problem_name']}")
+    for evaluation_run in request_evaluation_response.evaluation_runs:
+        logger.info(f"    {evaluation_run.problem_name}")
 
 
 
     logger.info("Starting evaluation...")
 
     tasks = []
-    for evaluation_run in evaluation_runs:
-        evaluation_run_id = evaluation_run['evaluation_run_id']
-        problem_name = evaluation_run['problem_name']
+    for evaluation_run in request_evaluation_response.evaluation_runs:
+        evaluation_run_id = evaluation_run.evaluation_run_id
+        problem_name = evaluation_run.problem_name
 
         if config.SIMULATE_EVALUATION_RUNS:
             tasks.append(asyncio.create_task(_simulate_run_evaluation_run(evaluation_run_id, problem_name)))
         else:
-            tasks.append(asyncio.create_task(_run_evaluation_run(evaluation_run_id, problem_name, agent_code)))
+            tasks.append(asyncio.create_task(_run_evaluation_run(evaluation_run_id, problem_name, request_evaluation_response.agent_code)))
 
     await asyncio.gather(*tasks)
 
     logger.info("Finished evaluation")
 
-    await post_ridges_platform("/validator/finish-evaluation", bearer_token=session_id, quiet=1)
+    await post_ridges_platform("/validator/finish-evaluation", ValidatorFinishEvaluationRequest(), bearer_token=session_id, quiet=1)
 
 
 
@@ -312,33 +313,32 @@ async def main():
             timestamp = int(time.time())
             signed_timestamp = config.VALIDATOR_HOTKEY.sign(str(timestamp)).hex()
             
-            register_response = await post_ridges_platform("/validator/register-as-validator", {
-                "timestamp": timestamp,
-                "signed_timestamp": signed_timestamp,
-                "hotkey": config.VALIDATOR_HOTKEY.ss58_address,
-                "commit_hash": COMMIT_HASH
-            })
+            register_response = ValidatorRegistrationResponse(**(await post_ridges_platform("/validator/register-as-validator", ValidatorRegistrationRequest(
+                timestamp=timestamp,
+                signed_timestamp=signed_timestamp,
+                hotkey=config.VALIDATOR_HOTKEY.ss58_address,
+                commit_hash=COMMIT_HASH
+            ))))
         
         elif config.MODE == "screener":
-            register_response = await post_ridges_platform("/validator/register-as-screener", {
-                "name": config.SCREENER_NAME,
-                "password": config.SCREENER_PASSWORD,
-                "commit_hash": COMMIT_HASH
-            })
+            register_response = ScreenerRegistrationResponse(**(await post_ridges_platform("/validator/register-as-screener", ScreenerRegistrationRequest(
+                name=config.SCREENER_NAME,
+                password=config.SCREENER_PASSWORD,
+                commit_hash=COMMIT_HASH
+            ))))
     
     except httpx.HTTPStatusError as e:
         if config.UPDATE_AUTOMATICALLY and e.response.status_code == 426:
-            # TODO ADAM
             logger.info("Updating...")
-            pull_local_repo(pathlib.Path(__file__).parent.parent)
+            reset_local_repo(pathlib.Path(__file__).parent.parent, e.response.headers["X-Commit-Hash"])
             sys.exit(0)
         else:
             raise e
     
-    session_id = register_response["session_id"]
-    running_agent_timeout_seconds = register_response["running_agent_timeout_seconds"]
-    running_eval_timeout_seconds = register_response["running_eval_timeout_seconds"]
-    max_evaluation_run_log_size_bytes = register_response["max_evaluation_run_log_size_bytes"]
+    session_id = register_response.session_id
+    running_agent_timeout_seconds = register_response.running_agent_timeout_seconds
+    running_eval_timeout_seconds = register_response.running_eval_timeout_seconds
+    max_evaluation_run_log_size_bytes = register_response.max_evaluation_run_log_size_bytes
 
     logger.info("Registered validator:")
     logger.info(f"  Session ID: {session_id}")
@@ -359,8 +359,9 @@ async def main():
 
 
     # Get all the problems in the latest set
-    latest_set_problems = await get_ridges_platform("/evaluation-sets/all-latest-set-problems", quiet=1)
-    latest_set_problem_names = list({prob["problem_name"] for prob in latest_set_problems})
+    latest_set_problems_data = await get_ridges_platform("/evaluation-sets/all-latest-set-problems", quiet=1)
+    latest_set_problems = [EvaluationSetProblem(**prob) for prob in latest_set_problems_data]
+    latest_set_problem_names = list({prob.problem_name for prob in latest_set_problems})
     
     # Prebuild the images for the SWE-Bench Verified problems
     swebench_verified_suite.prebuild_problem_images(latest_set_problem_names)
@@ -380,15 +381,15 @@ async def main():
     while True:
         logger.info("Requesting an evaluation...")
         
-        request_evaluation_response = await post_ridges_platform("/validator/request-evaluation", bearer_token=session_id, quiet=1)
+        request_evaluation_response_data = await post_ridges_platform("/validator/request-evaluation", ValidatorRequestEvaluationRequest(), bearer_token=session_id, quiet=1)
 
         # If no evaluation is available, wait and try again
-        if request_evaluation_response is None:
+        if request_evaluation_response_data is None:
             logger.info(f"No evaluations available. Waiting for {config.REQUEST_EVALUATION_INTERVAL_SECONDS} seconds...")
             await asyncio.sleep(config.REQUEST_EVALUATION_INTERVAL_SECONDS)
             continue
 
-        await _run_evaluation(request_evaluation_response)
+        await _run_evaluation(ValidatorRequestEvaluationResponse(**request_evaluation_response_data))
 
 
 
@@ -398,7 +399,9 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.warning("Keyboard interrupt")
         asyncio.run(disconnect("Keyboard interrupt"))
+        os._exit(1)
     except Exception as e:
         logger.error(f"Error in main(): {type(e).__name__}: {e}")
         logger.error(traceback.format_exc())
         asyncio.run(disconnect(f"Error in main(): {type(e).__name__}: {e}"))
+        os._exit(1)

@@ -1,19 +1,25 @@
 import json
-import asyncpg
 
-from typing import List
-from typing import Optional
 from uuid import UUID, uuid4
-from datetime import datetime
-from utils.database import db_operation
-from models.evaluation_run import EvaluationRunStatus
+from typing import Any, List, Optional
+from utils.database import db_operation, DatabaseConnection
 from inference_gateway.models import InferenceMessage
+
+
+
+def _remove_null_bytes(x: Any) -> Any:
+    if isinstance(x, str):
+        return x.replace('\x00', '')
+    elif isinstance(x, dict):
+        return {k: _remove_null_bytes(v) for k, v in x.items()}
+    
+    return x
 
 
 
 @db_operation
 async def create_new_inference(
-    conn: asyncpg.Connection,
+    conn: DatabaseConnection,
     *,
     evaluation_run_id: UUID,
 
@@ -45,7 +51,7 @@ async def create_new_inference(
         provider,
         model,
         temperature,
-        json.dumps([message.model_dump() for message in messages]),
+        json.dumps([_remove_null_bytes(message.model_dump()) for message in messages])
     )
 
     return inference_id
@@ -54,7 +60,7 @@ async def create_new_inference(
 
 @db_operation
 async def update_inference_by_id(
-    conn: asyncpg.Connection,
+    conn: DatabaseConnection,
     *,
     inference_id: UUID,
 
@@ -79,7 +85,7 @@ async def update_inference_by_id(
         """,
         inference_id,
         status_code,
-        response,
+        _remove_null_bytes(response),
         num_input_tokens,
         num_output_tokens,
         cost_usd
@@ -88,7 +94,8 @@ async def update_inference_by_id(
 
 
 @db_operation
-async def get_number_of_inferences_for_evaluation_run(conn: asyncpg.Connection, evaluation_run_id: UUID) -> int:
-    return await conn.fetchval("""
-        SELECT COUNT(*) FROM inferences WHERE evaluation_run_id = $1
-    """, evaluation_run_id)
+async def get_number_of_inferences_for_evaluation_run(conn: DatabaseConnection, evaluation_run_id: UUID) -> int:
+    return await conn.fetchval(
+        """SELECT COUNT(*) FROM inferences WHERE evaluation_run_id = $1""",
+        evaluation_run_id
+    )

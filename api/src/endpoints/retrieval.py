@@ -1,11 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
-from typing import Optional
+from typing import Any
 from queries.statistics import score_improvement_24_hrs, agents_created_24_hrs, top_score
 import utils.logger as logger
 from dotenv import load_dotenv
 
 from api.src.utils.auth import verify_request_public
-from api.src.backend.queries.statistics import get_top_scores_over_last_week as db_get_top_scores_over_last_week
+from queries.statistics import get_top_scores_over_time
 
 
 load_dotenv()
@@ -15,14 +15,30 @@ router = APIRouter()
 
 import uuid
 import asyncio
-from queries.agent import get_agents_in_queue, get_top_agents, get_agent_by_id, get_latest_agent_for_hotkey
+import time
+from queries.agent import get_agents_in_queue, get_all_agents_by_hotkey, get_top_agents, get_agent_by_id, get_latest_agent_for_hotkey
 from queries.evaluation import get_evaluations_for_agent_id
 from queries.evaluation_run import get_all_evaluation_runs_in_evaluation_id
 from models.evaluation import Evaluation, EvaluationWithRuns
 from models.evaluation_set import EvaluationSetGroup
 from models.agent import Agent, AgentScored, AgentStatus
 from utils.s3 import download_text_file_from_s3
-from api.src.endpoints.validator import get_all_connected_validator_ip_addresses
+from api.endpoints.validator import get_all_connected_validator_ip_addresses
+
+
+# TODO: Hacky cache implementation. We should use a proper cache library
+CACHE_EXPIRATION = 900 # 15 minutes
+cache_timestamps: dict[str, float] = {}
+recalculating_cache: dict[str, bool] = {}
+cache_data: dict[str, Any] = {}
+
+def is_cache_valid(cache_key: str) -> bool:
+    if cache_key not in cache_timestamps:
+        return False
+    return time.time() - cache_timestamps[cache_key] < CACHE_EXPIRATION
+
+def update_cache_timestamp(cache_key: str):
+    cache_timestamps[cache_key] = time.time()
 
 async def queue(
     stage: str
@@ -45,12 +61,22 @@ async def top_agents(
     """
     Returns the top agents for the latest problem set. All agents, including ones that have not been approved.
     """
-    return await get_top_agents(
+    cache_key = f"top_agents_{number_of_agents}_{page}"
+    if is_cache_valid(cache_key):
+        return cache_data[cache_key]
+
+    if recalculating_cache.get(cache_key, False) and cache_key in cache_data:
+        return cache_data[cache_key]
+    recalculating_cache[cache_key] = True
+    cache_data[cache_key] = await get_top_agents(
         number_of_agents=number_of_agents,
         page=page
-    )
+    )   
+    cache_timestamps[cache_key] = time.time()
+    recalculating_cache[cache_key] = False
+    return cache_data[cache_key]
 
-async def agent_by_id(agent_id: str) -> Agent:
+async def agent_by_id(agent_id: str) -> Agent | AgentScored:
     agent = await get_agent_by_id(agent_id=uuid.UUID(agent_id))
     
     if agent is None:
@@ -61,7 +87,7 @@ async def agent_by_id(agent_id: str) -> Agent:
 
     return agent
 
-async def agent_by_hotkey(miner_hotkey: str) -> Agent:
+async def agent_by_hotkey(miner_hotkey: str) -> Agent | AgentScored:
     """
     Returns the latest agent submitted by a hotkey
     """
@@ -74,6 +100,10 @@ async def agent_by_hotkey(miner_hotkey: str) -> Agent:
         )
 
     return agent
+
+async def all_agents_by_hotkey(miner_hotkey: str) -> list[Agent]:
+    agents = await get_all_agents_by_hotkey(miner_hotkey=miner_hotkey)
+    return agents
 
 # TODO ADAM: optimize that
 async def evaluations_for_agent(agent_id: str) -> list[EvaluationWithRuns]:
@@ -123,22 +153,42 @@ async def get_agent_code(agent_id: str, request: Request):
 
 async def top_scores_over_time():
     """Gets agent scores over time for charting"""
-    return await db_get_top_scores_over_last_week()
+    cache_key = "top_scores_over_time"
+    if is_cache_valid(cache_key):
+        return cache_data[cache_key]
+
+    if recalculating_cache.get(cache_key, False) and cache_key in cache_data:
+        return cache_data[cache_key]
+    recalculating_cache[cache_key] = True
+    cache_data[cache_key] = await get_top_scores_over_time()
+    cache_timestamps[cache_key] = time.time()
+    recalculating_cache[cache_key] = False
+    return cache_data[cache_key]
 
 async def network_statistics():
     """
     Gets network statistics for the dashboard
     """
+    cache_key = "network_statistics"
+    if is_cache_valid(cache_key):
+        return cache_data[cache_key]
+
+    if recalculating_cache.get(cache_key, False) and cache_key in cache_data:
+        return cache_data[cache_key]
+    recalculating_cache[cache_key] = True
     score_improvement, agents_created, top_score_value = await asyncio.gather(
         score_improvement_24_hrs(),
         agents_created_24_hrs(),
         top_score()
     )
-    return {
+    cache_data[cache_key] = {
         "score_improvement_24_hrs": score_improvement,
         "agents_created_24_hrs": agents_created,
         "top_score": top_score_value
     }
+    cache_timestamps[cache_key] = time.time()
+    recalculating_cache[cache_key] = False
+    return cache_data[cache_key]
 
 router = APIRouter()
 
@@ -151,6 +201,7 @@ routes = [
     ("/agent-version-file", get_agent_code),
     ("/top-scores-over-time", top_scores_over_time),
     ("/network-statistics", network_statistics),
+    ("/all-agents-by-hotkey", all_agents_by_hotkey),
 ]
 
 for path, endpoint in routes:

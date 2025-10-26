@@ -19,7 +19,7 @@ from rich.prompt import Prompt
 
 console = Console()
 DEFAULT_API_BASE_URL = "https://platform-v2.ridges.ai"
-CONFIG_FILE = "validator/.env"
+CONFIG_FILE = "miner/.env"
 
 load_dotenv(CONFIG_FILE)
 load_dotenv(".env")
@@ -126,13 +126,6 @@ class RidgesCLI:
         self.api_url = api_url or DEFAULT_API_BASE_URL
         self.config = Config()
     
-    def get_keypair(self, coldkey_name: Optional[str] = None, hotkey_name: Optional[str] = None):
-        coldkey = coldkey_name or self.config.get_or_prompt("RIDGES_COLDKEY_NAME", "Enter your coldkey name", "miner")
-        hotkey = hotkey_name or self.config.get_or_prompt("RIDGES_HOTKEY_NAME", "Enter your hotkey name", "default")
-        return load_hotkey_keypair(coldkey, hotkey)
-    
-    def get_agent_path(self) -> str:
-        return self.config.get_or_prompt("RIDGES_AGENT_FILE", "Enter the path to your agent.py file", "miner/agent.py")
 
 @click.group()
 @click.version_option(version="1.0.0")
@@ -148,66 +141,56 @@ def cli(ctx, url):
 @click.option("--coldkey-name", help="Coldkey name")
 @click.option("--hotkey-name", help="Hotkey name")
 @click.pass_context
-def upload(ctx, hotkey_name: Optional[str], file: Optional[str], coldkey_name: Optional[str]):
+def upload(ctx, file: Optional[str], coldkey_name: Optional[str], hotkey_name: Optional[str]):
     """Upload a miner agent to the Ridges API."""
     ridges = RidgesCLI(ctx.obj.get('url'))
     
-    file = file or ridges.get_agent_path()
+    coldkey = coldkey_name or ridges.config.get_or_prompt("RIDGES_COLDKEY_NAME", "Enter your coldkey name", "miner")
+    hotkey = hotkey_name or ridges.config.get_or_prompt("RIDGES_HOTKEY_NAME", "Enter your hotkey name", "default")
+    keypair = load_hotkey_keypair(coldkey, hotkey)
+    
+    file = file or ridges.config.get_or_prompt("RIDGES_AGENT_FILE", "Enter the path to your agent.py file", "agent.py")
     if not os.path.exists(file) or os.path.basename(file) != "agent.py":
-        console.print("💥 File must be named 'agent.py' and exist", style="bold red")
+        console.print("File must be named 'agent.py' and exist", style="bold red")
         return
     
-    console.print(Panel(f"[bold cyan] Uploading Agent[/bold cyan]\n[yellow]File:[/yellow] {file}\n[yellow]API:[/yellow] {ridges.api_url}", title="🚀 Upload", border_style="cyan"))
+    console.print(Panel(f"[bold cyan]Uploading Agent[/bold cyan]\n[yellow]Hotkey:[/yellow] {keypair.ss58_address}\n[yellow]File:[/yellow] {file}\n[yellow]API:[/yellow] {ridges.api_url}", title="Upload", border_style="cyan"))
     
     try:
         with open(file, 'rb') as f:
-            files = {'agent_file': ('agent.py', f, 'text/plain')}
-            content_hash = hashlib.sha256(f.read()).hexdigest()
-            keypair = ridges.get_keypair(coldkey_name, hotkey_name)
-            public_key = keypair.public_key.hex()
+            file_content = f.read()
+        
+        content_hash = hashlib.sha256(file_content).hexdigest()
+        public_key = keypair.public_key.hex()
+        
+        with httpx.Client() as client:
+            response = client.get(f"{ridges.api_url}/retrieval/agent-by-hotkey?miner_hotkey={keypair.ss58_address}")
             
-            name_and_prev_version = get_name_and_prev_version(ridges.api_url, keypair.ss58_address)
-            if name_and_prev_version is None:
-                name = Prompt.ask("Enter a name for your miner agent")
-                version_num = -1
+            if response.status_code == 200 and response.json():
+                latest_agent = response.json()
+                name = latest_agent.get("name")
+                version_num = latest_agent.get("version_num", -1) + 1
             else:
-                name, prev_version_num = name_and_prev_version
-                version_num = prev_version_num + 1
+                name = Prompt.ask("Enter a name for your miner agent")
+                version_num = 0
 
             file_info = f"{keypair.ss58_address}:{content_hash}:{version_num}"
             signature = keypair.sign(file_info).hex()
             payload = {'public_key': public_key, 'file_info': file_info, 'signature': signature, 'name': name}
+            files = {'agent_file': ('agent.py', file_content, 'text/plain')}
 
             with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console, transient=True) as progress:
-                progress.add_task("🔐 Signing and uploading...", total=None)
-
-                with httpx.Client() as client:
-                    response = client.post(f"{ridges.api_url}/upload/agent", files=files, data=payload, timeout=120)
-                
-                if response.status_code == 200:
-                    console.print(Panel(f"[bold green]🎉 Upload Complete[/bold green]\n[cyan]Miner '{name}' uploaded successfully![/cyan]", title="✨ Success", border_style="green"))
-                else:
-                    error = response.json().get('detail', 'Unknown error') if response.headers.get('content-type', '').startswith('application/json') else response.text
-                    console.print(f"💥 Upload failed: {error}", style="bold red")
+                progress.add_task("Signing and uploading...", total=None)
+                response = client.post(f"{ridges.api_url}/upload/agent", files=files, data=payload, timeout=120)
+            
+            if response.status_code == 200:
+                console.print(Panel(f"[bold green]Upload Complete[/bold green]\n[cyan]Miner '{name}' uploaded successfully![/cyan]", title="Success", border_style="green"))
+            else:
+                error = response.json().get('detail', 'Unknown error') if response.headers.get('content-type', '').startswith('application/json') else response.text
+                console.print(f"Upload failed: {error}", style="bold red")
                     
     except Exception as e:
-        console.print(f"💥 Error: {e}", style="bold red")
-
-def get_name_and_prev_version(url: str, miner_hotkey: str) -> Optional[tuple[str, int]]:
-    try:
-        with httpx.Client() as client:
-            response = client.get(f"{url}/retrieval/agent-by-hotkey?miner_hotkey={miner_hotkey}")
-            if response.status_code == 404:
-                return None
-            if response.status_code == 200:
-                latest_agent = response.json()
-                if latest_agent:
-                    return latest_agent.get("name"), latest_agent.get("version_num")
-    except Exception as e:
-        console.print(f"💥 Error: {e}", style="bold red")
-        exit(1)
-
-
+        console.print(f"Error: {e}", style="bold red")
 
 @cli.group()
 def validator():
@@ -563,449 +546,360 @@ def status():
             console.print(f"❌ {display_name}: [bold red]Stopped[/bold red]")
 
 
-@cli.command()
-@click.argument("problem_name")
-@click.argument("agent_file")
-@click.option("--local", is_flag=True, help="Run agent locally without Docker (no sandbox isolation)")
-@click.option("--log-docker-to-stdout", is_flag=True, help="Print Docker container logs to stdout in real-time")
-@click.option("--include-solution", is_flag=True, help="Expose the solution to the agent at /sandbox/solution.diff")
-@click.option("--verbose", is_flag=True, help="Enable verbose (debug) logging")
-@click.option("--timeout", default=10, type=int, help="Timeout in seconds for sandbox execution (default: 10)")
-@click.option("--cleanup", is_flag=True, default=True, help="Clean up containers after test")
-@click.option("--gateway-url", help="URL for the gateway (overrides RIDGES_PROXY_URL)")
-def test_agent(
-    problem_name: str,
-    agent_file: str,
-    local: bool,
-    log_docker_to_stdout: bool,
-    include_solution: bool,
-    verbose: bool,
-    timeout: int,
-    cleanup: bool,
-    gateway_url: str
-):
-    """Test your agent locally with full SWE-bench evaluation.
+# @cli.command()
+# @click.argument("problem_name")
+# @click.argument("agent_file")
+# @click.option("--log-docker-to-stdout", is_flag=True, help="Print Docker container logs to stdout in real-time")
+# @click.option("--include-solution", is_flag=True, help="Expose the solution to the agent at /sandbox/solution.diff")
+# @click.option("--verbose", is_flag=True, help="Enable verbose (debug) logging")
+# @click.option("--timeout", default=10, type=int, help="Timeout in seconds for sandbox execution (default: 10)")
+# @click.option("--cleanup", is_flag=True, default=True, help="Clean up containers after test")
+# @click.option("--start-proxy", is_flag=True, default=True, help="Automatically start proxy if needed")
+# @click.option("--gateway-url", help="URL for the gateway (overrides RIDGES_PROXY_URL)")
+# def test_agent(
+#     problem_name: str,
+#     agent_file: str,
+#     log_docker_to_stdout: bool,
+#     include_solution: bool,
+#     verbose: bool,
+#     timeout: int,
+#     cleanup: bool,
+#     start_proxy: bool,
+#     gateway_url: str
+# ):
+#     """Test your agent locally with full SWE-bench evaluation.
 #
-    This command runs a single agent against a specific problem. It automatically searches
-    all available problem suites (Polyglot and SWE-bench Verified) to find the problem,
-    handles sandbox creation (Docker or local), and provides detailed output about the agent's performance.
+#     This command runs a single agent against a specific problem. It automatically searches
+#     all available problem suites (Polyglot and SWE-bench Verified) to find the problem,
+#     handles Docker sandbox creation, proxy server management, and provides detailed output
+#     about the agent's performance.
 #
 #
-    Examples:
-        # Start inference gateway first (required for both modes):
-        python -m inference_gateway.main
-        
-        # Run locally without Docker (faster, no isolation):
-        ./ridges.py test-agent affine-cipher miner/agent.py --local
-        ./ridges.py test-agent affine-cipher miner/agent.py --local --include-solution
-        
-        # Run with Docker (full isolation):
-        ./ridges.py test-agent affine-cipher miner/agent.py
-        ./ridges.py test-agent django__django-12308 miner/agent.py --include-solution --verbose
+#     Examples:
+#         ./ridges.py test-agent affine-cipher miner/agent.py
+#         ./ridges.py test-agent django__django-12308 miner/agent.py
+#         ./ridges.py test-agent affine-cipher miner/agent.py --include-solution --log-docker-to-stdout --verbose
 #
-    Note:
-        - Both modes require inference gateway running at http://localhost:8000
-        - Local mode (--local): Runs agent directly, no Docker/sandbox required, faster
-        - Docker mode (default): Full isolation with Docker sandbox containers
-        - Problems with >150 tests are rejected to prevent excessive resource usage
-    """
+#     Note:
+#         - Requires Docker to be running
+#         - Automatically sets up proxy/.env if needed
+#         - Validates CHUTES_API_KEY configuration
+#         - Problems with >150 tests are rejected to prevent excessive resource usage
+#     """
 #
-    import os
-    import sys
-    import time
-    import uuid
-    import json
-    import shutil
-    import tempfile
-    import traceback
-    import subprocess
-    import socket
-    import importlib.util
-    from pathlib import Path
+#     import os
+#     import time
+#     import uuid
+#     import shutil
+#     import traceback
+#     import subprocess
+#     import socket
+#     from pathlib import Path
 #
-    def get_local_ip():
-        """Get the local IP address for the inference gateway."""
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                # Connect to a remote address (doesn't actually send data)
-                s.connect(("8.8.8.8", 80))
-                return s.getsockname()[0]
-        except Exception as e:
-            console.print(f"⚠️ Could not determine local IP: {e}", style="yellow")
-            console.print("   You can manually specify with --gateway-url http://YOUR_IP:8000", style="dim")
-            return "192.168.1.100"  # Fallback IP
-    
-    def run_agent_locally(agent_file_path: str, problem, suite, include_solution: bool, timeout: int, verbose: bool):
-        """Run agent locally without Docker."""
-        # Create temporary workspace in project directory
-        workspace_base = os.path.join(os.getcwd(), "result")
-        os.makedirs(workspace_base, exist_ok=True)
-        workspace_dir = tempfile.mkdtemp(prefix="local_", dir=workspace_base)
-        console.print(f"📁 Created local workspace: {workspace_dir}", style="dim")
-        
-        try:
-            # Create directory structure
-            repo_dir = os.path.join(workspace_dir, "repo")
-            os.makedirs(repo_dir, exist_ok=True)
-            
-            # Copy agent file
-            agent_path = os.path.join(workspace_dir, "agent.py")
-            shutil.copy2(agent_file_path, agent_path)
-            console.print(f"✓ Copied agent to workspace", style="dim")
-            
-            # Copy problem files
-            suite.copy_problem_files_to_directory(problem, repo_dir)
-            console.print(f"✓ Copied problem files to {repo_dir}", style="dim")
-            
-            # Copy solution if requested
-            if include_solution:
-                solution_path = os.path.join(workspace_dir, "solution.diff")
-                with open(solution_path, "w") as f:
-                    f.write(problem.solution_diff)
-                console.print(f"✓ Copied solution to workspace", style="dim")
-            
-            # Create input data
-            input_data = {"problem_statement": problem.problem_statement}
-            input_path = os.path.join(workspace_dir, "input.json")
-            with open(input_path, "w") as f:
-                json.dump(input_data, f, indent=2)
-            console.print(f"✓ Created input.json", style="dim")
-            
-            # Load and run agent
-            console.print(f"\n▶️  Running agent (timeout: {timeout}s)...", style="yellow")
-            
-            # Set environment variable for inference gateway (local mode uses localhost)
-            # The agent expects SANDBOX_PROXY_URL to point to the inference gateway
-            os.environ["SANDBOX_PROXY_URL"] = "http://localhost:8000"
-            console.print(f"✓ Set SANDBOX_PROXY_URL to http://localhost:8000", style="dim")
-            
-            # Change to workspace directory for agent execution
-            original_cwd = os.getcwd()
-            os.chdir(workspace_dir)
-            
-            # Add workspace to Python path
-            sys.path.insert(0, workspace_dir)
-            
-            try:
-                # Import agent module
-                spec = importlib.util.spec_from_file_location("agent", agent_path)
-                agent_module = importlib.util.module_from_spec(spec)
-                
-                # Capture stdout/stderr
-                from io import StringIO
-                old_stdout = sys.stdout
-                old_stderr = sys.stderr
-                captured_output = StringIO()
-                sys.stdout = captured_output
-                sys.stderr = captured_output
-                
-                try:
-                    # Execute agent module
-                    spec.loader.exec_module(agent_module)
-                    
-                    # Check for agent_main function
-                    if not hasattr(agent_module, "agent_main"):
-                        raise Exception("agent_main() function not found in agent.py")
-                    
-                    # Call agent_main
-                    start_time = time.time()
-                    patch = agent_module.agent_main(input_data)
-                    elapsed_time = time.time() - start_time
-                    
-                    if elapsed_time > timeout:
-                        console.print(f"⚠️  Agent exceeded timeout ({elapsed_time:.1f}s > {timeout}s)", style="yellow")
-                    
-                    # Validate return value
-                    if not isinstance(patch, str):
-                        raise Exception(f"agent_main() must return a string, got {type(patch)}")
-                    
-                finally:
-                    # Restore stdout/stderr
-                    sys.stdout = old_stdout
-                    sys.stderr = old_stderr
-                    agent_logs = captured_output.getvalue()
-                
-                # Save results before cleanup
-                timestamp = time.strftime("%Y%m%d_%H%M%S")
-                problem_slug = problem.name.replace("/", "_").replace(" ", "_")
-                results_dir = os.path.join(workspace_base, f"{timestamp}_{problem_slug}")
-                os.makedirs(results_dir, exist_ok=True)
-                
-                # Save patch
-                patch_file = os.path.join(results_dir, "patch.diff")
-                with open(patch_file, "w") as f:
-                    f.write(patch if patch else "")
-                
-                # Save logs
-                logs_file = os.path.join(results_dir, "agent_logs.txt")
-                with open(logs_file, "w") as f:
-                    f.write(agent_logs)
-                
-                # Save problem statement
-                problem_file = os.path.join(results_dir, "problem_statement.txt")
-                with open(problem_file, "w") as f:
-                    f.write(problem.problem_statement)
-                
-                # Copy the entire repo directory (contains test files and generated code)
-                results_repo_dir = os.path.join(results_dir, "repo")
-                if os.path.exists(repo_dir):
-                    shutil.copytree(repo_dir, results_repo_dir)
-                
-                # Create summary JSON
-                summary = {
-                    "problem_name": problem.name,
-                    "timestamp": timestamp,
-                    "timeout_seconds": timeout,
-                    "elapsed_time": elapsed_time,
-                    "exceeded_timeout": elapsed_time > timeout,
-                    "patch_generated": bool(patch),
-                    "patch_length": len(patch) if patch else 0,
-                    "agent_file": agent_file_path,
-                    "include_solution": include_solution,
-                    "workspace_dir": results_dir
-                }
-                summary_file = os.path.join(results_dir, "summary.json")
-                with open(summary_file, "w") as f:
-                    json.dump(summary, f, indent=2)
-                
-                # Create README explaining the structure
-                readme_content = f"""# Test Results for {problem.name}
-
-## Execution Summary
-- **Timestamp**: {timestamp}
-- **Problem**: {problem.name}
-- **Agent**: {agent_file_path}
-- **Timeout**: {timeout}s
-- **Elapsed Time**: {elapsed_time:.2f}s
-- **Exceeded Timeout**: {'Yes' if elapsed_time > timeout else 'No'}
-- **Patch Generated**: {'Yes' if patch else 'No'}
-
-## Directory Structure
-- `patch.diff` - Generated solution patch
-- `agent_logs.txt` - Complete agent execution logs (includes test results)
-- `problem_statement.txt` - Original problem statement
-- `repo/` - Complete repository state with generated code and test files
-- `summary.json` - Machine-readable summary
-- `README.md` - This file
-
-## Test Results
-Check `agent_logs.txt` for detailed test execution output including:
-- Test cases executed
-- Passed/failed test counts
-- Error messages and stack traces
-
-## Generated Code
-All generated/modified files are in the `repo/` directory.
-"""
-                readme_file = os.path.join(results_dir, "README.md")
-                with open(readme_file, "w") as f:
-                    f.write(readme_content)
-                
-                console.print(f"💾 Saved results to: {results_dir}", style="green")
-                
-                return patch, agent_logs, results_dir
-                
-            finally:
-                # Restore original directory and path
-                os.chdir(original_cwd)
-                if workspace_dir in sys.path:
-                    sys.path.remove(workspace_dir)
-        
-        finally:
-            # Cleanup temporary workspace
-            if os.path.exists(workspace_dir):
-                shutil.rmtree(workspace_dir)
-                console.print(f"✓ Cleaned up temporary workspace", style="dim")
+#     def get_local_ip():
+#         """Get the local IP address for the inference gateway."""
+#         try:
+#             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+#                 # Connect to a remote address (doesn't actually send data)
+#                 s.connect(("8.8.8.8", 80))
+#                 return s.getsockname()[0]
+#         except Exception as e:
+#             console.print(f"⚠️ Could not determine local IP: {e}", style="yellow")
+#             console.print("   You can manually specify with --gateway-url http://YOUR_IP:8000", style="dim")
+#             return "192.168.1.100"  # Fallback IP
 #
-    # Only check gateway config if not running in local mode
-    if not local:
-        inference_env_path = Path("inference_gateway/.env")
-        inference_env_example_path = Path("inference_gateway/.env.example")
+#     inference_env_path = Path("inference_gateway/.env")
+#     inference_env_example_path = Path("inference_gateway/.env.example")
 #
-        if not inference_env_path.exists():
-            if inference_env_example_path.exists():
-                console.print("📋 No inference_gateway/.env file found, copying from .env.example...", style="yellow")
-                shutil.copy(inference_env_example_path, inference_env_path)
-                console.print("✅ Created inference_gateway/.env from inference_gateway/.env.example", style="green")
-            else:
-                console.print("❌ No inference_gateway/.env.example file found! This is required for setup.", style="bold red")
-                return
+#     if not inference_env_path.exists():
+#         if inference_env_example_path.exists():
+#             console.print("📋 No inference_gateway/.env file found, copying from .env.example...", style="yellow")
+#             shutil.copy(inference_env_example_path, inference_env_path)
+#             console.print("✅ Created inference_gateway/.env from inference_gateway/.env.example", style="green")
+#         else:
+#             console.print("❌ No inference_gateway/.env.example file found! This is required for setup.", style="bold red")
+#             return
 #
-        # Check for required Chutes API key
-        if os.path.exists("inference_gateway/.env"):
-            with open("inference_gateway/.env", "r") as f:
-                env_content = f.read()
+#     # Check for required Chutes API key
+#     if os.path.exists("inference_gateway/.env"):
+#         with open("inference_gateway/.env", "r") as f:
+#             env_content = f.read()
 #
-            if "PROXY_CHUTES_API_KEY=" in env_content:
-                # Check if it's just empty or still has placeholder
-                import re
-                api_key_match = re.search(r'PROXY_CHUTES_API_KEY=(.*)$', env_content, re.MULTILINE)
-                if not api_key_match or not api_key_match.group(1).strip():
-                    console.print("❌ PROXY_CHUTES_API_KEY is required in inference_gateway/.env", style="bold red")
-                    console.print("   Please get your API key from https://chutes.ai and update inference_gateway/.env", style="yellow")
-                    return
+#         if "PROXY_CHUTES_API_KEY=" in env_content:
+#             # Check if it's just empty or still has placeholder
+#             import re
+#             api_key_match = re.search(r'PROXY_CHUTES_API_KEY=(.*)$', env_content, re.MULTILINE)
+#             if not api_key_match or not api_key_match.group(1).strip():
+#                 console.print("❌ PROXY_CHUTES_API_KEY is required in inference_gateway/.env", style="bold red")
+#                 console.print("   Please get your API key from https://chutes.ai and update inference_gateway/.env", style="yellow")
+#                 return
 #
-    # Load environment variables
-    try:
-        from dotenv import load_dotenv
-        validator_env = Path("validator/.env")
-        if validator_env.exists():
-            load_dotenv(validator_env)
-            console.print("Loaded configuration from validator/.env", style="green")
-        else:
-            console.print("No validator/.env found, using defaults", style="yellow")
-    except ImportError as e:
-        console.print(f"❌ Failed to load environment setup: {e}", style="bold red")
-        return
+#     # Load environment variables
+#     try:
+#         from dotenv import load_dotenv
+#         validator_env = Path("validator/.env")
+#         if validator_env.exists():
+#             load_dotenv(validator_env)
+#             console.print("Loaded configuration from validator/.env", style="green")
+#         else:
+#             console.print("No validator/.env found, using defaults", style="yellow")
+#     except ImportError as e:
+#         console.print(f"❌ Failed to load environment setup: {e}", style="bold red")
+#         return
 #
-    if verbose:
-        from validator.utils.logger import enable_verbose
-        enable_verbose()
-        console.print("🔧 Verbose logging enabled", style="dim")
+#     if verbose:
+#         from validator.utils.logger import enable_verbose
+#         enable_verbose()
+#         console.print("🔧 Verbose logging enabled", style="dim")
 #
-    mode_str = "Local Mode (No Docker)" if local else "Docker Mode"
-    console.print(Panel(f"[bold cyan]🧪 Testing Agent[/bold cyan]\n"
-                        f"[yellow]Mode:[/yellow] {mode_str}\n"
-                        f"[yellow]Problem:[/yellow] {problem_name}\n"
-                        f"[yellow]Agent:[/yellow] {agent_file}\n"
-                        f"[yellow]Timeout:[/yellow] {timeout}s",
-                        title=" Test Agent", border_style="cyan"))
+#     console.print(Panel(f"[bold cyan]🧪 Testing Agent Locally[/bold cyan]\n"
+#                         f"[yellow]Problem:[/yellow] {problem_name}\n"
+#                         f"[yellow]Agent:[/yellow] {agent_file}\n"
+#                         f"[yellow]Timeout:[/yellow] {timeout}s",
+#                         title=" Local Test", border_style="cyan"))
 #
-    # Remind about inference gateway requirement
-    if local:
-        console.print(f"📡 Local mode requires inference gateway at http://localhost:8000", style="cyan")
-        console.print(f"💡 Start it in another terminal: python -m inference_gateway.main", style="dim")
+#     # Validate agent file exists
+#     if not Path(agent_file).exists():
+#         console.print(f" Agent file not found: {agent_file}", style="bold red")
+#         return
 #
-    # Validate agent file exists
-    if not Path(agent_file).exists():
-        console.print(f" Agent file not found: {agent_file}", style="bold red")
-        return
+#     # Check if inference gateway is needed and start if required
+#     gateway_process = None
+#     local_ip = get_local_ip()
 #
-    # Set gateway URL (only needed for Docker mode)
-    if not local:
-        local_ip = get_local_ip()
-        if gateway_url:
-            gateway_full_url = gateway_url
-        else:
-            gateway_full_url = f"http://{local_ip}:8000"
-        gateway_url = f"http://0.0.0.0:8000"
-        console.print(f"📡 Using inference gateway at: {gateway_full_url}", style="cyan")
-        console.print(f"💡 Make sure to start it manually: python -m inference_gateway.main", style="dim")
-        
-        from evaluator.sandbox.sandbox_manager import SandboxManager
-    
-    from evaluator.problem_suites.problem_suite import ProblemSuite
-
-    console.print(f"🔍 Searching for problem '{problem_name}' in all suites...", style="yellow")
-    search_result = ProblemSuite.find_problem_in_suites(problem_name)
+#     if start_proxy:
+#         try:
+#             # Determine gateway URL
+#             if gateway_url:
+#                 gateway_full_url = gateway_url
+#             else:
+#                 gateway_full_url = f"http://{local_ip}:8000"
 #
-    if search_result is None:
-        console.print(f" Problem '{problem_name}' not found in any suite", style="bold red")
-        console.print("Available suites: polyglot, swebench_verified", style="yellow")
-        return
+#             # Check if inference gateway is already running
+#             import requests
+#             try:
+#                 response = requests.get(f"{gateway_full_url}/docs", timeout=5)
+#                 if response.status_code == 200:
+#                     console.print(f"✅ Inference gateway already running at {gateway_full_url}", style="green")
+#                 else:
+#                     raise Exception("Gateway not responding")
+#             except:
+#                 console.print(f"🚀 Starting inference gateway on {local_ip}:8000...", style="yellow")
+#                 gateway_process = subprocess.Popen(
+#                     ["python", "main.py"],
+#                     cwd="inference_gateway",
+#                     preexec_fn=os.setsid  # Create new process group for proper cleanup
+#                 )
+#                 # Give gateway time to start up
+#                 time.sleep(3)
 #
-    suite_name, suite = search_result
-    console.print(f"✅ Found problem '{problem_name}' in '{suite_name}' suite", style="green")
+#                 try:
+#                     response = requests.get(f"{gateway_full_url}/docs", timeout=5)
+#                     if response.status_code == 200:
+#                         console.print(f"✅ Inference gateway started at {gateway_full_url}", style="green")
+#                     else:
+#                         raise Exception("Gateway health check failed")
+#                 except:
+#                     console.print("⚠️  Inference gateway may not have started properly", style="yellow")
+#                     console.print(f"You may need to manually run: cd inference_gateway && python main.py", style="yellow")
+#         except Exception as e:
+#             console.print(f"⚠️  Could not start inference gateway: {e}", style="yellow")
+#             console.print(f"You may need to manually run: cd inference_gateway && python main.py", style="yellow")
+#     else:
+#         if gateway_url:
+#             gateway_full_url = gateway_url
+#         else:
+#             gateway_full_url = f"http://{local_ip}:8000"
+#         console.print(f"Using inference gateway at: {gateway_full_url}", style="blue")
 #
-    test_count = suite.get_problem_test_count(problem_name)
-    if test_count > 150:
-        console.print(f" Problem {problem_name} has {test_count} tests (>150)", style="bold red")
-        return
+#     from validator.sandbox.sandbox_manager import SandboxManager
+#     from validator.problem_suites.problem_suite import ProblemSuite
 #
-    console.print(f"Problem {problem_name} has {test_count} tests", style="cyan")
+#     console.print(f"🔍 Searching for problem '{problem_name}' in all suites...", style="yellow")
+#     search_result = ProblemSuite.find_problem_in_suites(problem_name)
 #
-    problem = suite.get_problem(problem_name)
-    
-    results_dir = None
-    try:
-        if local:
-            # Run locally without Docker
-            patch, agent_logs, results_dir = run_agent_locally(
-                agent_file_path=agent_file,
-                problem=problem,
-                suite=suite,
-                include_solution=include_solution,
-                timeout=timeout,
-                verbose=verbose
-            )
-        else:
-            # Run with Docker
-            sandbox_manager = SandboxManager(gateway_full_url)
-            
-            with open(agent_file, "r") as f:
-                agent_source_code = f.read()
-            
-            run_id = uuid.uuid4()
-            
-            console.print(f"🚀 Creating agent sandbox...", style="yellow")
-            
-            # Initialize agent sandbox
-            agent_sandbox = suite.initialize_agent_sandbox(
-                sandbox_manager=sandbox_manager,
-                problem=problem,
-                evaluation_run_id=run_id,
-                agent_code=agent_source_code,
-                include_solution=include_solution
-            )
-            
-            console.print(f"▶️  Running agent (timeout: {timeout}s)...", style="yellow")
-            
-            # Run the agent
-            patch, agent_logs = suite.run_agent_sandbox(
-                sandbox_manager=sandbox_manager,
-                agent_sandbox=agent_sandbox,
-                timeout_seconds=timeout
-            )
-        
-        console.print("\n" + "=" * 80, style="cyan")
-        console.print(" AGENT RESULTS", style="bold cyan")
-        console.print("=" * 80 + "\n", style="cyan")
-        
-        if patch:
-            console.print("📝 Generated patch:", style="bold green")
-            print(patch)
-        else:
-            console.print("⚠️  No patch generated", style="yellow")
-        
-        if agent_logs:
-            console.print("\n📋 Agent logs:", style="bold blue")
-            print(agent_logs)
-        
-        console.print("\n✅ Agent execution completed successfully", style="bold green")
-        
-        if results_dir and local:
-            console.print(f"\n📂 Full results saved to: {results_dir}", style="bold cyan")
-            console.print(f"   - patch.diff - Generated solution", style="dim")
-            console.print(f"   - agent_logs.txt - Complete logs with test results", style="dim")
-            console.print(f"   - repo/ - All generated code and test files", style="dim")
-            console.print(f"   - summary.json - Machine-readable summary", style="dim")
-    
-    except KeyboardInterrupt:
-        console.print("\n🛑 Test interrupted by user", style="yellow")
-    except Exception as e:
-        console.print(f" Test failed: {e}", style="bold red")
-        if verbose:
-            console.print(traceback.format_exc(), style="dim")
-    finally:
-        if not local:
-            console.print("🧹 Cleaning up...", style="dim")
-            cleanup_tasks = []
+#     if search_result is None:
+#         console.print(f" Problem '{problem_name}' not found in any suite", style="bold red")
+#         console.print("Available suites: polyglot, swebench_verified", style="yellow")
+#         return
 #
-            # Clean up Docker containers if cleanup flag is enabled
-            if cleanup and 'sandbox_manager' in locals():
-                try:
-                    cleanup_tasks.append("sandboxes")
-                    sandbox_manager.cleanup()
-                    console.print("✓ Cleaned up sandboxes", style="dim")
-                except Exception as e:
-                    if verbose:
-                        console.print(f"⚠️  Could not clean up containers: {e}", style="yellow")
+#     suite_name, suite = search_result
+#     console.print(f"✅ Found problem '{problem_name}' in '{suite_name}' suite", style="green")
 #
-            # Show what was cleaned up
-            if cleanup_tasks:
-                console.print(f"✅ Cleaned up {', '.join(cleanup_tasks)}", style="dim")
-            else:
-                console.print("✅ Nothing to clean up", style="dim")
+#     test_count = suite.get_problem_test_count(problem_name)
+#     if test_count > 150:
+#         console.print(f" Problem {problem_name} has {test_count} tests (>150)", style="bold red")
+#         return
+#
+#     console.print(f"Problem {problem_name} has {test_count} tests", style="cyan")
+#
+#     sandbox_manager = SandboxManager(gateway_full_url, log_docker_to_stdout=log_docker_to_stdout)
+#
+#     with open(agent_file, "r") as f:
+#         agent_source_code = f.read()
+#
+#     run_id = str(uuid.uuid4())
+#
+#     def on_finish(result):
+#         time.sleep(0.5)
+#
+#         print()
+#         print()
+#         print()
+#
+#         if (result["status"] == "success"):
+#             n = len((result.get("diff") or "").splitlines())
+#             print(f"========== DIFF ({n} line{'s' if n != 1 else ''}) ==========")
+#             print(result.get("diff", ""))
+#
+#             n = len((result.get("logs") or "").splitlines())
+#             print(f"========== LOGS ({n} line{'s' if n != 1 else ''}) ==========")
+#
+#             print()
+#             print()
+#             print()
+#
+#             diff = result["diff"]
+#
+#             def on_finish_eval(result):
+#                 time.sleep(0.5)
+#
+#                 print()
+#                 print()
+#                 print()
+#
+#                 if result["status"] == "success":
+#                     print("========== TEST RESULTS ==========")
+#                     test_results = result.get("test_results", [])
+#                     tests_passed = sum(1 for test in test_results if test["status"] == "pass")
+#                     tests_failed = sum(1 for test in test_results if test["status"] == "fail")
+#                     tests_skipped = sum(1 for test in test_results if test["status"] == "skip")
+#                     print(f"{tests_passed} passed, {tests_failed} failed, {tests_skipped} skipped")
+#                     for test in test_results:
+#                         print(f"{test['name']} - {test.get('category', 'no category')} - {test['status']}")
+#
+#                     n = len((result.get("logs") or "").splitlines())
+#                     print(f"========== LOGS ({n} line{'s' if n != 1 else ''}) ==========")
+#                 else:
+#                     print("========== ERROR ==========")
+#                     print(result.get("error", ""))
+#
+#                     print("========== TRACEBACK ==========")
+#                     print(result.get("traceback", ""))
+#
+#                     print("========== LOGS ==========")
+#                     print(result.get("logs", ""))
+#
+#                 print()
+#                 print()
+#                 print()
+#
+#             suite.evaluate_solution_diff(sandbox_manager, run_id, problem_name, diff, on_finish_eval, timeout=timeout)
+#         else:
+#             print("========== ERROR ==========")
+#             print(result.get("error", ""))
+#
+#             print("========== TRACEBACK ==========")
+#             print(result.get("traceback", ""))
+#
+#             print("========== DIFF ==========")
+#             print(result.get("diff", ""))
+#
+#             print("========== LOGS ==========")
+#             print(result.get("logs", ""))
+#
+#     try:
+#         suite.run_agent_in_sandbox_for_problem(sandbox_manager, run_id, problem_name, agent_source_code, on_finish, timeout=timeout, include_solution=include_solution)
+#
+#         # Wait for completion
+#         time.sleep(1)
+#         while sandbox_manager.get_num_sandboxes() > 0:
+#             time.sleep(1)
+#
+#     except KeyboardInterrupt:
+#         console.print("\n🛑 Test interrupted by user", style="yellow")
+#     except Exception as e:
+#         console.print(f" Test failed: {e}", style="bold red")
+#         if verbose:
+#             console.print(traceback.format_exc(), style="dim")
+#     finally:
+#         console.print("🧹 Cleaning up...", style="dim")
+#         cleanup_tasks = []
+#
+#         # Stop inference gateway process if we started it
+#         if gateway_process:
+#             cleanup_tasks.append("inference gateway process")
+#             try:
+#                 import signal
+#                 # Try graceful shutdown first
+#                 if hasattr(gateway_process, 'pid') and gateway_process.pid:
+#                     # Send SIGTERM to the entire process group
+#                     os.killpg(os.getpgid(gateway_process.pid), signal.SIGTERM)
+#                     gateway_process.wait(timeout=5)
+#                 else:
+#                     gateway_process.terminate()
+#                     gateway_process.wait(timeout=5)
+#             except (ProcessLookupError, OSError):
+#                 # Process already terminated - this is fine
+#                 pass
+#             except subprocess.TimeoutExpired:
+#                 # Graceful shutdown failed, force kill
+#                 try:
+#                     if hasattr(gateway_process, 'pid') and gateway_process.pid:
+#                         os.killpg(os.getpgid(gateway_process.pid), signal.SIGKILL)
+#                     else:
+#                         gateway_process.kill()
+#                 except Exception as e:
+#                     if verbose:
+#                         console.print(f"⚠️  Could not stop inference gateway process: {e}", style="yellow")
+#             except Exception as e:
+#                 # Any other error, try force kill as last resort
+#                 try:
+#                     gateway_process.kill()
+#                 except Exception:
+#                     pass
+#                 if verbose:
+#                     console.print(f"⚠️  Could not stop inference gateway process: {e}", style="yellow")
+#
+#         # Clean up Docker containers if cleanup flag is enabled
+#         if cleanup and 'sandbox_manager' in locals():
+#             try:
+#                 # Get count of active sandboxes before cleanup
+#                 active_count = sandbox_manager.get_num_sandboxes()
+#
+#                 if active_count > 0:
+#                     cleanup_tasks.append(f"{active_count} sandbox(es)")
+#                     sandbox_manager.cleanup_all_sandboxes()
+#
+#                 # Also clean up the proxy container if it exists
+#                 try:
+#                     if hasattr(sandbox_manager, 'proxy_container') and sandbox_manager.proxy_container:
+#                         cleanup_tasks.append("proxy container")
+#                         sandbox_manager.proxy_container.stop(timeout=3)
+#                         sandbox_manager.proxy_container.remove(force=True)
+#                         sandbox_manager.proxy_container = None
+#                 except Exception as proxy_cleanup_error:
+#                     if verbose:
+#                         console.print(f"⚠️  Could not clean up proxy container: {proxy_cleanup_error}", style="yellow")
+#
+#                 # Give cleanup some time to complete
+#                 if active_count > 0:
+#                     time.sleep(1)
+#                     # Check if sandbox cleanup was successful
+#                     remaining_count = sandbox_manager.get_num_sandboxes()
+#                     if remaining_count > 0:
+#                         console.print(f"⚠️  {remaining_count} sandbox containers may still be running", style="yellow")
+#
+#             except Exception as e:
+#                 console.print(f"⚠️  Could not clean up containers: {e}", style="yellow")
+#                 if verbose:
+#                     console.print(traceback.format_exc(), style="dim")
+#
+#         # Show what was cleaned up
+#         if cleanup_tasks:
+#             console.print(f"✅ Cleaned up {', '.join(cleanup_tasks)}", style="dim")
+#         else:
+#             console.print("✅ Nothing to clean up", style="dim")
 
 
 if __name__ == "__main__":

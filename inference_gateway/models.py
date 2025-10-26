@@ -7,6 +7,7 @@ from typing import List, Optional
 class ModelInfo(BaseModel):
     name: str
     external_name: str
+    max_input_tokens: int
     cost_usd_per_million_input_tokens: float
     cost_usd_per_million_output_tokens: float
 
@@ -29,18 +30,17 @@ class InferenceMessage(BaseModel):
     content: str
 
 class InferenceRequest(BaseModel):
-    model_config = {"extra": "allow"}  # Allow extra fields that aren't defined
-    
     # TODO
     # evaluation_run_id: UUID
-    run_id: str  # Changed from UUID to str to accept non-UUID run IDs like "nocache-1"
+    run_id: UUID
     model: str
     temperature: float
     messages: List[InferenceMessage]
-    agent_id: Optional[str] = None  # Optional field for agent identification
+
+
 
 class EmbeddingRequest(BaseModel):
     # TODO
     # evaluation_run_id: UUID
-    run_id: str  # Changed from UUID to str to accept non-UUID run IDs like "nocache-1"
+    run_id: UUID
     input: str

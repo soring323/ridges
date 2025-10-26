@@ -4,13 +4,11 @@ import os
 import requests
 import traceback
 import utils.logger as logger
-import validator.config as config
 
 from uuid import UUID
 from models.problem import Problem
 from abc import ABC, abstractmethod
 from typing import Any, List, Tuple
-from utils.temp import create_temp_dir
 from models.problem import ProblemTestResult
 from evaluator.models import EvaluationRunException
 from models.evaluation_run import EvaluationRunErrorCode
@@ -24,34 +22,7 @@ class ProblemSuite(ABC):
     Classes like PolyglotProblemSuite and SWEBenchProblemSuite inherit from this class.
     """
 
-    @classmethod
-    def find_problem_in_suites(cls, problem_name: str):
-        """
-        Search for a problem across all available problem suites.
-        Returns a tuple of (suite_name, suite_instance) if found, None otherwise.
-        """
-        from evaluator.problem_suites.polyglot.polyglot_suite import PolyglotSuite
-        from evaluator.problem_suites.swebench_verified.swebench_verified_suite import SWEBenchVerifiedSuite
-        
-        # Try Polyglot suite
-        try:
-            # Dataset is in evaluator/datasets/polyglot, not evaluator/problem_suites/polyglot
-            datasets_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "datasets")
-            polyglot_suite = PolyglotSuite(os.path.join(datasets_dir, "polyglot"))
-            if polyglot_suite.has_problem_name(problem_name):
-                return ("polyglot", polyglot_suite)
-        except Exception:
-            pass
-        
-        # Try SWE-bench Verified suite
-        try:
-            swebench_suite = SWEBenchVerifiedSuite(os.path.join(datasets_dir, "swebench_verified"))
-            if swebench_suite.has_problem_name(problem_name):
-                return ("swebench_verified", swebench_suite)
-        except Exception:
-            pass
-        
-        return None
+
 
     def __init__(self, dataset_path: str):
         self.problems = {}
@@ -95,16 +66,6 @@ class ProblemSuite(ABC):
         """
         
         return self.problems.get(problem_name)
-
-    def get_problem_test_count(self, problem_name: str) -> int:
-        """
-        Returns the number of tests for the given problem.
-        """
-        problem = self.get_problem(problem_name)
-        if problem and hasattr(problem, 'test_count'):
-            return problem.test_count
-        # Default estimate if test_count not available
-        return 10
 
 
 
@@ -157,7 +118,7 @@ class ProblemSuite(ABC):
 
 
             return sandbox_manager.initialize_sandbox(
-                name=f"agent-sandbox-{problem.name}",
+                name=f"agent-sandbox-{problem.name}-{evaluation_run_id}",
                 python_script_path=os.path.join(os.path.dirname(__file__), "AGENT_RUNNER.py"),
                 input_data={
                     "problem_statement": problem.problem_statement
