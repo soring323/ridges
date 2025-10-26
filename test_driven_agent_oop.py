@@ -23,6 +23,7 @@ from uuid import uuid4
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 import multiprocessing
+import psutil
 
 # ============================================================================
 # Configuration (from test_driven_agent.py)
@@ -31,14 +32,14 @@ import multiprocessing
 RUN_ID = os.getenv("RUN_ID", str(uuid4()))
 SANDBOX_PROXY_URL = os.getenv("SANDBOX_PROXY_URL", "http://sandbox_proxy")
 DEFAULT_TIMEOUT = int(os.getenv("AGENT_TIMEOUT", "2000"))
-ENABLE_PARALLEL = os.getenv("ENABLE_PARALLEL", "false").lower() == "true"
+ENABLE_PARALLEL = os.getenv("ENABLE_PARALLEL", "true").lower() == "true"  # Default: enabled
 
 # Model selection
 REASONING_MODEL = "deepseek-ai/DeepSeek-V3-0324"
 CODING_MODEL = "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"
 FAST_MODEL = "deepseek-ai/DeepSeek-V3-0324"
 
-MAX_ITERATIONS = 10
+MAX_ITERATIONS = 30
 
 # ============================================================================
 # Resource Management & Parallel Execution
@@ -49,14 +50,39 @@ class ResourceManager:
     
     @staticmethod
     def get_optimal_workers() -> int:
-        """Calculate optimal number of worker threads based on system resources."""
+        """Calculate optimal number of worker threads based on current CPU status."""
         cpu_count = multiprocessing.cpu_count()
         
-        # Use 75% of available CPUs, minimum 2, maximum 6
-        # This leaves resources for the main thread and system
-        optimal = max(2, min(6, int(cpu_count * 0.75)))
+        # Get current CPU usage (average over 1 second)
+        cpu_percent = psutil.cpu_percent(interval=1)
         
-        print(f"[RESOURCE] CPU cores: {cpu_count}, using {optimal} worker threads")
+        # Get load average (1-minute average)
+        try:
+            load_avg_1min = psutil.getloadavg()[0]
+        except (AttributeError, OSError):
+            # getloadavg() not available on Windows
+            load_avg_1min = cpu_percent / 100.0 * cpu_count
+        
+        # Calculate available CPU capacity
+        # If CPU is heavily loaded, reduce thread count
+        cpu_load_ratio = load_avg_1min / cpu_count if cpu_count > 0 else 1.0
+        
+        # Determine thread count based on current load
+        if cpu_load_ratio < 0.3:
+            # Low load: use 75% of CPUs
+            base_workers = int(cpu_count * 0.75)
+        elif cpu_load_ratio < 0.6:
+            # Medium load: use 50% of CPUs
+            base_workers = int(cpu_count * 0.5)
+        else:
+            # High load: use 25% of CPUs
+            base_workers = int(cpu_count * 0.25)
+        
+        # Apply bounds: minimum 2, maximum 8
+        optimal = max(2, min(8, base_workers))
+        
+        print(f"[RESOURCE] CPU cores: {cpu_count}, usage: {cpu_percent:.1f}%, "
+              f"load avg: {load_avg_1min:.2f}, using {optimal} worker threads")
         return optimal
 
 @dataclass
@@ -66,6 +92,7 @@ class SolutionCandidate:
     test_results: Optional[Any]  # TestResults, but defined later
     architecture_name: str
     generation_time: float
+    network_error: bool = False  # Track if generation failed due to network
     
     @property
     def score(self) -> int:
@@ -106,11 +133,10 @@ class AlternativeArchitecture:
 @dataclass
 class RefinementConfig:
     """Configuration for refinement process."""
-    max_iterations: int = 20  # Increased from 10 to allow more attempts
-    max_alternatives: int = 10
+    max_iterations: int = 8  # Reduced from 20 - rely on restart mechanism instead
+    max_alternatives: int = 10  # Legacy parameter, not currently used
     stuck_threshold: int = 2
     timeout: int = 1800
-    alternative_iterations: int = 6
 
 class ProblemMode(Enum):
     """Problem solving mode."""
@@ -138,8 +164,14 @@ class ICodeGenerator(ABC):
     """Interface for code generation."""
     
     @abstractmethod
-    def generate_solution(self, problem: str) -> Dict[str, str]:
-        """Generate initial solution."""
+    def generate_solution(self, problem: str, architecture_hint: Optional[str] = None, failure_hints: Optional[str] = None) -> Dict[str, str]:
+        """Generate initial solution with optional architecture hint and failure hints.
+        
+        Args:
+            problem: Problem statement
+            architecture_hint: Specific architecture approach to use
+            failure_hints: Formatted failure information from previous attempts
+        """
         pass
     
     @abstractmethod
@@ -231,6 +263,7 @@ def call_llm(messages: List[Dict], model: str = CODING_MODEL, temperature: float
     messages = truncate_messages(messages, max_tokens=120000)
     
     last_error = None
+    consecutive_connection_errors = 0
     
     for attempt in range(max_retries):
         try:
@@ -242,7 +275,7 @@ def call_llm(messages: List[Dict], model: str = CODING_MODEL, temperature: float
                     "temperature": temperature,
                     "messages": messages
                 },
-                timeout=180
+                timeout=(10, 180)  # (connect_timeout, read_timeout) - fail fast on connection
             )
             
             if response.status_code == 200:
@@ -253,15 +286,37 @@ def call_llm(messages: List[Dict], model: str = CODING_MODEL, temperature: float
                     return result.strip()
                 else:
                     return str(result)
+            
+            # Reset connection error counter on any response (even errors)
+            consecutive_connection_errors = 0
+            
+            if response.status_code == 429:
+                # Rate limit - wait longer before retry
+                last_error = "Rate limit (429)"
+                wait_time = min(60, 10 * (2 ** attempt))  # 10s, 20s, 40s, 60s...
+                print(f"[RATE LIMIT] 429 Too Many Requests - waiting {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                if attempt < max_retries - 1:
+                    time.sleep(wait_time)
+                continue
             else:
                 last_error = f"HTTP {response.status_code}"
                 print(f"[NETWORK] HTTP {response.status_code} (attempt {attempt + 1}/{max_retries})")
                 
         except requests.exceptions.ConnectionError:
-            last_error = "Connection refused"
+            consecutive_connection_errors += 1
+            last_error = "Connection refused - inference gateway may be down"
             print(f"[NETWORK] Connection refused (attempt {attempt + 1}/{max_retries})")
+            
+            # Fast fail if gateway is clearly down (2 consecutive connection errors)
+            if consecutive_connection_errors >= 2:
+                print(f"[FATAL] Inference gateway appears to be down after {consecutive_connection_errors} connection failures")
+                print(f"[FATAL] Please check: {SANDBOX_PROXY_URL}")
+                print(f"[FATAL] Make sure gateway is running: python -m inference_gateway.main")
+                raise RuntimeError(f"Inference gateway unreachable at {SANDBOX_PROXY_URL}")
+            
             if attempt < max_retries - 1:
-                wait_time = min(30, 5 * (2 ** attempt))
+                wait_time = min(10, 3 * (2 ** attempt))  # Reduced from 30s max to 10s
+                print(f"[NETWORK] Retrying in {wait_time}s...")
                 time.sleep(wait_time)
                 continue
                 
@@ -512,8 +567,14 @@ class LLMCodeGenerator(ICodeGenerator):
     def __init__(self, api_url: str):
         self.api_url = api_url
     
-    def generate_solution(self, problem: str) -> Dict[str, str]:
-        """Generate solution using LLM."""
+    def generate_solution(self, problem: str, architecture_hint: Optional[str] = None, failure_hints: Optional[str] = None) -> Dict[str, str]:
+        """Generate solution using LLM with optional architecture hint and failure hints.
+        
+        Args:
+            problem: Problem statement
+            architecture_hint: Specific architecture approach to use
+            failure_hints: Formatted failure information from previous attempts
+        """
         # Truncate problem statement to avoid context overflow
         problem = truncate_text(problem, max_chars=5000)
         
@@ -541,43 +602,55 @@ class LLMCodeGenerator(ICodeGenerator):
                 if example_lines:
                     test_examples = f"\n\nExample tests you need to pass:\n```python\n{''.join(example_lines[:50])}\n```"
         
+        # Add architecture hint if provided
+        architecture_guidance = ""
+        if architecture_hint:
+            architecture_guidance = f"\n\n🎯 REQUIRED ARCHITECTURE APPROACH:\n{architecture_hint}\n\nYou MUST follow this architectural approach in your solution.\n"
+        
+        # Add failure hints if provided
+        failure_guidance = ""
+        if failure_hints:
+            failure_guidance = f"\n\n⚠️ LEARN FROM PREVIOUS FAILURES:\n{failure_hints}\n\nYour solution MUST address these specific failures. Study the test names and error messages carefully.\n"
+        
         prompt = f"""You are an expert Python developer. Use step-by-step reasoning to solve this problem.
 
-Problem Statement:
-{problem}
-{test_examples}
-
-STEP 1 - ANALYZE THE PROBLEM:
-- What is the core problem asking for?
-- What are the key requirements and constraints?
-- What edge cases need to be handled?
-- What data structures or algorithms are most appropriate?
-
-STEP 2 - DESIGN THE SOLUTION:
-- What classes/functions are needed?
-- How should they interact?
-- What is the overall architecture?
-- What are potential pitfalls to avoid?
-
-STEP 3 - IMPLEMENT:
-- Write clean, well-structured code
-- Handle all edge cases identified in Step 1
-- Use only standard library (no external dependencies)
-- Include proper error handling
-- Make sure the implementation matches the design
-
-STEP 4 - VERIFY:
-- Does the solution address all requirements?
-- Are edge cases handled?
-- Is the code readable and maintainable?
-
-Now generate the complete solution in this format:
-filename.py
-```python
-<complete code>
-```
-
-Generate your solution:"""
+                    Problem Statement:
+                    {problem}
+                    {test_examples}
+                    {architecture_guidance}
+                    {failure_guidance}
+                    
+                    STEP 1 - ANALYZE THE PROBLEM:
+                    - What is the core problem asking for?
+                    - What are the key requirements and constraints?
+                    - What edge cases need to be handled?
+                    - What data structures or algorithms are most appropriate?
+                    
+                    STEP 2 - DESIGN THE SOLUTION:
+                    - What classes/functions are needed?
+                    - How should they interact?
+                    - What is the overall architecture?{' (MUST align with the required approach above)' if architecture_hint else ''}
+                    - What are potential pitfalls to avoid?
+                    
+                    STEP 3 - IMPLEMENT:
+                    - Write clean, well-structured code
+                    - Handle all edge cases identified in Step 1
+                    - Use only standard library (no external dependencies)
+                    - Include proper error handling
+                    - Make sure the implementation matches the design
+                    
+                    STEP 4 - VERIFY:
+                    - Does the solution address all requirements?
+                    - Are edge cases handled?
+                    - Is the code readable and maintainable?
+                    
+                    Now generate the complete solution in this format:
+                    filename.py
+                    ```python
+                    <complete code>
+                    ```
+                    
+                    Generate your solution:"""
         
         try:
             response = call_llm(
@@ -602,37 +675,37 @@ Generate your solution:"""
         # Step 1: Generate initial tests
         prompt = f"""You are an expert test developer. Generate comprehensive tests for this solution.
 
-Problem Statement:
-{problem}
+                    Problem Statement:
+                    {problem}
 
-Solution Files:
-{solution_summary}
+                    Solution Files:
+                    {solution_summary}
 
-Important things:
-1. Test functions declared in code skeleton, don't customized those prototypes.
-2. Read the problem statement carefully and deeply and generate testcases that exactly match the rules, mathmatical fomulas, algorithms, data, and workflow in it.
-3. Do not generate testcases that are not mentioned in problem statement
-4. Minimize all testcases as you have context and generation limit
+                    Important things:
+                    1. Test functions declared in code skeleton, don't customized those prototypes.
+                    2. Read the problem statement carefully and deeply and generate testcases that exactly match the rules, mathmatical fomulas, algorithms, data, and workflow in it.
+                    3. Do not generate testcases that are not mentioned in problem statement
+                    4. Minimize all testcases as you have context and generation limit
 
-Requirements:
-1. Use pytest framework
-2. Test all functions and edge cases
-3. Include boundary conditions, empty inputs, invalid inputs
-4. Output in format: test_filename.py followed by test code
-5. Import from solution files correctly
+                    Requirements:
+                    1. Use pytest framework
+                    2. Test all functions and edge cases
+                    3. Include boundary conditions, empty inputs, invalid inputs
+                    4. Output in format: test_filename.py followed by test code
+                    5. Import from solution files correctly
 
-Example format:
-test_main.py
-import pytest
-from main import solution
+                    Example format:
+                    test_main.py
+                    import pytest
+                    from main import solution
 
-def test_basic():
-    assert solution() == expected
+                    def test_basic():
+                        assert solution() == expected
 
-def test_edge_case():
-    assert solution(edge_input) == expected
+                    def test_edge_case():
+                        assert solution(edge_input) == expected
 
-Generate comprehensive tests now:"""
+                    Generate comprehensive tests now:"""
         
         try:
             # Step 1: Generate tests
@@ -646,33 +719,33 @@ Generate comprehensive tests now:"""
             print("[TEST_GEN] Step 2: Validating and refining tests...")
             validation_prompt = f"""You are an expert test reviewer. Analyze the generated tests for validity.
 
-Problem Statement:
-{problem}
+                Problem Statement:
+                {problem}
 
-Solution Files:
-{solution_summary}
+                Solution Files:
+                {solution_summary}
 
-Generated Tests:
-{response}
+                Generated Tests:
+                {response}
 
-Check for:
-1. Incorrect/invalid input/output pairs based on problem statement - fix or remove them
-2. Missing critical edge cases - add them
-3. Minimize testcases (context limit)
+                Check for:
+                1. Incorrect/invalid input/output pairs based on problem statement - fix or remove them
+                2. Missing critical edge cases - add them
+                3. Minimize testcases (context limit)
 
-If tests are valid and complete:
-- Return the original tests unchanged
+                If tests are valid and complete:
+                - Return the original tests unchanged
 
-STRICT REQUIREMENT: Return ONLY the final Python test code with file names.
+                STRICT REQUIREMENT: Return ONLY the final Python test code with file names.
 
-Example format:
-test_main.py
-import pytest
-from main import solution
+                Example format:
+                test_main.py
+                import pytest
+                from main import solution
 
-def test_basic():
-    assert solution() == expected
-"""
+                def test_basic():
+                    assert solution() == expected
+                """
             
             validated_response = call_llm(
                 [{"role": "user", "content": validation_prompt}],
@@ -741,11 +814,72 @@ def test_basic():
         # Fallback: return last part of output (increased from 2000 to 5000 chars)
         return test_output[-5000:] if len(test_output) > 5000 else test_output
     
+    def _analyze_failure_patterns(self, failure_summary: str) -> str:
+        """Analyze actual failure patterns from test output to generate intelligent hints."""
+        hints = []
+        
+        # Extract failing test names and convert them to hints
+        test_names = []
+        lines = failure_summary.split('\n')
+        for line in lines:
+            # Look for test method names (usually start with test_ or contain ::test)
+            if 'test_' in line and ('FAILED' in line or 'def test_' in line or '::test_' in line):
+                # Extract test name
+                import re
+                match = re.search(r'test_[\w_]+', line)
+                if match:
+                    test_name = match.group(0)
+                    if test_name not in test_names:
+                        test_names.append(test_name)
+        
+        # Convert test names to human-readable hints
+        if test_names:
+            hints.append("📋 FAILING TESTS:")
+            for test_name in test_names[:5]:  # Limit to 5 most relevant
+                # Convert snake_case test name to readable hint
+                readable = test_name.replace('test_', '').replace('_', ' ')
+                hints.append(f"   • {test_name}: {readable}")
+        
+        # Analyze assertion failures to understand what's expected vs actual
+        lines = failure_summary.split('\n')
+        
+        for i, line in enumerate(lines):
+            # Look for assertion errors with expected vs actual values
+            if 'AssertionError' in line or 'assertEqual' in line or 'assert' in line.lower():
+                # Get context around the assertion (2 lines before and after)
+                context_start = max(0, i - 2)
+                context_end = min(len(lines), i + 3)
+                context = '\n'.join(lines[context_start:context_end])
+                
+                # Analyze patterns in the assertion
+                if '[]' in context and 'observer' in context.lower():
+                    # Expected empty list but got something - likely callback fired when it shouldn't
+                    hints.append("⚠️ PATTERN DETECTED: Callbacks are firing when they shouldn't. Check if you're comparing values before triggering callbacks.")
+                
+                elif 'expected' in context.lower() and 'actual' in context.lower():
+                    # Extract what was expected vs what was received
+                    hints.append(f"⚠️ ASSERTION FAILURE CONTEXT:\n{context[:200]}")
+        
+        # Look for common error patterns
+        if 'callback' in failure_summary.lower():
+            callback_count = failure_summary.lower().count('callback')
+            if callback_count > 3:
+                hints.append(f"⚠️ Multiple callback-related failures detected ({callback_count} mentions). Focus on callback triggering logic.")
+        
+        # Look for value comparison issues
+        if 'value' in failure_summary.lower() and ('change' in failure_summary.lower() or 'same' in failure_summary.lower()):
+            hints.append("⚠️ Value comparison issue detected. Ensure you're tracking previous values and only triggering actions when values actually change.")
+        
+        return "\n\n".join(hints) if hints else ""
+    
     def fix_failures(self, problem: str, test_output: str, files: Dict[str, str]) -> Optional[Dict[str, str]]:
         """Fix failures using LLM with detailed error context."""
         # Extract detailed failure information from FAILURES section
         # Limit to 200 lines to avoid context overflow
         failure_summary = self._extract_failure_summary(test_output, max_lines=200)
+        
+        # Analyze actual failure patterns to generate intelligent hints
+        pattern_hints = self._analyze_failure_patterns(failure_summary)
         
         # Detect if this is a large problem (SWE-Bench style)
         total_file_size = sum(len(content) for content in files.values())
@@ -778,33 +912,43 @@ def test_basic():
         # Truncate problem statement too
         problem = truncate_text(problem, max_chars=max_problem_chars)
         
+        # Build prompt with pattern-based hints if available
+        hints_section = ""
+        if pattern_hints:
+            hints_section = f"""
+
+                    🔍 FAILURE PATTERN ANALYSIS:
+                    {pattern_hints}
+                    
+                    """
+        
         prompt = f"""You are an expert debugger. Fix the failing tests by analyzing the detailed error messages.
 
-Problem Statement:
-{problem}
+                    Problem Statement:
+                    {problem}
 
-Current Code:
-{files_summary}
+                    Current Code:
+                    {files_summary}
 
-Detailed Test Failures (with stack traces and assertions):
-{failure_summary}
+                    Detailed Test Failures (with stack traces and assertions):
+                    {failure_summary}{hints_section}
 
-Instructions:
-1. Read the FULL error messages and stack traces above
-2. Identify the EXACT cause of each failure (wrong value, missing method, logic error, etc.)
-3. Fix the code to address the root cause
-4. Ensure all edge cases are handled
-5. Don't break existing passing tests
+                    Instructions:
+                    1. Read the FULL error messages and stack traces above
+                    2. {f"Pay attention to the failure patterns identified above" if pattern_hints else "Identify the EXACT cause of each failure (wrong value, missing method, logic error, etc.)"}
+                    3. Fix the code to address the root cause
+                    4. Ensure all edge cases are handled
+                    5. Don't break existing passing tests
 
-CRITICAL: The error messages above show you EXACTLY what's wrong. Use them!
+                    CRITICAL: The error messages above show you EXACTLY what's wrong. Use them!
 
-Output the fixed code in this format:
-filename.py
-```python
-<complete fixed code>
-```
+                    Output the fixed code in this format:
+                    filename.py
+                    ```python
+                    <complete fixed code>
+                    ```
 
-Generate the fixed code:"""
+                    Generate the fixed code:"""
         
         try:
             response = call_llm(
@@ -838,81 +982,81 @@ class LLMArchitectureGenerator(IArchitectureGenerator):
         
         prompt = f"""You are an expert Python architect. The current solution is stuck on edge cases that require a DIFFERENT ARCHITECTURAL APPROACH.
 
-Use systematic reasoning to analyze the problem and propose alternative architectures:
+                    Use systematic reasoning to analyze the problem and propose alternative architectures:
 
-STEP 1 - UNDERSTAND THE PROBLEM DOMAIN:
-Analyze the problem statement to identify:
-- What type of problem is this? (e.g., reactive system, API, data processing, algorithm, etc.)
-- What are the core requirements and constraints?
-- What patterns or paradigms are most relevant?
+                    STEP 1 - UNDERSTAND THE PROBLEM DOMAIN:
+                    Analyze the problem statement to identify:
+                    - What type of problem is this? (e.g., reactive system, API, data processing, algorithm, etc.)
+                    - What are the core requirements and constraints?
+                    - What patterns or paradigms are most relevant?
 
-STEP 2 - ANALYZE WHY CURRENT APPROACH IS FAILING:
-Examine the test failures to understand:
-- What is the root cause of the failures? (not just symptoms)
-- Why can't the current architecture handle this case?
-- What fundamental assumption or design choice is problematic?
+                    STEP 2 - ANALYZE WHY CURRENT APPROACH IS FAILING:
+                    Examine the test failures to understand:
+                    - What is the root cause of the failures? (not just symptoms)
+                    - Why can't the current architecture handle this case?
+                    - What fundamental assumption or design choice is problematic?
 
-STEP 3 - GENERATE ALTERNATIVE ARCHITECTURES:
-Propose 3 COMPLETELY DIFFERENT architectural approaches that could solve this problem.
-For each alternative, explain:
-- Architecture name and core concept
-- Key design principles
-- Why this approach addresses the root cause
-- Trade-offs and considerations
+                    STEP 3 - GENERATE ALTERNATIVE ARCHITECTURES:
+                    Propose 3 COMPLETELY DIFFERENT architectural approaches that could solve this problem.
+                    For each alternative, explain:
+                    - Architecture name and core concept
+                    - Key design principles
+                    - Why this approach addresses the root cause
+                    - Trade-offs and considerations
 
-This is attempt #{attempt}, so focus on approaches that are FUNDAMENTALLY DIFFERENT from typical solutions.
+                    This is attempt #{attempt}, so focus on approaches that are FUNDAMENTALLY DIFFERENT from typical solutions.
 
-STEP 4 - SELECT AND IMPLEMENT:
-Choose the most promising approach (approach #{min(attempt, 6)}) from your alternatives.
+                    STEP 4 - SELECT AND IMPLEMENT:
+                    Choose the most promising approach (approach #{min(attempt, 6)}) from your alternatives.
 
-**SELECTION CRITERIA (prioritize in this order):**
-1. **Directly addresses the failing test's edge case** (highest priority)
-2. **Simple to implement** (fewer moving parts = fewer bugs)
-3. **Minimal changes to working code** (preserve what already passes)
-   - {test_results.passed}/{test_results.total} tests already pass
+                    **SELECTION CRITERIA (prioritize in this order):**
+                    1. **Directly addresses the failing test's edge case** (highest priority)
+                    2. **Simple to implement** (fewer moving parts = fewer bugs)
+                    3. **Minimal changes to working code** (preserve what already passes)
+                       - {test_results.passed}/{test_results.total} tests already pass
 
-Provide a complete implementation with:
-- Clear explanation of the architecture
-- How it solves the specific failing test cases
-- Complete, working code
+                    Provide a complete implementation with:
+                    - Clear explanation of the architecture
+                    - How it solves the specific failing test cases
+                    - Complete, working code
 
-Problem Statement:
-{problem}
+                    Problem Statement:
+                    {problem}
 
-Current Implementation (STUCK - Attempt #{attempt}):
-{current_code}
+                    Current Implementation (STUCK - Attempt #{attempt}):
+                    {current_code}
 
-Persistent Test Failures:
-Failing tests: {failing_tests}
-Passed: {test_results.passed}/{test_results.total}
+                    Persistent Test Failures:
+                    Failing tests: {failing_tests}
+                    Passed: {test_results.passed}/{test_results.total}
 
-NOW, COMPLETE THE ANALYSIS AND IMPLEMENTATION:
+                    NOW, COMPLETE THE ANALYSIS AND IMPLEMENTATION:
 
-Follow the 4-step process above to:
-1. Identify the problem domain
-2. Analyze the failure pattern
-3. Generate 3 architectural alternatives
-4. Select and implement approach #{min(attempt, 6)}
+                    Follow the 4-step process above to:
+                    1. Identify the problem domain
+                    2. Analyze the failure pattern
+                    3. Generate 3 architectural alternatives
+                    4. Select and implement approach #{min(attempt, 6)}
 
-CRITICAL REQUIREMENTS:
-- The current architecture CANNOT fix these failures through incremental changes
-- You MUST redesign with a FUNDAMENTALLY DIFFERENT approach
-- Do NOT try to patch the old code - start FRESH with new design
-- Make sure the new architecture handles the edge case that's failing
-- Provide COMPLETE working code, not just snippets
+                    CRITICAL REQUIREMENTS:
+                    - The current architecture CANNOT fix these failures through incremental changes
+                    - You MUST redesign with a FUNDAMENTALLY DIFFERENT approach
+                    - Do NOT try to patch the old code - start FRESH with new design
+                    - Make sure the new architecture handles the edge case that's failing
+                    - Provide COMPLETE working code, not just snippets
 
-OUTPUT FORMAT:
-First, show your reasoning:
-**ARCHITECTURE NAME:** [Give it a descriptive name]
-**REASONING:** [Explain why this architecture solves the problem]
+                    OUTPUT FORMAT:
+                    First, show your reasoning:
+                    **ARCHITECTURE NAME:** [Give it a descriptive name]
+                    **REASONING:** [Explain why this architecture solves the problem]
 
-Then provide the complete code:
-filename.py
-```python
-<complete code>
-```
+                    Then provide the complete code:
+                    filename.py
+                    ```python
+                    <complete code>
+                    ```
 
-Generate your alternative architecture:"""
+                    Generate your alternative architecture:"""
         
         try:
             response = call_llm(
@@ -1247,14 +1391,13 @@ class RefinementLoop:
         # Initialize tracking
         previous_failed = set(initial_baseline.failed_tests) if initial_baseline else set()
         stuck_count = 0
-        alternatives_tried = 0
         best_score = initial_baseline.passed if initial_baseline else 0
         iterations_without_improvement = 0
         
         for iteration in range(self.config.max_iterations):
             # Check timeout
             if time.time() - start_time > self.config.timeout - 60:
-                print(f"[TIMEOUT] Stopping refinement")
+                print("[TIMEOUT] Stopping refinement")
                 break
             
             print(f"\n--- Iteration {iteration + 1}/{self.config.max_iterations} ---")
@@ -1282,92 +1425,13 @@ class RefinementLoop:
             if current_failed == previous_failed and len(current_failed) > 0:
                 stuck_count += 1
                 
-                # Try alternative architecture
-                if stuck_count >= self.config.stuck_threshold and alternatives_tried < self.config.max_alternatives:
+                # Stop if stuck for too long (alternative architectures handled at round level)
+                if stuck_count >= self.config.stuck_threshold:
                     print(f"\n[STUCK] Same {len(current_failed)} test(s) failing for {stuck_count} iterations")
-                    print(f"[STUCK] Trying alternative architecture #{alternatives_tried + 1}/{self.config.max_alternatives}...")
-                    
-                    # Save current solution
-                    best_solution = solution_files.copy()
-                    best_score = results.passed
-                    print(f"[BACKUP] Saved current solution: {best_score}/{results.total} passed")
-                    
-                    # Try alternative
-                    improved, alternative, final_results = self.arch_manager.try_alternative(
-                        problem,
-                        solution_files,
-                        results,
-                        self.test_manager,
-                        self.fix_manager,
-                        alternatives_tried + 1,
-                        min(self.config.alternative_iterations, self.config.max_iterations - iteration - 1),
-                        best_score
-                    )
-                    
-                    if alternative:
-                        alternatives_tried += 1
-                        
-                        print(f"\n[COMPARISON] Original: {best_score}/{results.total} | {alternative.name}: {final_results.passed}/{final_results.total}")
-                        
-                        if improved:
-                            print(f"[ALTERNATIVE #{alternatives_tried}] ✓ Better! Continuing with '{alternative.name}'...")
-                            stuck_count = 0
-                            previous_failed = set(final_results.failed_tests)
-                            continue
-                        else:
-                            print(f"[ALTERNATIVE #{alternatives_tried}] ✗ Not better, reverting...")
-                            solution_files.update(best_solution)
-                            self.fix_manager.files.write_files(best_solution)
-                            stuck_count = 2  # Keep at threshold
-                            previous_failed = current_failed
-                            continue
-                    else:
-                        print(f"[STUCK] Could not generate alternative")
-                        stuck_count = 2
-                
-                elif stuck_count >= self.config.stuck_threshold and alternatives_tried >= self.config.max_alternatives:
-                    print(f"\n[STUCK] Tried {alternatives_tried} alternatives, all failed. Stopping.")
+                    print("[STUCK] Stopping refinement. Will try new architectures in next round.")
                     break
             else:
                 stuck_count = 0
-            
-            # Also trigger alternative if no improvement for too long
-            if iterations_without_improvement >= 5 and alternatives_tried < self.config.max_alternatives:
-                print(f"\n[NO PROGRESS] No improvement for {iterations_without_improvement} iterations")
-                print(f"[NO PROGRESS] Trying alternative architecture #{alternatives_tried + 1}/{self.config.max_alternatives}...")
-                
-                # Save current solution
-                best_solution = solution_files.copy()
-                current_score = results.passed
-                print(f"[BACKUP] Saved current solution: {current_score}/{results.total} passed")
-                
-                # Try alternative
-                improved, alternative, final_results = self.arch_manager.try_alternative(
-                    problem,
-                    solution_files,
-                    results,
-                    self.test_manager,
-                    self.fix_manager,
-                    alternatives_tried + 1,
-                    min(self.config.alternative_iterations, self.config.max_iterations - iteration - 1),
-                    current_score
-                )
-                
-                if alternative:
-                    alternatives_tried += 1
-                    
-                    if improved:
-                        print(f"[ALTERNATIVE #{alternatives_tried}] ✓ Better! Continuing...")
-                        iterations_without_improvement = 0
-                        best_score = final_results.passed
-                        previous_failed = set(final_results.failed_tests)
-                        continue
-                    else:
-                        print(f"[ALTERNATIVE #{alternatives_tried}] ✗ Not better, reverting...")
-                        solution_files.update(best_solution)
-                        self.fix_manager.files.write_files(best_solution)
-                        iterations_without_improvement = 3  # Reset but keep elevated
-                        continue
             
             previous_failed = current_failed
             
@@ -1421,50 +1485,133 @@ class TestDrivenAgent:
             print("[STEP 1] No existing tests found, generating test suite...")
             test_files = self.code_generator.generate_tests(problem, {})
             self.file_manager.write_files(test_files)
-            print(f"[STEP 1] Created test files")
+            print("[STEP 1] Created test files")
         else:
             print(f"[STEP 1] Found {len(existing_tests)} existing test files")
             print("[STEP 1] Using existing tests from dataset")
         
-        # Step 2: Generate solution(s)
+        # Step 2: Generate solution(s) with restart mechanism to escape local minima
         if ENABLE_PARALLEL:
-            # Parallel mode: Generate multiple solutions and pick best
-            print("\n[STEP 2] Generating multiple solutions in parallel...")
+            # Parallel mode with refinement in each round
+            print("\n[STEP 2] Multi-round parallel generation with refinement...")
+            
+            # Dynamic configuration based on CPU resources
+            optimal_workers = ResourceManager.get_optimal_workers()
+            max_rounds = 2  # Reduced from 4 - with more solutions per round, need fewer rounds
+            solutions_per_round = optimal_workers  # Match worker count for maximum parallelism
+            
+            solution_files = {}
+            found_perfect = False
+            
+            # Create instances for parallel generation
             parallel_gen = ParallelSolutionGenerator(
                 self.code_generator,
                 self.test_manager,
                 self.file_manager
             )
             
-            best_candidate = parallel_gen.find_best_solution(
-                problem,
-                max_rounds=3,
-                solutions_per_round=3
+            refinement_loop = RefinementLoop(
+                self.test_manager,
+                self.fix_manager,
+                self.arch_manager,
+                self.config
             )
             
-            if best_candidate and best_candidate.is_perfect:
-                print(f"\n[STEP 2] ✓ Found perfect solution!")
+            best_overall = None
+            found_perfect = False
+            
+            # Track best candidate from previous round to learn from its failures
+            best_from_previous_round = None
+            
+            for round_num in range(1, max_rounds + 1):
+                print(f"\n{'='*80}")
+                print(f"ROUND {round_num}/{max_rounds} - Generate N Solutions + Refine Best")
+                print(f"{'='*80}")
+                
+                # Generate N solutions in parallel with different architectures
+                # Pass best candidate info from previous round to target its failures
+                print(f"\n[ROUND {round_num}] Generating {solutions_per_round} solutions in parallel...")
+                candidates = parallel_gen.generate_multiple_solutions(
+                    problem, 
+                    solutions_per_round, 
+                    best_candidate_info=best_from_previous_round
+                )
+                
+                if not candidates:
+                    print(f"[ROUND {round_num}] ✗ No valid solutions generated")
+                    continue
+                
+                # Check if all solutions failed due to network issues
+                network_failures = sum(1 for c in candidates if c.network_error)
+                valid_solutions = [c for c in candidates if not c.network_error and c.score > 0]
+                
+                if network_failures >= len(candidates) * 0.75:  # 75% or more failed due to network
+                    print(f"[NETWORK] {network_failures}/{len(candidates)} solutions failed due to network issues")
+                    print("[NETWORK] Gateway appears unstable or down")
+                    continue  # Skip to next round
+                
+                if not valid_solutions:
+                    print(f"[ROUND {round_num}] ✗ No valid solutions (all had network errors or zero score)")
+                    print("[SKIP] Skipping refinement, moving to next round")
+                    continue
+                
+                # Pick best from this round (candidates already sorted by score, perfect solution first)
+                best_candidate = candidates[0]
+                print(f"\n[ROUND {round_num}] Best candidate: '{best_candidate.architecture_name}' "
+                      f"({best_candidate.score}/{best_candidate.test_results.total if best_candidate.test_results else 0} tests)")
+                
+                # Store solution files for patch generation
                 solution_files = best_candidate.solution_files
-                self.file_manager.write_files(solution_files)
-            elif best_candidate:
-                print(f"\n[STEP 2] Using best solution ({best_candidate.score} tests passed)")
-                solution_files = best_candidate.solution_files
+                
+                # Check if already perfect (BEFORE refining)
+                if best_candidate.is_perfect:
+                    print(f"\n[ROUND {round_num}] ✓ Perfect solution found!")
+                    self.file_manager.write_files(solution_files)
+                    found_perfect = True
+                    break
+                
+                # Refine the best candidate
+                print(f"\n[ROUND {round_num}] Refining best solution...")
                 self.file_manager.write_files(solution_files)
                 
-                # Refine the best solution
-                print("\n[STEP 3] Refining best solution...")
-                initial_results = best_candidate.test_results
-                refinement_loop = RefinementLoop(
-                    self.test_manager,
-                    self.fix_manager,
-                    self.arch_manager,
-                    self.config
-                )
-                refinement_loop.run(problem, solution_files, start_time, initial_results)
-            else:
-                print("\n[STEP 2] ✗ All solutions failed, falling back to sequential mode")
-                solution_files = self.code_generator.generate_solution(problem)
-                self.file_manager.write_files(solution_files)
+                success = refinement_loop.run(problem, solution_files, start_time, best_candidate.test_results)
+                
+                if success:
+                    print(f"\n[ROUND {round_num}] ✓ Refinement achieved perfect solution!")
+                    found_perfect = True
+                    break
+                
+                # Track best overall
+                final_results, _ = self.test_manager.run_and_parse()
+                
+                if best_overall is None or final_results.passed > best_overall.score:
+                    best_overall = SolutionCandidate(
+                        solution_files=solution_files.copy(),
+                        test_results=final_results,
+                        architecture_name=best_candidate.architecture_name,
+                        generation_time=0
+                    )
+                    print(f"[ROUND {round_num}] New best overall: {final_results.passed}/{final_results.total} tests")
+                
+                # Prepare info for next round - focus on best candidate's failures
+                if round_num < max_rounds and final_results.failed > 0:
+                    best_from_previous_round = {
+                        'architecture': best_candidate.architecture_name,
+                        'test_results': final_results,
+                        'failed_tests': final_results.failed_tests,
+                        'error_details': final_results.error_details
+                    }
+                    print(f"\n[ROUND {round_num}] No perfect solution yet. Next round will target these {final_results.failed} failures...")
+                elif round_num < max_rounds:
+                    print(f"\n[ROUND {round_num}] No perfect solution yet. Trying NEW architectures in next round...")
+            
+            # Use best solution if no perfect solution found
+            if not found_perfect and best_overall:
+                print(f"\n[FINAL] All {max_rounds} rounds completed. Best: {best_overall.score} tests")
+                self.file_manager.write_files(best_overall.solution_files)
+                solution_files = best_overall.solution_files
+            elif not found_perfect:
+                print("[WARNING] No valid solution found!")
         else:
             # Sequential mode: Original behavior
             print("\n[STEP 2] Generating initial solution...")
@@ -1489,6 +1636,9 @@ class TestDrivenAgent:
         
         # Generate patch
         print("\n[COMPLETE] Generating patch...")
+        if not solution_files:
+            print("[ERROR] No solution files generated - cannot create patch")
+            return ""
         patch = self._generate_patch(solution_files)
         print(f"[COMPLETE] Generated patch ({len(patch)} bytes)")
         return patch
@@ -1541,7 +1691,7 @@ class TestDrivenAgent:
 # ============================================================================
 
 class ParallelSolutionGenerator:
-    """Generates and tests multiple solutions in parallel."""
+    """Generates and tests multiple solutions in parallel with COT-based architecture diversity."""
     
     def __init__(self, code_generator, test_manager, file_manager):
         self.code_generator = code_generator
@@ -1551,9 +1701,269 @@ class ParallelSolutionGenerator:
         self.num_workers = ResourceManager.get_optimal_workers()
         self.perfect_solution_found = False  # Flag for early termination
         self.termination_lock = Lock()  # Protect the flag
+        self.used_architecture_descriptions = []  # Track used architectures
+        self.architecture_lock = Lock()  # Protect architecture tracking
     
-    def generate_and_test_solution(self, problem: str, architecture_hint: Optional[str] = None) -> Optional[SolutionCandidate]:
-        """Generate a single solution and test it (thread-safe). Returns None if terminated early."""
+    def generate_diverse_architectures(self, problem: str, num_architectures: int, best_candidate_info: Optional[Dict] = None) -> List[str]:
+        """Use COT to generate N diverse architectural approaches for the problem.
+        
+        Args:
+            problem: Problem statement
+            num_architectures: Number of architectures to generate
+            best_candidate_info: Dict with 'architecture', 'test_results', 'failed_tests', 'error_details' from best previous candidate
+        """
+        problem_summary = truncate_text(problem, max_chars=2000)
+        
+        # Build list of previously used architectures with their results
+        avoid_list = ""
+        if self.used_architecture_descriptions:
+            avoid_list = "\n\nPREVIOUSLY TRIED ARCHITECTURES (DO NOT REPEAT):\n"
+            for i, arch in enumerate(self.used_architecture_descriptions[-6:], 1):
+                avoid_list += f"{i}. {arch}\n"
+        
+        # Add detailed failure analysis from ALL previous candidates
+        failure_analysis = ""
+        if best_candidate_info:
+            # Use formatted failure breakdown if available
+            failure_breakdown = best_candidate_info.get('failure_breakdown', '')
+            
+            if failure_breakdown:
+                failure_analysis = "\n\n" + failure_breakdown + "\n"
+                failure_analysis += "💡 YOUR TASK:\n"
+                failure_analysis += f"Generate {num_architectures} NEW architectures that specifically ADDRESS the failures above.\n"
+                failure_analysis += "Study the test names and hints - they tell you EXACTLY what's failing.\n"
+                failure_analysis += "Think about what architectural patterns would PREVENT these specific errors.\n"
+            else:
+                # Fallback to old format if breakdown not available
+                test_results = best_candidate_info.get('test_results')
+                failed_tests = best_candidate_info.get('failed_tests', [])
+                
+                if test_results:
+                    failure_analysis = "\n\n🎯 CRITICAL - LEARN FROM PREVIOUS ATTEMPTS:\n"
+                    failure_analysis += f"Best Architecture: {best_candidate_info.get('architecture', 'Unknown')}\n"
+                    failure_analysis += f"Score: {test_results.passed}/{test_results.total} tests passed\n"
+                    
+                    if failed_tests:
+                        failure_analysis += f"\n❌ FAILED TESTS ({len(failed_tests)}):\n"
+                        for i, test_name in enumerate(failed_tests[:5], 1):
+                            readable = test_name.replace('test_', '').replace('_', ' ')
+                            failure_analysis += f"{i}. {test_name}\n"
+                            failure_analysis += f"   Hint: {readable}\n"
+                        
+                        failure_analysis += "\n💡 YOUR TASK:\n"
+                        failure_analysis += f"Generate {num_architectures} NEW architectures that specifically ADDRESS these failures.\n"
+                        failure_analysis += "Think about what architectural patterns would PREVENT these specific errors.\n"
+        
+        prompt = f"""You are an expert software architect. Generate {num_architectures} COMPLETELY DIFFERENT architectural approaches to solve this problem.
+
+            Problem Summary:
+            {problem_summary}
+            {avoid_list}
+            {failure_analysis}
+            
+            Use Chain-of-Thought reasoning to ensure diversity:
+            
+            STEP 1 - ANALYZE PROBLEM DOMAIN:
+            - What type of problem is this? (algorithm, data processing, API, state management, etc.)
+            - What are the core operations needed?
+            - What are the key constraints?
+            
+            STEP 2 - BRAINSTORM DIVERSE PARADIGMS:
+            Think of {num_architectures} FUNDAMENTALLY DIFFERENT ways to approach this:
+            - Different programming paradigms (functional, OOP, procedural, data-driven)
+            - Different design patterns (strategy, state machine, builder, pipeline, etc.)
+            - Different data structures (dict-based, class-based, list-based, generator-based)
+            - Different control flows (recursive, iterative, event-driven, declarative)
+            
+            STEP 3 - SELECT {num_architectures} MOST DISTINCT APPROACHES:
+            Choose approaches that are MAXIMALLY DIFFERENT from each other and from previously used ones.
+            
+            CRITICAL REQUIREMENTS:
+            - Each architecture must be FUNDAMENTALLY different (not just minor variations)
+            - Avoid any similarity to previously used architectures
+            - Be specific about the core design principle of each approach
+            
+            OUTPUT FORMAT - CRITICAL:
+            You MUST output EXACTLY {num_architectures} lines in this format (no preamble, no explanation):
+            
+            Architecture 1: [One concise sentence describing the core architectural approach]
+            Architecture 2: [One concise sentence describing a COMPLETELY DIFFERENT approach]
+            Architecture 3: [One concise sentence describing yet ANOTHER DIFFERENT approach]
+            ...
+            
+            DO NOT include any introductory text. Start directly with "Architecture 1:".
+            
+            Generate {num_architectures} diverse architectures NOW:"""
+        
+        try:
+            response = call_llm(
+                [{"role": "user", "content": prompt}],
+                model=REASONING_MODEL,
+                temperature=0.9  # High temperature for diversity
+            )
+            
+            # Parse architectures from response - be strict first, then flexible
+            architectures = []
+            lines = response.split('\n')
+            
+            # First pass: Look for proper "Architecture N:" format
+            for line in lines:
+                line = line.strip()
+                if line.startswith('Architecture ') and ':' in line:
+                    arch_desc = line.split(':', 1)[1].strip()
+                    if arch_desc and len(arch_desc) > 20:  # Meaningful description
+                        architectures.append(arch_desc)
+            
+            # Second pass: Try numbered list format "1.", "2.", etc.
+            if len(architectures) < num_architectures:
+                for line in lines:
+                    line = line.strip()
+                    # Match "1. Description" or "Approach 1: Description"
+                    if any(line.startswith(f"{i}.") for i in range(1, 11)) or line.startswith('Approach '):
+                        if ':' in line:
+                            arch_desc = line.split(':', 1)[1].strip()
+                        else:
+                            arch_desc = line.split('.', 1)[1].strip() if '.' in line else line
+                        if arch_desc and len(arch_desc) > 20 and arch_desc not in architectures:
+                            architectures.append(arch_desc)
+            
+            # Fallback: Extract meaningful sentences (skip preamble)
+            if len(architectures) < num_architectures:
+                print(f"[COT] Warning: Only parsed {len(architectures)} architectures, using fallback")
+                skip_keywords = ['here are', 'fundamentally different', 'architectural approaches', 
+                                'step 1', 'step 2', 'step 3', 'critical', 'output format']
+                for line in lines:
+                    line = line.strip()
+                    # Skip preamble and instructions
+                    if any(keyword in line.lower() for keyword in skip_keywords):
+                        continue
+                    # Skip lines that are too short or look like headers
+                    if len(line) > 40 and not line.startswith('#') and not line.startswith('**'):
+                        if line not in architectures:
+                            architectures.append(line)
+                            if len(architectures) >= num_architectures:
+                                break
+            
+            # Track these architectures
+            with self.architecture_lock:
+                self.used_architecture_descriptions.extend(architectures)
+            
+            print(f"[COT] Generated {len(architectures)} diverse architectures:")
+            for i, arch in enumerate(architectures, 1):
+                print(f"  {i}. {arch[:80]}...")
+            
+            return architectures[:num_architectures]
+            
+        except Exception as e:
+            print(f"[COT] Failed to generate architectures: {e}")
+            # Fallback: return generic hints with high temperature
+            return [f"Approach {i+1}" for i in range(num_architectures)]
+    
+    def _format_failure_breakdown(self, failure_breakdown: List[Dict]) -> str:
+        """Format failure breakdown in a clear, structured way for LLM."""
+        if not failure_breakdown:
+            return ""
+        
+        formatted = "📊 DETAILED FAILURE ANALYSIS BY ARCHITECTURE:\n"
+        formatted += "=" * 80 + "\n\n"
+        
+        for i, entry in enumerate(failure_breakdown, 1):
+            arch_name = entry['architecture']
+            score = entry['score']
+            failed_tests = entry['failed_tests']
+            test_output = entry.get('test_output', '')
+            
+            formatted += f"Architecture {i}: {arch_name}\n"
+            formatted += f"Score: {score}\n"
+            
+            if failed_tests:
+                formatted += f"Failed Tests ({len(failed_tests)}):\n"
+                for test_name in failed_tests:
+                    # Extract hints from test name (convert snake_case to readable)
+                    readable_hint = test_name.replace('test_', '').replace('_', ' ')
+                    formatted += f"  ❌ {test_name}\n"
+                    formatted += f"     Hint: {readable_hint}\n"
+                
+                # Add test output if available
+                if test_output:
+                    formatted += "\nTest Output (first 500 chars):\n"
+                    formatted += f"  {test_output[:500]}\n"
+            else:
+                formatted += "✅ All tests passed!\n"
+            
+            formatted += "\n" + "-" * 80 + "\n\n"
+        
+        # Summary of all unique failures
+        all_unique_failures = set()
+        for entry in failure_breakdown:
+            all_unique_failures.update(entry['failed_tests'])
+        
+        if all_unique_failures:
+            formatted += f"🎯 SUMMARY: {len(all_unique_failures)} unique test failures across all architectures:\n"
+            for test_name in sorted(all_unique_failures):
+                readable = test_name.replace('test_', '').replace('_', ' ')
+                formatted += f"  • {test_name} ({readable})\n"
+        
+        return formatted
+    
+    def _build_failure_context(self, candidates: List[SolutionCandidate]) -> Optional[Dict]:
+        """Build failure context from ALL completed solutions for dynamic architecture generation."""
+        if not candidates:
+            return None
+        
+        # Find best candidate so far
+        best = max(candidates, key=lambda c: c.score)
+        
+        # Aggregate ALL unique failed tests from ALL candidates
+        all_failed_tests = set()
+        all_architectures = []
+        
+        # Build detailed failure breakdown by architecture
+        failure_breakdown = []
+        
+        for candidate in candidates:
+            if candidate.test_results:
+                # Add this candidate's architecture to the list
+                all_architectures.append(candidate.architecture_name)
+                
+                # Collect failed tests
+                candidate_failures = []
+                if hasattr(candidate.test_results, 'failed_tests'):
+                    candidate_failures = candidate.test_results.failed_tests
+                    all_failed_tests.update(candidate_failures)
+                
+                # Build detailed entry for this candidate
+                failure_breakdown.append({
+                    "architecture": candidate.architecture_name,
+                    "score": f"{candidate.test_results.passed}/{candidate.test_results.total}",
+                    "failed_tests": candidate_failures,
+                    "test_output": getattr(candidate.test_results, 'output', '')[:500]  # First 500 chars
+                })
+        
+        if not best.test_results:
+            return None
+        
+        # Format failure breakdown as readable text for LLM
+        formatted_failures = self._format_failure_breakdown(failure_breakdown)
+        
+        return {
+            "architecture": best.architecture_name,
+            "test_results": best.test_results,
+            "failed_tests": list(all_failed_tests),  # ← ALL unique failures
+            "score": best.score,
+            "num_completed": len(candidates),
+            "tried_architectures": all_architectures,
+            "failure_breakdown": formatted_failures  # ← Formatted for LLM
+        }
+    
+    def generate_and_test_solution(self, problem: str, architecture_hint: Optional[str] = None, failure_hints: Optional[str] = None) -> Optional[SolutionCandidate]:
+        """Generate a single solution and test it (thread-safe). Returns None if terminated early.
+        
+        Args:
+            problem: Problem statement
+            architecture_hint: Specific architecture approach
+            failure_hints: Formatted failure information from previous attempts
+        """
         # Check if another thread already found a perfect solution
         with self.termination_lock:
             if self.perfect_solution_found:
@@ -1563,8 +1973,8 @@ class ParallelSolutionGenerator:
         start_time = time.time()
         
         try:
-            # Generate solution
-            solution_files = self.code_generator.generate_solution(problem, architecture_hint)
+            # Generate solution with failure hints
+            solution_files = self.code_generator.generate_solution(problem, architecture_hint, failure_hints)
             arch_name = architecture_hint or "default"
             
             # Check again before expensive testing
@@ -1599,36 +2009,69 @@ class ParallelSolutionGenerator:
             return candidate
         
         except Exception as e:
-            print(f"[PARALLEL] Error generating solution: {e}")
+            error_msg = str(e)
+            is_network_error = "Connection refused" in error_msg or "gateway" in error_msg.lower() or "unreachable" in error_msg.lower()
+            
+            if is_network_error:
+                print(f"[ERROR] Solution generation failed: {e}")
+            else:
+                print(f"[PARALLEL] Error generating solution: {e}")
+            
             return SolutionCandidate(
                 solution_files={},
                 test_results=None,
                 architecture_name=architecture_hint or "failed",
-                generation_time=time.time() - start_time
+                generation_time=time.time() - start_time,
+                network_error=is_network_error
             )
     
     def generate_multiple_solutions(
         self, 
         problem: str, 
         num_solutions: int = 3,
-        architecture_hints: Optional[List[str]] = None
+        architecture_hints: Optional[List[str]] = None,
+        best_candidate_info: Optional[Dict] = None,
+        use_dynamic_queue: bool = True
     ) -> List[SolutionCandidate]:
-        """Generate multiple solutions in parallel and return all candidates."""
+        """Generate multiple solutions in parallel with GUARANTEED diverse architectures.
+        
+        Args:
+            problem: Problem statement
+            num_solutions: Number of solutions to generate
+            architecture_hints: Pre-generated architecture hints (optional)
+            best_candidate_info: Info about best previous candidate (architecture, test_results, failed_tests, errors)
+            use_dynamic_queue: If True, dynamically generate new architectures as solutions complete
+        """
+        
+        # CRITICAL: Generate diverse architectures BEFORE threading to guarantee uniqueness
+        if not architecture_hints:
+            print(f"\n[COT] Generating up to {num_solutions} diverse architectures using Chain-of-Thought...")
+            architecture_hints = self.generate_diverse_architectures(problem, num_solutions, best_candidate_info)
+            
+            # Accept whatever architectures are available - don't force padding
+            if not architecture_hints:
+                print("[COT] ⚠️ No architectures generated, using single default approach")
+                architecture_hints = ["Default approach"]
+            elif len(architecture_hints) < num_solutions:
+                actual_count = len(architecture_hints)
+                print(f"[COT] ✓ Generated {actual_count} unique architectures (requested {num_solutions})")
+                print("[COT] This is the maximum diversity available for this problem - adjusting expectations")
+                # Update num_solutions to match what's actually available
+                num_solutions = actual_count
+            else:
+                print(f"[COT] ✓ Successfully generated {len(architecture_hints)} diverse architectures")
         
         print(f"\n[PARALLEL] Generating {num_solutions} solutions in parallel with {self.num_workers} workers...")
-        
-        # Prepare architecture hints
-        if not architecture_hints:
-            architecture_hints = [None] * num_solutions
-        elif len(architecture_hints) < num_solutions:
-            # Pad with None
-            architecture_hints = architecture_hints + [None] * (num_solutions - len(architecture_hints))
+        print("[PARALLEL] Each thread will use a UNIQUE architecture pattern")
+        if use_dynamic_queue:
+            print("[PARALLEL] 🚀 Dynamic queue enabled - will generate new architectures as solutions complete")
         
         candidates = []
+        completed_count = 0
         
         # Use ThreadPoolExecutor for parallel generation
         with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-            # Submit all tasks
+            # Submit initial batch of tasks
             future_to_hint = {
                 executor.submit(self.generate_and_test_solution, problem, hint): hint
                 for hint in architecture_hints[:num_solutions]
@@ -1645,6 +2088,7 @@ class ParallelSolutionGenerator:
                         continue
                     
                     candidates.append(candidate)
+                    completed_count += 1
                     
                     if candidate.test_results:
                         print(f"[PARALLEL] Solution '{candidate.architecture_name}': "
@@ -1653,13 +2097,52 @@ class ParallelSolutionGenerator:
                     else:
                         print(f"[PARALLEL] Solution '{candidate.architecture_name}': failed to generate")
                     
-                    # If perfect solution found, stop waiting for other futures
+                    # If perfect solution found, return immediately
                     if candidate.is_perfect:
-                        print(f"[PARALLEL] ⚡ Stopping remaining threads - perfect solution found!")
-                        break
+                        print("[PARALLEL] ⚡ Perfect solution found - returning immediately!")
+                        # Add perfect solution to the front of the list and return
+                        candidates.sort(key=lambda c: c.score, reverse=True)
+                        return candidates
+                    
+                    # Dynamic queue: Generate new architecture and submit new task
+                    if use_dynamic_queue and not self.perfect_solution_found:
+                        # Build failure context from ALL completed solutions
+                        failed_tests_context = self._build_failure_context(candidates)
+                        
+                        if failed_tests_context:
+                            num_failed = len(failed_tests_context.get('failed_tests', []))
+                            num_completed = failed_tests_context.get('num_completed', len(candidates))
+                            
+                            # Generate ONE new architecture based on ALL failures
+                            print(f"[DYNAMIC] 🔄 Generating new architecture based on {num_completed} completed solutions...")
+                            print(f"[DYNAMIC]    Targeting {num_failed} unique failed tests from all solutions")
+                            
+                            new_archs = self.generate_diverse_architectures(
+                                problem, 
+                                num_architectures=1,
+                                best_candidate_info=failed_tests_context
+                            )
+                            
+                            if new_archs:
+                                new_hint = new_archs[0]
+                                # Extract failure breakdown to pass to solution generator
+                                failure_breakdown_text = failed_tests_context.get('failure_breakdown', '')
+                                
+                                print(f"[DYNAMIC] ✓ Submitting new task: {new_hint[:60]}...")
+                                print(f"[DYNAMIC]    Passing failure context to solution generator")
+                                
+                                # Pass both architecture hint AND failure hints to solution generator
+                                new_future = executor.submit(
+                                    self.generate_and_test_solution, 
+                                    problem, 
+                                    new_hint,  # architecture hint
+                                    failure_breakdown_text  # failure hints
+                                )
+                                future_to_hint[new_future] = new_hint
                         
                 except Exception as e:
                     print(f"[PARALLEL] Solution with hint '{hint}' failed: {e}")
+                    completed_count += 1
         
         # Sort by score (best first)
         candidates.sort(key=lambda c: c.score, reverse=True)
@@ -1827,8 +2310,7 @@ def agent_main(input_data: Dict[str, Any]) -> str:
         max_iterations=10,
         max_alternatives=10 if mode == "create" else 5,
         stuck_threshold=2,
-        timeout=timeout,
-        alternative_iterations=6
+        timeout=timeout
     )
     
     # Create agent

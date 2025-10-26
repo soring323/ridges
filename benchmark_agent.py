@@ -29,31 +29,31 @@ console = Console()
 
 # Default test problems - edit this list
 DEFAULT_TEST_PROBLEMS = [
-    # "affine-cipher",
-    # "beer-song", 
+    #"affine-cipher",
+    #"beer-song", 
     "react",
-    "react",
-    "react",
-    "react",
-    "react",
-    "react",
-    "react",
-    "react",
-    # "robot-name",
-    # "rest-api",      # Test: JSON string format detection
-    # "book-store",    # Test: Unit conversion (cents vs dollars)
-    # "scale-generator",
-    # "grep",
-    # "pov",
+    # "react",
+    # "react",
+    # "react",
+    # "react",
+    # "react",
+    # "react",
+    # "react",
+    #"robot-name",
+    #"rest-api",      # Test: JSON string format detection
+    #"book-store",    # Test: Unit conversion (cents vs dollars)
+    #"scale-generator",
+    #"grep",
+    #"pov",
     
     # SWE Benchmark problems
-    # "astropy__astropy-14369"
+    #"astropy__astropy-14369"
     #"django__diango-10554",
     #"django__django-12325"
     #"django__django-11885"
 ]
 
-AGENT_FILE_NAME = "test_driven_agent.py"
+AGENT_FILE_NAME = "test_driven_agent_oop.py"
 
 
 def run_agent_locally(agent_file_path: str, problem, suite, timeout: int) -> tuple[str, str, float, str]:
@@ -122,7 +122,6 @@ def run_tests_polyglot(repo_dir: str, problem_name: str, problem_dir: str) -> Di
     """Run tests from original dataset against generated main.py (Polyglot problems only)."""
     import re
     
-    test_start_time = time.time()
     # Check main.py exists
     main_py = os.path.join(repo_dir, "main.py")
     if not os.path.exists(main_py):
@@ -176,8 +175,7 @@ def run_tests_polyglot(repo_dir: str, problem_name: str, problem_dir: str) -> Di
         with open(test_output_file, "w") as f:
             f.write(output)
         
-        test_elapsed = time.time() - test_start_time
-        console.print(f"  📊 Tests: {tests_passed}/{tests_total} passed (took {test_elapsed:.2f}s)", 
+        console.print(f"  📊 Tests: {tests_passed}/{tests_total} passed", 
                      style="green" if tests_passed == tests_total else "yellow")
         
         return {
@@ -185,28 +183,23 @@ def run_tests_polyglot(repo_dir: str, problem_name: str, problem_dir: str) -> Di
             "tests_total": tests_total,
             "tests_failed": tests_failed,
             "test_output": output,
-            "test_execution_time": test_elapsed,
             "error": None if result.returncode == 0 else "Tests failed"
         }
     
     except subprocess.TimeoutExpired:
-        test_elapsed = time.time() - test_start_time
         return {
             "tests_passed": 0,
             "tests_total": 0,
             "tests_failed": 0,
             "test_output": "Test execution timeout",
-            "test_execution_time": test_elapsed,
             "error": "Test execution timeout"
         }
     except Exception as e:
-        test_elapsed = time.time() - test_start_time
         return {
             "tests_passed": 0,
             "tests_total": 0,
             "tests_failed": 0,
             "test_output": str(e),
-            "test_execution_time": test_elapsed,
             "error": str(e)
         }
 
@@ -469,7 +462,6 @@ def run_tests_swebench_local(problem, patch: str, problem_dir: str) -> Dict:
     import re
     from utils.git import clone_local_repo_at_commit
     
-    test_start_time = time.time()
     try:
         console.print(f"  📁 Testing SWEBench problem locally (no Docker)...", style="cyan")
         
@@ -797,8 +789,7 @@ def run_tests_swebench_local(problem, patch: str, problem_dir: str) -> Dict:
             with open(os.path.join(problem_dir, "test_output.txt"), "w") as f:
                 f.write(test_output)
             
-            test_elapsed = time.time() - test_start_time
-            console.print(f"  📊 Tests: {tests_passed}/{tests_total} passed (took {test_elapsed:.2f}s)", 
+            console.print(f"  📊 Tests: {tests_passed}/{tests_total} passed", 
                          style="green" if tests_passed == tests_total else "yellow")
             
             return {
@@ -806,23 +797,19 @@ def run_tests_swebench_local(problem, patch: str, problem_dir: str) -> Dict:
                 "tests_total": tests_total,
                 "tests_failed": tests_failed,
                 "test_output": test_output,
-                "test_execution_time": test_elapsed,
                 "error": None if tests_passed == tests_total else "Some tests failed"
             }
     
     except subprocess.TimeoutExpired:
-        test_elapsed = time.time() - test_start_time
         return {
             "tests_passed": 0,
             "tests_total": 0,
             "tests_failed": 0,
             "test_output": "Test execution timeout",
-            "test_execution_time": test_elapsed,
             "error": "Timeout"
         }
     except Exception as e:
         import traceback
-        test_elapsed = time.time() - test_start_time
         error_msg = f"Error running SWEBench local test: {str(e)}\n{traceback.format_exc()}"
         console.print(f"  ❌ {error_msg}", style="red")
         return {
@@ -830,7 +817,6 @@ def run_tests_swebench_local(problem, patch: str, problem_dir: str) -> Dict:
             "tests_total": 0,
             "tests_failed": 0,
             "test_output": error_msg,
-            "test_execution_time": test_elapsed,
             "error": str(e)
         }
 
@@ -845,7 +831,6 @@ def evaluate_problem(problem_name: str, agent_file: str, timeout: int, results_d
         results_dir: Directory to save results
         reuse_existing: If True, reuse existing patch and only re-run tests
     """
-    problem_start_time = time.time()
     workspace_dir = None
     try:
         # Find problem
@@ -893,10 +878,25 @@ def evaluate_problem(problem_name: str, agent_file: str, timeout: int, results_d
             patch, logs, elapsed, repo_dir = run_agent_locally(agent_file, problem, suite, timeout)
             workspace_dir = os.path.dirname(repo_dir)
         
-        # Save results
+        # Save results with counter to avoid overwriting
         problem_slug = problem_name.replace("/", "_").replace(" ", "_")
-        problem_dir = os.path.join(results_dir, problem_slug)
+        
+        # Find next available counter for this problem
+        counter = 1
+        while True:
+            if counter == 1:
+                problem_dir = os.path.join(results_dir, problem_slug)
+            else:
+                problem_dir = os.path.join(results_dir, f"{problem_slug}_{counter}")
+            
+            if not os.path.exists(problem_dir):
+                break
+            counter += 1
+        
         os.makedirs(problem_dir, exist_ok=True)
+        
+        if counter > 1:
+            console.print(f"  💾 Saving as attempt #{counter} (previous attempts exist)", style="dim")
         
         # Save patch
         with open(os.path.join(problem_dir, "patch.diff"), "w") as f:
@@ -953,10 +953,8 @@ def evaluate_problem(problem_name: str, agent_file: str, timeout: int, results_d
             main_dst = os.path.join(problem_dir, "main.py")
             shutil.copy2(main_src, main_dst)
         
-        # Calculate score and total time
+        # Calculate score
         score = test_results["tests_passed"] / test_results["tests_total"] if test_results["tests_total"] > 0 else 0.0
-        problem_total_time = time.time() - problem_start_time
-        test_execution_time = test_results.get("test_execution_time", 0.0)
         
         summary = {
             "problem": problem_name,
@@ -966,9 +964,7 @@ def evaluate_problem(problem_name: str, agent_file: str, timeout: int, results_d
             "tests_failed": test_results["tests_failed"],
             "patch_generated": bool(patch),
             "patch_length": len(patch) if patch else 0,
-            "agent_time": elapsed,
-            "test_time": test_execution_time,
-            "total_time": problem_total_time,
+            "elapsed_time": elapsed,
             "exceeded_timeout": elapsed > timeout,
             "error": test_results.get("error")
         }
@@ -976,25 +972,20 @@ def evaluate_problem(problem_name: str, agent_file: str, timeout: int, results_d
         with open(os.path.join(problem_dir, "summary.json"), "w") as f:
             json.dump(summary, f, indent=2)
         
-        # Display test results with timing
+        # Display test results
         if test_results["tests_total"] > 0:
             console.print(f"  Tests: {test_results['tests_passed']}/{test_results['tests_total']} passed", style="cyan")
-        console.print(f"  ⏱️  Agent: {elapsed:.2f}s | Tests: {test_execution_time:.2f}s | Total: {problem_total_time:.2f}s", style="dim")
         
         return summary
         
     except Exception as e:
         import traceback
-        problem_total_time = time.time() - problem_start_time
         return {
             "problem": problem_name,
             "score": 0.0,
             "tests_passed": 0,
             "tests_total": 0,
             "patch_generated": False,
-            "agent_time": 0.0,
-            "test_time": 0.0,
-            "total_time": problem_total_time,
             "error": f"{str(e)}\n{traceback.format_exc()}"
         }
     finally:
@@ -1012,11 +1003,10 @@ def benchmark_agent(agent_file: str, problems: List[str], timeout: int, reuse_ex
         timeout: Timeout per problem in seconds
         reuse_existing: If True, reuse existing patches and only re-run tests
     """
-    benchmark_start_time = time.time()
-    
-    # Use first problem name for directory (cleaner for single-problem runs)
-    first_problem_slug = problems[0].replace("/", "_").replace(" ", "_")
-    results_dir = os.path.join("result", f"benchmark_{first_problem_slug}")
+    # Use timestamp-based directory for this benchmark run
+    import datetime
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_dir = os.path.join("result", f"benchmark_{timestamp}")
     os.makedirs(results_dir, exist_ok=True)
     
     console.print("📡 Requires inference gateway at http://localhost:8000", style="cyan")
@@ -1035,41 +1025,54 @@ def benchmark_agent(agent_file: str, problems: List[str], timeout: int, reuse_ex
     
     results = []
     
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        console=console
-    ) as progress:
-        task = progress.add_task("[cyan]Running...", total=len(problems))
-        
-        for i, problem in enumerate(problems):
-            console.print(f"\n[bold]Problem {i+1}/{len(problems)}:[/bold] {problem}")
+    # Suppress suite loading logs during benchmark (they clutter progress bar)
+    import logging
+    suite_logger = logging.getLogger('polyglot_suite')
+    swe_logger = logging.getLogger('swebench_verified_suite')
+    original_level_poly = suite_logger.level
+    original_level_swe = swe_logger.level
+    suite_logger.setLevel(logging.WARNING)
+    swe_logger.setLevel(logging.WARNING)
+    
+    try:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console
+        ) as progress:
+            task = progress.add_task("[cyan]Running...", total=len(problems))
             
-            result = evaluate_problem(problem, agent_file, timeout, results_dir, reuse_existing=reuse_existing)
-            results.append(result)
-            
-            if result["error"] and not result['patch_generated']:
-                console.print(f"  [red]❌ {result['error'][:50]}[/red]")
-            else:
-                tests_total = result.get('tests_total', 0)
-                tests_passed = result.get('tests_passed', 0)
-                if tests_total > 0:
-                    emoji = "🎉" if tests_passed == tests_total else "⚠️" if tests_passed > 0 else "❌"
-                    console.print(f"  {emoji} Tests: {tests_passed}/{tests_total} passed ({result['score']*100:.1f}%)")
+            for i, problem in enumerate(problems):
+                console.print(f"\n[bold]Problem {i+1}/{len(problems)}:[/bold] {problem}")
+                
+                result = evaluate_problem(problem, agent_file, timeout, results_dir, reuse_existing=reuse_existing)
+                results.append(result)
+                
+                if result["error"] and not result['patch_generated']:
+                    console.print(f"  [red]❌ {result['error'][:50]}[/red]")
                 else:
-                    emoji = "🎉" if result['patch_generated'] else "❌"
-                    console.print(f"  {emoji} Patch: {'Generated' if result['patch_generated'] else 'Failed'}")
-            
-            progress.update(task, advance=1)
+                    tests_total = result.get('tests_total', 0)
+                    tests_passed = result.get('tests_passed', 0)
+                    elapsed = result.get('elapsed_time', 0)
+                    time_str = f" [dim]({elapsed:.1f}s)[/dim]" if elapsed > 0 else ""
+                    if tests_total > 0:
+                        emoji = "🎉" if tests_passed == tests_total else "⚠️" if tests_passed > 0 else "❌"
+                        console.print(f"  {emoji} Tests: {tests_passed}/{tests_total} passed ({result['score']*100:.1f}%){time_str}")
+                    else:
+                        emoji = "🎉" if result['patch_generated'] else "❌"
+                        console.print(f"  {emoji} Patch: {'Generated' if result['patch_generated'] else 'Failed'}{time_str}")
+                
+                progress.update(task, advance=1)
+    finally:
+        # Restore original logging levels
+        suite_logger.setLevel(original_level_poly)
+        swe_logger.setLevel(original_level_swe)
     
     # Calculate scores
     valid_results = [r for r in results if r["error"] is None]
     final_score = sum(r['score'] for r in valid_results) / len(valid_results) if valid_results else 0.0
-    
-    # Calculate total benchmark time
-    benchmark_total_time = time.time() - benchmark_start_time
     
     # Display table
     console.print("\n" + "="*80)
@@ -1083,7 +1086,8 @@ def benchmark_agent(agent_file: str, problems: List[str], timeout: int, reuse_ex
     for result in results:
         score_str = f"{result['score']*100:.1f}%"
         tests_str = f"{result.get('tests_passed', 0)}/{result.get('tests_total', 0)}"
-        time_str = f"{result.get('total_time', 0):.1f}s"
+        elapsed = result.get('elapsed_time', 0)
+        time_str = f"{elapsed:.1f}s" if elapsed > 0 else "N/A"
         
         if result['score'] == 1.0:
             status = "✅ All passed"
@@ -1102,33 +1106,28 @@ def benchmark_agent(agent_file: str, problems: List[str], timeout: int, reuse_ex
     console.print("\n" + "="*80)
     total_tests = sum(r.get('tests_total', 0) for r in results)
     total_passed = sum(r.get('tests_passed', 0) for r in results)
-    total_agent_time = sum(r.get('agent_time', 0) for r in results)
-    total_test_time = sum(r.get('test_time', 0) for r in results)
+    total_time = sum(r.get('elapsed_time', 0) for r in results)
+    avg_time = total_time / len(results) if results else 0
     
     console.print(Panel(
         f"[bold cyan]Final Score:[/bold cyan] [bold yellow]{final_score*100:.1f}%[/bold yellow]\n\n"
         f"Total Tests: {total_passed}/{total_tests} passed\n"
         f"Problems: {sum(1 for r in results if r['score'] == 1.0)}/{len(results)} fully solved\n"
-        f"Patches generated: {sum(1 for r in results if r['patch_generated'])}/{len(results)}\n\n"
-        f"[bold cyan]⏱️  Timing:[/bold cyan]\n"
-        f"  Agent execution: {total_agent_time:.2f}s\n"
-        f"  Test execution: {total_test_time:.2f}s\n"
-        f"  Total benchmark: {benchmark_total_time:.2f}s ({benchmark_total_time/60:.1f}m)",
+        f"Patches generated: {sum(1 for r in results if r['patch_generated'])}/{len(results)}\n"
+        f"Total Time: {total_time:.1f}s | Avg: {avg_time:.1f}s per problem",
         title="🏆 Summary",
         border_style="green" if final_score > 0.8 else "yellow"
     ))
     
     # Save summary
     summary_data = {
+
         "agent_file": agent_file,
         "final_score": final_score,
         "problems_tested": len(problems),
         "patches_generated": sum(1 for r in results if r['patch_generated']),
         "total_tests": total_tests,
         "total_passed": total_passed,
-        "total_agent_time": total_agent_time,
-        "total_test_time": total_test_time,
-        "total_benchmark_time": benchmark_total_time,
         "results": results
     }
     
@@ -1155,9 +1154,7 @@ def benchmark_agent(agent_file: str, problems: List[str], timeout: int, reuse_ex
         readme_content += f"### {emoji} {result['problem']}\n"
         readme_content += f"- **Score**: {result['score']*100:.1f}%\n"
         readme_content += f"- **Tests**: {result.get('tests_passed', 0)}/{result.get('tests_total', 0)} passed\n"
-        readme_content += f"- **Agent Time**: {result.get('agent_time', 0):.2f}s\n"
-        readme_content += f"- **Test Time**: {result.get('test_time', 0):.2f}s\n"
-        readme_content += f"- **Total Time**: {result.get('total_time', 0):.2f}s\n"
+        readme_content += f"- **Elapsed Time**: {result.get('elapsed_time', 0):.2f}s\n"
         if result.get('error'):
             readme_content += f"- **Error**: {result['error']}\n"
         readme_content += f"- **Files**: See `{result['problem'].replace('/', '_').replace(' ', '_')}/`\n\n"
@@ -1204,13 +1201,13 @@ The `test_output.txt` files contain pytest output showing:
     with open(os.path.join(results_dir, "README.md"), "w") as f:
         f.write(readme_content)
     
-    console.print(f"\n💾 Results saved to: [cyan]{results_dir}/[/cyan]")
-    console.print(f"   - [cyan]README.md[/cyan] - Human-readable summary")
-    console.print(f"   - [cyan]summary.json[/cyan] - Machine-readable data")
-    console.print(f"   - [cyan]<problem>/main.py[/cyan] - 🎯 Generated solution (tested)")
-    console.print(f"   - [cyan]<problem>/tests.py[/cyan] - Test cases from dataset")
-    console.print(f"   - [cyan]<problem>/test_output.txt[/cyan] - 📊 Complete test logs")
-    console.print(f"\n   Quick access: [cyan]result/latest_benchmark.json[/cyan]")
+    console.print("\n💾 Results saved to: [cyan]{results_dir}/[/cyan]")
+    console.print("   - [cyan]README.md[/cyan] - Human-readable summary")
+    console.print("   - [cyan]summary.json[/cyan] - Machine-readable data")
+    console.print("   - [cyan]<problem>/main.py[/cyan] - 🎯 Generated solution (tested)")
+    console.print("   - [cyan]<problem>/tests.py[/cyan] - Test cases from dataset")
+    console.print("   - [cyan]<problem>/test_output.txt[/cyan] - 📊 Complete test logs")
+    console.print("\n   Quick access: [cyan]result/latest_benchmark.json[/cyan]")
 
 
 def test_existing_patch(problem_name: str, patch_path: str) -> Dict:
@@ -1239,26 +1236,33 @@ def test_existing_patch(problem_name: str, patch_path: str) -> Dict:
     
     # Create results directory
     problem_slug = problem_name.replace("/", "_").replace(" ", "_")
-    results_dir = os.path.join("result", f"retest_{problem_slug}")
-    problem_dir = os.path.join(results_dir, problem_slug)
+    import datetime
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    problem_dir = os.path.join("result", f"retest_{timestamp}_{problem_slug}")
     os.makedirs(problem_dir, exist_ok=True)
     
-    # Run tests
+    # Run tests with timing
+    import time
+    start_time = time.time()
+    
     if is_swebench:
         test_results = run_tests_swebench_local(problem, patch, problem_dir)
     else:
         console.print(f"[yellow]⚠️  Polyglot testing not yet supported for --test-only[/yellow]")
         return None
     
+    elapsed_time = time.time() - start_time
+    
     # Calculate score
     score = (test_results["tests_passed"] / test_results["tests_total"] * 100) if test_results["tests_total"] > 0 else 0
     
     # Display results
     console.print(f"\n[bold]{'='*80}[/bold]")
-    console.print(f"[bold cyan]                      📊 Test Results[/bold cyan]")
+    console.print("[bold cyan]                      📊 Test Results[/bold cyan]")
     console.print(f"[bold cyan]Problem:[/bold cyan] {problem_name}")
     console.print(f"[bold cyan]Score:[/bold cyan] {score:.1f}%")
     console.print(f"[bold cyan]Tests:[/bold cyan] {test_results['tests_passed']}/{test_results['tests_total']} passed")
+    console.print(f"[bold cyan]Time:[/bold cyan] {elapsed_time:.1f}s")
     if test_results.get('error'):
         console.print(f"[bold red]Error:[/bold red] {test_results['error']}")
     console.print(f"[bold]{'='*80}[/bold]")
@@ -1286,24 +1290,31 @@ def main():
             problem_name, patch_path = test_problem.split(":", 1)
         else:
             problem_name = test_problem
-            # Auto-find patch in result directories
+            # Auto-find patch in result directories (search for most recent)
             patch_path = None
-            result_dirs = [
-                f"result/benchmark_{problem_name}/{problem_name}/patch.diff",
-                f"result/retest_{problem_name}/{problem_name}/patch.diff",
-                f"result/latest_benchmark/{problem_name}/patch.diff",
-            ]
-            for candidate in result_dirs:
-                if os.path.exists(candidate):
-                    patch_path = candidate
+            problem_slug = problem_name.replace("/", "_").replace(" ", "_")
+            
+            # Search for most recent benchmark/retest directories
+            result_base = Path("result")
+            if result_base.exists():
+                # Find all matching directories (benchmark_*, retest_*)
+                candidates = []
+                for dir_path in result_base.iterdir():
+                    if dir_path.is_dir():
+                        # Check for patch in problem subdirectory
+                        patch_file = dir_path / problem_slug / "patch.diff"
+                        if patch_file.exists():
+                            candidates.append((dir_path.stat().st_mtime, str(patch_file)))
+                
+                # Use most recent
+                if candidates:
+                    candidates.sort(reverse=True)  # Most recent first
+                    patch_path = candidates[0][1]
                     console.print(f"[dim]📁 Auto-found patch: {patch_path}[/dim]")
-                    break
             
             if not patch_path:
                 console.print(f"[bold red]❌ No patch found for {problem_name}[/bold red]")
-                console.print(f"[yellow]Searched in:[/yellow]")
-                for d in result_dirs:
-                    console.print(f"  - {d}")
+                console.print(f"[yellow]Searched in: result/*/{problem_slug}/patch.diff[/yellow]")
                 console.print(f"\n[yellow]Specify path explicitly: --test-only {problem_name}:path/to/patch.diff[/yellow]")
                 sys.exit(1)
         

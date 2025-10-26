@@ -1252,6 +1252,7 @@ class ArchitectureManager:
         """Check if two architecture names are semantically similar."""
         return are_architectures_similar_helper(name1, name2)
     
+    ## Unused
     def try_alternative(
         self,
         problem: str,
@@ -1925,65 +1926,6 @@ class ParallelSolutionGenerator:
         
         return candidates
     
-    def find_best_solution(
-        self,
-        problem: str,
-        max_rounds: int = 3,
-        solutions_per_round: int = 3
-    ) -> Optional[SolutionCandidate]:
-        """
-        Generate solutions in multiple rounds until a perfect solution is found.
-        
-        Strategy:
-        - Round 1: Generate N solutions with default architectures
-        - Round 2+: If no perfect solution, generate N more with different architectures
-        - Return best solution found
-        """
-        
-        all_candidates = []
-        
-        for round_num in range(1, max_rounds + 1):
-            print(f"\n[PARALLEL] === Round {round_num}/{max_rounds} ===")
-            
-            # Reset termination flag for new round
-            with self.termination_lock:
-                self.perfect_solution_found = False
-            
-            # Generate architecture hints for this round
-            if round_num == 1:
-                hints = [None] * solutions_per_round  # Default architectures
-            else:
-                # Generate different architecture hints based on previous failures
-                hints = [f"alternative_{i}_round_{round_num}" for i in range(solutions_per_round)]
-            
-            # Generate and test solutions in parallel
-            candidates = self.generate_multiple_solutions(problem, solutions_per_round, hints)
-            all_candidates.extend(candidates)
-            
-            # Check if we found a perfect solution (early termination worked!)
-            perfect_solutions = [c for c in candidates if c.is_perfect]
-            if perfect_solutions:
-                best = perfect_solutions[0]
-                print(f"\n[PARALLEL] ✓ Found perfect solution: '{best.architecture_name}' "
-                      f"({best.test_results.passed}/{best.test_results.total} tests)")
-                return best
-            
-            # Show best so far
-            if candidates:
-                best_this_round = candidates[0]
-                print(f"[PARALLEL] Best this round: '{best_this_round.architecture_name}' "
-                      f"({best_this_round.score} tests passed)")
-        
-        # No perfect solution found, return best overall
-        if all_candidates:
-            all_candidates.sort(key=lambda c: c.score, reverse=True)
-            best = all_candidates[0]
-            print(f"\n[PARALLEL] No perfect solution found. Best: '{best.architecture_name}' "
-                  f"({best.score} tests passed)")
-            return best
-        
-        return None
-
 # ============================================================================
 # Entry Point - Independent Function
 # ============================================================================
