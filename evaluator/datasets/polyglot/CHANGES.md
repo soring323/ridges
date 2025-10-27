@@ -79,7 +79,7 @@ Added typing to `best_hands()` with comments clarifying the hand format and poke
 
 ## pov
 
-Added typing to `Tree.__init__()`, `from_pov()`, and `path_to()`, as it is unclear what the parameter types should be and what the methods should return. There are some links that are impossible for the agent to follow. This will be resolved in a future version of our sandbox, where we provide restricted Internet access.
+Added typing to `Tree.__init__()`, `from_pov()`, and `path_to()`, as it is unclear what the parameter types should be and what the methods should return. Added specific error message documentation to the instructions for "Tree could not be reoriented" and "No path found", as the original instructions did not document the required messages. Fixed `test.py` and `solution.py` so that `path_to()` raises "No path found" (not "Tree could not be reoriented") when the source node doesn't exist, as this is more semantically correct for a path-finding operation. There are some links that are impossible for the agent to follow. This will be resolved in a future version of our sandbox, where we provide restricted Internet access.
 
 ## proverb
 
