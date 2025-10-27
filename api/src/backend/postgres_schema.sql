@@ -11,6 +11,7 @@ BEGIN
             'finished'
         );
     END IF;
+
     IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'evaluationsetgroup') THEN
         CREATE TYPE EvaluationSetGroup AS ENUM (
             'screener_1',
@@ -18,6 +19,7 @@ BEGIN
             'validator'
         );
     END IF;
+
     IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'evaluationrunstatus') THEN
         CREATE TYPE EvaluationRunStatus AS ENUM (
             'pending',
@@ -29,12 +31,14 @@ BEGIN
             'error'
         );
     END IF;
+
     IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'evaluationrunlogtype') THEN
         CREATE TYPE EvaluationRunLogType AS ENUM (
             'agent',
             'eval'
         );
     END IF;
+
     IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'evaluationstatus') THEN
         CREATE TYPE EvaluationStatus AS ENUM (
             'running',
@@ -42,6 +46,7 @@ BEGIN
             'failure'
         );
     END IF;
+    
 END $$;
 
 CREATE TABLE IF NOT EXISTS agents (
