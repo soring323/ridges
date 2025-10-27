@@ -75,6 +75,11 @@ if USE_CHUTES:
     if not CHUTES_API_KEY:
         logger.fatal("CHUTES_API_KEY is not set in .env")
 
+    CHUTES_WEIGHT = os.getenv("CHUTES_WEIGHT")
+    if not CHUTES_WEIGHT:
+        logger.fatal("CHUTES_WEIGHT is not set in .env")
+    CHUTES_WEIGHT = int(CHUTES_WEIGHT)
+
 
 
 # Load Targon configuration
@@ -91,6 +96,11 @@ if USE_TARGON:
     TARGON_API_KEY = os.getenv("TARGON_API_KEY")
     if not TARGON_API_KEY:
         logger.fatal("TARGON_API_KEY is not set in .env")
+
+    TARGON_WEIGHT = os.getenv("TARGON_WEIGHT")
+    if not TARGON_WEIGHT:
+        logger.fatal("TARGON_WEIGHT is not set in .env")
+    TARGON_WEIGHT = int(TARGON_WEIGHT)
 
 
 

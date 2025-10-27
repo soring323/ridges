@@ -18,21 +18,28 @@ from queries.inference import create_new_inference, update_inference_by_id, get_
 
 
 
+class WeightedProvider:
+    def __init__(self, provider: Provider, weight: int):
+        self.provider = provider
+        self.weight = weight
+
 providers = []
 
 
 
 def get_provider_that_supports_model_for_inference(model_name: str) -> Provider:
-    inference_providers = [provider for provider in providers if provider.is_model_supported_for_inference(model_name)]  
+    inference_providers = [wp for wp in providers if wp.provider.is_model_supported_for_inference(model_name)]  
     if not inference_providers:
         return None
-    return random.choice(inference_providers)
+    chosen = random.choices(inference_providers, weights=[wp.weight for wp in inference_providers], k=1)[0]
+    return chosen.provider
 
 def get_provider_that_supports_model_for_embedding(model_name: str) -> Provider:
-    embedding_providers = [provider for provider in providers if provider.is_model_supported_for_embedding(model_name)]
+    embedding_providers = [wp for wp in providers if wp.provider.is_model_supported_for_embedding(model_name)]
     if not embedding_providers:
         return None
-    return random.choice(embedding_providers)
+    chosen = random.choices(embedding_providers, weights=[wp.weight for wp in embedding_providers], k=1)[0]
+    return chosen.provider
 
 
 
@@ -51,14 +58,14 @@ async def lifespan(app: FastAPI):
 
     global providers
     if config.USE_CHUTES:
-        providers.append(await ChutesProvider().init())
+        providers.append(WeightedProvider(await ChutesProvider().init(), weight=config.CHUTES_WEIGHT))
     if config.USE_TARGON:
-        providers.append(await TargonProvider().init())
+        providers.append(WeightedProvider(await TargonProvider().init(), weight=config.TARGON_WEIGHT))
 
     # TODO ADAM: uncomment
-    # for provider in providers:
-    #     await provider.test_all_inference_models()
-    #     await provider.test_all_embedding_models()
+    # for wp in providers:
+    #     await wp.provider.test_all_inference_models()
+    #     await wp.provider.test_all_embedding_models()
 
 
 
