@@ -23,8 +23,8 @@ if not SUBTENSOR_ADDRESS:
     logger.fatal("SUBTENSOR_ADDRESS is not set in .env")
 
 SUBTENSOR_NETWORK = os.getenv("SUBTENSOR_NETWORK")
-if not SUBTENSOR_NETWORK:
-    logger.fatal("SUBTENSOR_NETWORK is not set in .env")
+if not SUBTENSOR_ADDRESS:
+    logger.fatal("SUBTENSOR_ADDRESS is not set in .env")
 
 
 
@@ -131,14 +131,6 @@ INCLUDE_SOLUTIONS = INCLUDE_SOLUTIONS.lower() == "true"
 
 
 
-# Load the update automatically configuration
-UPDATE_AUTOMATICALLY = os.getenv("UPDATE_AUTOMATICALLY")
-if not UPDATE_AUTOMATICALLY:
-    logger.fatal("UPDATE_AUTOMATICALLY is not set in .env")
-UPDATE_AUTOMATICALLY = UPDATE_AUTOMATICALLY.lower() == "true"
-
-
-
 # Print out the configuration
 logger.info("=== Validator Configuration ===")
 logger.info(f"Network ID: {NETUID}")
@@ -167,9 +159,4 @@ else:
         logger.warning("Including Solutions!")
     else:
         logger.info("Not Including Solutions")
-logger.info("-------------------------------")
-if UPDATE_AUTOMATICALLY:
-    logger.info("Updating Automatically")
-else:
-    logger.warning("Not Updating Automatically")
 logger.info("===============================")

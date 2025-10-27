@@ -31,7 +31,7 @@ console = Console()
 
 # Default test problems - edit this list
 DEFAULT_TEST_PROBLEMS = [
-    # "affine-cipher",
+    "affine-cipher",
     # "beer-song", 
     # "react",
     # "react",
@@ -56,7 +56,7 @@ DEFAULT_TEST_PROBLEMS = [
     # "django__django-12325",
     # "django__django-11400",
     # "django__django-16263",
-    "django__django-12708",
+    # "django__django-12708",
 ]
 
 AGENT_FILE_NAME = "test_driven_agent_oop.py"
@@ -606,22 +606,23 @@ def run_tests_swebench_local(problem, patch: str, problem_dir: str) -> Dict:
                 # Django format: "test_name (module.file.Class)" → "module.file.Class.test_name"
                 console.print(f"  🐍 Using Django's test runner (runtests.py)", style="cyan")
                 console.print(f"problem_statement: {problem.userdata['problem_statement']}")
-                django_tests = []
-                for test in all_tests:
-                    match = re.match(r'^([\w_]+)\s*\((.+)\)$', test)
-                    if match:
-                        test_func = match.group(1)
-                        module_class_path = match.group(2)
-                        # Format: module.file.Class.test_name
-                        django_tests.append(f"{module_class_path}.{test_func}")
-                    else:
-                        # Skip test descriptions that don't match the expected format
-                        # These are likely test docstrings, not actual test paths
-                        console.print(f"  ⚠️  Skipping invalid test label: {test[:50]}...", style="dim")
-                        continue
+                # django_tests = []
+                # for test in all_tests:
+                    # Format: module.file.Class.test_name
+                    # match = re.match(r'^([\w_]+)\s*\((.+)\)$', test)
+                    # if match:
+                    #     test_func = match.group(1)
+                    #     module_class_path = match.group(2)
+                    #     # Format: module.file.Class.test_name
+                    #     django_tests.append(f"{module_class_path}.{test_func}")
+                    # else:
+                    #     # Skip test descriptions that don't match the expected format
+                    #     # These are likely test docstrings, not actual test paths
+                    #     console.print(f"  ⚠️  Skipping invalid test label: {test[:50]}...", style="dim")
+                    #     continue
                 
                 # Run tests serially to avoid multiprocessing pickle errors
-                test_args = [python_path, django_runtests, "--verbosity=2", "--parallel=1"] + django_tests
+                test_args = [python_path, django_runtests, "--verbosity=2", "--parallel=1"] + all_tests
                 result = subprocess.run(
                     test_args,
                     cwd=temp_repo,
