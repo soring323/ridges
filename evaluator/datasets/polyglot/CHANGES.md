@@ -35,7 +35,7 @@ Added typing to `can_chain()`.
 
 ## dot-dsl
 
-Added typing to `Node.__init__()`, `Edge.__init__()`, and `Graph.__init__()`, as it is unclear what types the parameters should be. Fixed and expanded the error message documentation in instructions to include all 6 error messages required by tests: "Graph data malformed", "Graph item incomplete", "Attribute is malformed", "Node is malformed", "Edge is malformed", and "Unknown item". The original instructions only documented 2 of these. There are some links that are impossible for the agent to follow. This will be resolved in a future version of our sandbox, where we provide restricted Internet access.
+Added typing to `Node.__init__()`, `Edge.__init__()`, and `Graph.__init__()`, as it is unclear what types the parameters should be. Fixed and expanded the error message documentation in instructions to include all 6 error messages required by tests: `"Graph data malformed"`, `"Graph item incomplete"`, `"Attribute is malformed"`, `"Node is malformed"`, `"Edge is malformed"`, and `"Unknown item"`. The original instructions only documented 2 of these. There are some links that are impossible for the agent to follow. This will be resolved in a future version of our sandbox, where we provide restricted Internet access.
 
 ## food-chain
 
@@ -47,7 +47,7 @@ Added typing to `evaluate()`, as it is unclear what the parameter type should be
 
 ## go-counting
 
-Added typing to `Board.__init__()`, `territory()`, and `territories()`. Moved the `WHITE`, `BLACK`, and `NONE` constants from main.py to tests.py, as the docstrings already specify the exact string values to return and requiring the agent to define these constants is an unnecessary hurdle. There are some links that are impossible for the agent to follow. This will be resolved in a future version of our sandbox, where we provide restricted Internet access.
+Added typing to `Board.__init__()`, `territory()`, and `territories()`. Moved the `WHITE`, `BLACK`, and `NONE` constants from `main.py` to `tests.py`, as the docstrings already specify the exact string values to return and requiring the agent to define these constants is an unnecessary hurdle. There are some links that are impossible for the agent to follow. This will be resolved in a future version of our sandbox, where we provide restricted Internet access.
 
 ## grade-school
 
@@ -67,7 +67,7 @@ Added typing to all functions (`append()`, `concat()`, `filter()`, `length()`, `
 
 ## phone-number
 
-Added typing to `PhoneNumber.__init__()` and `pretty()`. Added the missing `pretty()` method stub, as it is required by the tests but was not present in the main.py file.
+Added typing to `PhoneNumber.__init__()` and `pretty()`. Added the missing `pretty()` method stub, as it is required by the tests but was not present in the `main.py` file.
 
 ## pig-latin
 
@@ -79,11 +79,11 @@ Added typing to `best_hands()` with comments clarifying the hand format and poke
 
 ## pov
 
-Added typing to `Tree.__init__()`, `from_pov()`, and `path_to()`, as it is unclear what the parameter types should be and what the methods should return. Added specific error message documentation to the instructions for "Tree could not be reoriented" and "No path found", as the original instructions did not document the required messages. Fixed `test.py` and `solution.py` so that `path_to()` raises "No path found" (not "Tree could not be reoriented") when the source node doesn't exist, as this is more semantically correct for a path-finding operation. There are some links that are impossible for the agent to follow. This will be resolved in a future version of our sandbox, where we provide restricted Internet access.
+Added typing to `Tree.__init__()`, `from_pov()`, and `path_to()`, as it is unclear what the parameter types should be and what the methods should return. Added specific error message documentation to the instructions for `"Tree could not be reoriented"` and `"No path found"`, as the original instructions did not document the required messages. Fixed `tests.py` and `solution.py` so that `path_to()` raises `"No path found"` (not `"Tree could not be reoriented"`) when the source node doesn't exist, as this is more semantically correct for a path-finding operation. There are some links that are impossible for the agent to follow. This will be resolved in a future version of our sandbox, where we provide restricted Internet access.
 
 ## proverb
 
-Added the complete function signature with typing for `proverb()`, including the `*items` variadic parameter and `qualifier` keyword argument, as the main.py file had no parameters at all. The instructions mention the `qualifier` parameter but don't specify its type or default value.
+Added the complete function signature with typing for `proverb()`, including the `*items` variadic parameter and `qualifier` keyword argument, as the `main.py` file had no parameters at all. The instructions mention the `qualifier` parameter but don't specify its type or default value.
 
 ## react
 
@@ -95,7 +95,7 @@ Added typing to `RestAPI.__init__()`, `get()`, and `post()`, as it is unclear wh
 
 ## robot-name
 
-Added the missing `name` property and `reset()` method with type hints. The instructions mention these behaviors but main.py had no indication that a `name` property or `reset()` method were needed.
+Added the missing `name` property and `reset()` method with type hints. The instructions mention these behaviors but `main.py` had no indication that a `name` property or `reset()` method were needed.
 
 ## scale-generator
 
@@ -115,11 +115,11 @@ Added typing to `transpose()`, as it is unclear what the parameter type should b
 
 ## tree-building
 
-Added typing to `Record.__init__()`, `Node.__init__()`, and `BuildTree()`. Fixed the error messages in the provided implementation to match what the tests expect, as the original code had generic messages like "error!" and "something went wrong!" instead of the specific messages required by the tests. Added comments documenting the required error messages. There are some links that are impossible for the agent to follow. This will be resolved in a future version of our sandbox, where we provide restricted Internet access.
+Added typing to `Record.__init__()`, `Node.__init__()`, and `BuildTree()`. Fixed the error messages in the provided implementation to match what the tests expect, as the original code had generic messages like `"error!"` and `"something went wrong!"` instead of the specific messages required by the tests. Added comments documenting the required error messages. There are some links that are impossible for the agent to follow. This will be resolved in a future version of our sandbox, where we provide restricted Internet access.
 
 ## two-bucket
 
-Added typing to `measure()` with a comment clarifying the return tuple format. The instructions explain what three values should be determined but don't specify they should be returned as a tuple, the order of the values, or that the bucket should be the string "one" or "two". There are some links that are impossible for the agent to follow. This will be resolved in a future version of our sandbox, where we provide restricted Internet access.
+Added typing to `measure()` with a comment clarifying the return tuple format. The instructions explain what three values should be determined but don't specify they should be returned as a tuple, the order of the values, or that the bucket should be the string `"one"` or `"two"`. There are some links that are impossible for the agent to follow. This will be resolved in a future version of our sandbox, where we provide restricted Internet access.
 
 ## variable-length-quantity
 
@@ -135,4 +135,4 @@ Added typing to `drinks_water()` and `owns_zebra()`, as it is unclear what the f
 
 ## zipper
 
-Added typing to all `Zipper` methods and fixed missing parameters for `set_value()`, `set_left()`, and `set_right()`, as the main.py file had these methods with no parameters but the tests call them with arguments. Added a comment clarifying the tree dict structure (with keys "value", "left", "right"), as the instructions never explicitly state this format. There are some links that are impossible for the agent to follow. This will be resolved in a future version of our sandbox, where we provide restricted Internet access.
+Added typing to all `Zipper` methods and fixed missing parameters for `set_value()`, `set_left()`, and `set_right()`, as the `main.py` file had these methods with no parameters but the tests call them with arguments. Added a comment clarifying the tree dict structure (with keys `"value"`, `"left"`, `"right"`), as the instructions never explicitly state this format. There are some links that are impossible for the agent to follow. This will be resolved in a future version of our sandbox, where we provide restricted Internet access.
