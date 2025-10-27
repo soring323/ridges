@@ -123,12 +123,14 @@ logger.info("---------------------------------------")
 if USE_CHUTES:
     logger.info("Using Chutes")
     logger.info(f"Chutes Base URL: {CHUTES_BASE_URL}")
+    logger.info(f"Chutes Weight: {CHUTES_WEIGHT}")
 else:
     logger.warning("Not Using Chutes")
 logger.info("---------------------------------------")
 if USE_TARGON:
     logger.info("Using Targon")
     logger.info(f"Targon Base URL: {TARGON_BASE_URL}")
+    logger.info(f"Targon Weight: {TARGON_WEIGHT}")
 else:
     logger.warning("Not Using Targon")
 logger.info("=======================================")
