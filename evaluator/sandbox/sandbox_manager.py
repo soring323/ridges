@@ -36,7 +36,8 @@ class SandboxManager:
         create_internal_docker_network(SANDBOX_NETWORK_NAME)
 
         # Setup sandbox-image
-        build_docker_image(os.path.dirname(__file__), "sandbox-image")
+        if os.getenv("CXII_NO_BUILD_SANDBOX_IMAGE") is None:
+            build_docker_image(os.path.dirname(__file__), "sandbox-image")
         self.sandboxes = {}
 
         # Setup sandbox-proxy
