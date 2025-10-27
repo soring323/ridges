@@ -24,14 +24,15 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 sys.path.insert(0, str(Path(__file__).parent))
 
 from evaluator.problem_suites.problem_suite import ProblemSuite
+from evaluator.problem_suites.polyglot.polyglot_suite import PolyglotSuite
+from evaluator.problem_suites.swebench_verified.swebench_verified_suite import SWEBenchVerifiedSuite
 
 console = Console()
 
 # Default test problems - edit this list
 DEFAULT_TEST_PROBLEMS = [
-    #"affine-cipher",
-    #"beer-song", 
-    "react",
+    # "affine-cipher",
+    # "beer-song", 
     # "react",
     # "react",
     # "react",
@@ -39,21 +40,36 @@ DEFAULT_TEST_PROBLEMS = [
     # "react",
     # "react",
     # "react",
-    #"robot-name",
-    #"rest-api",      # Test: JSON string format detection
-    #"book-store",    # Test: Unit conversion (cents vs dollars)
-    #"scale-generator",
-    #"grep",
-    #"pov",
+    # "react",
+    # "robot-name",
+    # "rest-api",      # Test: JSON string format detection
+    # "book-store",    # Test: Unit conversion (cents vs dollars)
+    # "scale-generator",
+    # "grep",
+    # "pov",
     
     # SWE Benchmark problems
-    #"astropy__astropy-14369"
-    #"django__diango-10554",
-    #"django__django-12325"
-    #"django__django-11885"
+    # "astropy__astropy-14369",
+    # "django__django-15629",
+    # "django__django-15957",
+    # "django__django-10554",
+    # "django__django-12325",
+    # "django__django-11400",
+    # "django__django-16263",
+    "django__django-12708",
 ]
 
 AGENT_FILE_NAME = "test_driven_agent_oop.py"
+
+
+def get_problem_suites() -> List[ProblemSuite]:
+    """Initialize and return all available problem suites."""
+    datasets_path = Path(__file__).parent / "evaluator" / "datasets"
+    
+    polyglot_suite = PolyglotSuite(str(datasets_path / "polyglot"))
+    swebench_suite = SWEBenchVerifiedSuite(str(datasets_path / "swebench_verified"))
+    
+    return [polyglot_suite, swebench_suite]
 
 
 def run_agent_locally(agent_file_path: str, problem, suite, timeout: int) -> tuple[str, str, float, str]:
@@ -589,6 +605,7 @@ def run_tests_swebench_local(problem, patch: str, problem_dir: str) -> Dict:
             if use_django_runner:
                 # Django format: "test_name (module.file.Class)" → "module.file.Class.test_name"
                 console.print(f"  🐍 Using Django's test runner (runtests.py)", style="cyan")
+                console.print(f"problem_statement: {problem.userdata['problem_statement']}")
                 django_tests = []
                 for test in all_tests:
                     match = re.match(r'^([\w_]+)\s*\((.+)\)$', test)
@@ -598,7 +615,10 @@ def run_tests_swebench_local(problem, patch: str, problem_dir: str) -> Dict:
                         # Format: module.file.Class.test_name
                         django_tests.append(f"{module_class_path}.{test_func}")
                     else:
-                        django_tests.append(test)
+                        # Skip test descriptions that don't match the expected format
+                        # These are likely test docstrings, not actual test paths
+                        console.print(f"  ⚠️  Skipping invalid test label: {test[:50]}...", style="dim")
+                        continue
                 
                 # Run tests serially to avoid multiprocessing pickle errors
                 test_args = [python_path, django_runtests, "--verbosity=2", "--parallel=1"] + django_tests
@@ -704,48 +724,53 @@ def run_tests_swebench_local(problem, patch: str, problem_dir: str) -> Dict:
                 missing_match = regex_module.search(r"No module named ['\"]([^'\"]+)['\"]", output)
                 if missing_match:
                     missing_module = missing_match.group(1)
-                    console.print(f"  ⚠️  Missing test dependency: {missing_module}", style="yellow")
-                    
-                    # Common package name mappings (import name -> pip package name)
-                    package_mappings = {
-                        'erfa': 'pyerfa',
-                        'yaml': 'pyyaml',
-                        'PIL': 'pillow',
-                        'cv2': 'opencv-python',
-                        'distutils': None,  # distutils is part of setuptools, already installed
-                    }
-                    
-                    # Get the correct pip package name
-                    pip_package = package_mappings.get(missing_module, missing_module)
-                    
-                    # Skip if package is None (already provided by other packages)
-                    if pip_package is not None:
-                        # Install the missing module
-                        pip_path = os.path.join(venv_dir, "bin", "pip")
-                        console.print(f"  📦 Installing {pip_package}...", style="cyan")
-                        install_result = subprocess.run(
-                            [pip_path, "install", pip_package],
-                            capture_output=True,
-                            text=True,
-                            timeout=120
-                        )
+                    # Validate that this is actually a valid module name (not an error message)
+                    # Module names should only contain alphanumeric, dots, and underscores
+                    if not regex_module.match(r'^[a-zA-Z0-9_\.]+$', missing_module):
+                        console.print(f"  ⚠️  Ignoring invalid module name: {missing_module[:50]}", style="dim")
+                    else:
+                        console.print(f"  ⚠️  Missing test dependency: {missing_module}", style="yellow")
                         
-                        if install_result.returncode == 0:
-                            console.print(f"  ✅ Installed {pip_package}, retrying tests...", style="green")
-                            
-                            # Retry the test execution with the same test_args
-                            result = subprocess.run(
-                                test_args,
-                                cwd=temp_repo,
+                        # Common package name mappings (import name -> pip package name)
+                        package_mappings = {
+                            'erfa': 'pyerfa',
+                            'yaml': 'pyyaml',
+                            'PIL': 'pillow',
+                            'cv2': 'opencv-python',
+                            'distutils': None,  # distutils is part of setuptools, already installed
+                        }
+                        
+                        # Get the correct pip package name
+                        pip_package = package_mappings.get(missing_module, missing_module)
+                        
+                        # Skip if package is None (already provided by other packages)
+                        if pip_package is not None:
+                            # Install the missing module
+                            pip_path = os.path.join(venv_dir, "bin", "pip")
+                            console.print(f"  📦 Installing {pip_package}...", style="cyan")
+                            install_result = subprocess.run(
+                                [pip_path, "install", pip_package],
                                 capture_output=True,
                                 text=True,
-                                timeout=300
+                                timeout=120
                             )
-                            output = result.stdout + "\n" + result.stderr
+                            
+                            if install_result.returncode == 0:
+                                console.print(f"  ✅ Installed {pip_package}, retrying tests...", style="green")
+                                
+                                # Retry the test execution with the same test_args
+                                result = subprocess.run(
+                                    test_args,
+                                    cwd=temp_repo,
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=300
+                                )
+                                output = result.stdout + "\n" + result.stderr
+                            else:
+                                console.print(f"  ❌ Failed to install {pip_package}: {install_result.stderr[:100]}", style="red")
                         else:
-                            console.print(f"  ❌ Failed to install {pip_package}: {install_result.stderr[:100]}", style="red")
-                    else:
-                        console.print(f"  ℹ️  {missing_module} is provided by setuptools, skipping...", style="dim")
+                            console.print(f"  ℹ️  {missing_module} is provided by setuptools, skipping...", style="dim")
             
             # Parse test results (different formats for Django vs pytest)
             if use_django_runner:
@@ -833,9 +858,11 @@ def evaluate_problem(problem_name: str, agent_file: str, timeout: int, results_d
     """
     workspace_dir = None
     try:
-        # Find problem
-        search_result = ProblemSuite.find_problem_in_suites(problem_name)
-        if not search_result:
+        # Find problem across all suites
+        problem_suites = get_problem_suites()
+        suite = next((s for s in problem_suites if s.has_problem_name(problem_name)), None)
+        
+        if suite is None:
             return {
                 "problem": problem_name,
                 "score": 0.0,
@@ -845,9 +872,8 @@ def evaluate_problem(problem_name: str, agent_file: str, timeout: int, results_d
                 "error": f"Problem '{problem_name}' not found"
             }
         
-        suite_name, suite = search_result
         problem = suite.get_problem(problem_name)
-        is_swebench = "swebench" in suite_name.lower()
+        is_swebench = isinstance(suite, SWEBenchVerifiedSuite)
         
         problem_slug = problem_name.replace("/", "_").replace(" ", "_")
         problem_dir = os.path.join(results_dir, problem_slug)
@@ -1201,7 +1227,7 @@ The `test_output.txt` files contain pytest output showing:
     with open(os.path.join(results_dir, "README.md"), "w") as f:
         f.write(readme_content)
     
-    console.print("\n💾 Results saved to: [cyan]{results_dir}/[/cyan]")
+    console.print(f"\n💾 Results saved to: [cyan]{results_dir}/[/cyan]")
     console.print("   - [cyan]README.md[/cyan] - Human-readable summary")
     console.print("   - [cyan]summary.json[/cyan] - Machine-readable data")
     console.print("   - [cyan]<problem>/main.py[/cyan] - 🎯 Generated solution (tested)")
@@ -1214,15 +1240,16 @@ def test_existing_patch(problem_name: str, patch_path: str) -> Dict:
     """Test an existing patch without regenerating it."""
     console.print(f"\n[bold cyan]Testing existing patch for: {problem_name}[/bold cyan]")
     
-    # Find the problem
-    search_result = ProblemSuite.find_problem_in_suites(problem_name)
-    if not search_result:
+    # Find problem across all suites
+    problem_suites = get_problem_suites()
+    suite = next((s for s in problem_suites if s.has_problem_name(problem_name)), None)
+    
+    if suite is None:
         console.print(f"[bold red]❌ Problem not found: {problem_name}[/bold red]")
         return None
     
-    suite_name, suite = search_result
     problem = suite.get_problem(problem_name)
-    is_swebench = "swebench" in suite_name.lower()
+    is_swebench = isinstance(suite, SWEBenchVerifiedSuite)
     
     # Read existing patch
     if not os.path.exists(patch_path):

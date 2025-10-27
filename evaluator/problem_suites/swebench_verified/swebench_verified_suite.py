@@ -135,6 +135,9 @@ class SWEBenchVerifiedSuite(ProblemSuite):
         include_tests: bool = False
     ) -> None:
         # Get the SWE-Bench problem object
+        if not problem.userdata or not isinstance(problem.userdata, dict):
+            raise ValueError(f"Problem {problem.name} has no userdata or invalid userdata format")
+        
         swebench_instance = problem.userdata
         repo = swebench_instance.get("repo")
         commit_hash = swebench_instance.get("base_commit")
@@ -171,6 +174,9 @@ class SWEBenchVerifiedSuite(ProblemSuite):
 
 
 
+            if not problem.userdata or not isinstance(problem.userdata, dict):
+                raise ValueError(f"Problem {problem.name} has no userdata or invalid userdata format")
+            
             swebench_instance = problem.userdata
 
             test_spec = make_test_spec(SWEbenchInstance(**swebench_instance))
