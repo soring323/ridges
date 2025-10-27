@@ -7,6 +7,12 @@ SOLID Principles:
 - Liskov Substitution: Interfaces can be swapped
 - Interface Segregation: Focused interfaces
 - Dependency Inversion: Depend on abstractions
+
+Sandbox Compatibility:
+- Uses SANDBOX_PROXY_URL for LLM API calls
+- Uses os.getloadavg() instead of psutil for resource management
+- Configured with RUN_ID for tracking in sandbox environment
+- Includes proper logging setup for sandbox monitoring
 """
 
 import time
@@ -23,6 +29,20 @@ from uuid import uuid4
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 import multiprocessing
+import logging
+import sys
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+for h in list(logger.handlers):
+    logger.removeHandler(h)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+stream_handler = logging.StreamHandler(sys.stdout)
+stream_handler.setLevel(logging.DEBUG)
+stream_handler.setFormatter(formatter)
+logger.addHandler(stream_handler)
 
 # ============================================================================
 # Configuration (from test_driven_agent.py)
@@ -309,6 +329,41 @@ def call_llm(messages: List[Dict], model: str = CODING_MODEL, temperature: float
     print(f"[NETWORK] {error_msg}")
     raise RuntimeError(error_msg)
 
+def detect_expected_module_name(test_file_path: str = "tests.py") -> str:
+    """Detect what module name the test file expects by parsing imports.
+    
+    Returns the expected module name (e.g., 'main', 'beer_song', etc.)
+    Defaults to 'main' if no test file or unclear imports.
+    """
+    if not os.path.exists(test_file_path):
+        return "main"
+    
+    try:
+        with open(test_file_path, 'r') as f:
+            content = f.read()
+        
+        # Look for imports like "from MODULE import" or "import MODULE"
+        import_patterns = [
+            r'from\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+import',  # from module import ...
+            r'import\s+([a-zA-Z_][a-zA-Z0-9_]*)',           # import module
+        ]
+        
+        for pattern in import_patterns:
+            matches = re.findall(pattern, content)
+            for module in matches:
+                # Exclude standard library and common test modules
+                if module not in ['unittest', 'pytest', 'sys', 'os', 'json', 're', 'math', 'typing']:
+                    print(f"[DETECT] Test file expects module: '{module}'")
+                    return module
+        
+        # Default to 'main' if no clear module found
+        print(f"[DETECT] No clear module found in tests, defaulting to 'main'")
+        return "main"
+    
+    except Exception as e:
+        print(f"[DETECT] Error reading test file: {e}, defaulting to 'main'")
+        return "main"
+
 def parse_file_blocks(text: str) -> Dict[str, str]:
     """Parse text containing multiple files."""
     files = {}
@@ -545,6 +600,11 @@ class LLMCodeGenerator(ICodeGenerator):
         # Truncate problem statement to avoid context overflow
         problem = truncate_text(problem, max_chars=5000)
         
+        # Detect expected module name from tests
+        expected_module = detect_expected_module_name("tests.py")
+        expected_filename = f"{expected_module}.py"
+        print(f"[CODE_GEN] Generating solution for module: {expected_filename}")
+        
         # Check if tests.py exists to show examples
         test_examples = ""
         if Path('tests.py').exists():
@@ -605,8 +665,10 @@ class LLMCodeGenerator(ICodeGenerator):
                     - Are edge cases handled?
                     - Is the code readable and maintainable?
                     
+                    CRITICAL: Your solution MUST be in a file named '{expected_filename}' (the tests import from this module).
+                    
                     Now generate the complete solution in this format:
-                    filename.py
+                    {expected_filename}
                     ```python
                     <complete code>
                     ```
@@ -623,6 +685,15 @@ class LLMCodeGenerator(ICodeGenerator):
             files = parse_file_blocks(response)
             if not files:
                 return {}
+            
+            # Ensure the file has the correct expected name
+            if expected_filename not in files:
+                # Rename the first file to the expected name
+                if files:
+                    first_key = list(files.keys())[0]
+                    content = files[first_key]
+                    files = {expected_filename: content}
+                    print(f"[CODE_GEN] ⚠️ Renamed '{first_key}' to '{expected_filename}' to match test imports")
             
             return files
         except Exception as e:
@@ -777,6 +848,10 @@ class LLMCodeGenerator(ICodeGenerator):
     
     def fix_failures(self, problem: str, test_output: str, files: Dict[str, str]) -> Optional[Dict[str, str]]:
         """Fix failures using LLM with detailed error context."""
+        # Detect expected module name
+        expected_module = detect_expected_module_name("tests.py")
+        expected_filename = f"{expected_module}.py"
+        
         # Extract detailed failure information from FAILURES section
         # Limit to 200 lines to avoid context overflow
         failure_summary = self._extract_failure_summary(test_output, max_lines=200)
@@ -848,6 +923,15 @@ class LLMCodeGenerator(ICodeGenerator):
             )
             
             fixed_files = parse_file_blocks(response)
+            
+            # Ensure the file has the correct expected name
+            if fixed_files and expected_filename not in fixed_files:
+                # Rename the first file to the expected name
+                first_key = list(fixed_files.keys())[0]
+                content = fixed_files[first_key]
+                fixed_files = {expected_filename: content}
+                print(f"[FIX] ⚠️ Renamed '{first_key}' to '{expected_filename}' to match test imports")
+            
             return fixed_files if fixed_files else None
         except Exception as e:
             print(f"[ERROR] Fix generation failed: {e}")
@@ -1592,24 +1676,64 @@ class TestDrivenAgent:
         relevant_files = self.file_manager.read_files(['*.py'])
         print(f"[STEP 1] Found {len(relevant_files)} relevant files")
         
-        # Step 2: Generate reproduction test
-        print("\n[STEP 2] Generating reproduction test...")
-        test_file = self.code_generator.generate_tests(problem, relevant_files)
-        if test_file:
-            self.file_manager.write_files(test_file)
-            print("[STEP 2] Created reproduction test")
+        # Detect if this is a SWEBench problem (large repo)
+        is_swebench = len(relevant_files) > 100
         
-        # Step 3: Refine
-        print("\n[STEP 3] Iterative fixing...")
-        config = RefinementConfig(max_alternatives=5)  # Fewer alternatives for FIX
-        refinement_loop = RefinementLoop(
-            self.test_manager,
-            self.fix_manager,
-            self.arch_manager,
-            config
-        )
-        
-        refinement_loop.run(problem, relevant_files, start_time, None)
+        if is_swebench:
+            print(f"[STEP 2] 🔍 Detected SWEBench problem ({len(relevant_files)} files)")
+            print("[STEP 2] Setting up proper test environment for SWEBench...")
+            
+            # For SWEBench, we need to:
+            # 1. Use the repo's existing test infrastructure
+            # 2. Run tests in a proper venv with dependencies
+            # 3. This is similar to how benchmark does it
+            
+            # The test_manager should already be configured to use the repo's tests
+            # We just need to make sure we're running in the right environment
+            
+            # Try to run initial tests to see baseline
+            print("[STEP 2] Running baseline tests...")
+            initial_results, _ = self.test_manager.run_and_parse()
+            print(f"[STEP 2] Baseline: {initial_results.passed}/{initial_results.total} tests passing")
+            
+            # Step 3: Iterative fixing with proper test feedback
+            print("\n[STEP 3] Iterative fixing with test feedback...")
+            config = RefinementConfig(max_iterations=8, stuck_threshold=3)  # More iterations for SWEBench
+            refinement_loop = RefinementLoop(
+                self.test_manager,
+                self.fix_manager,
+                self.arch_manager,
+                config
+            )
+            
+            # Run refinement with initial test results as feedback
+            refinement_loop.run(problem, relevant_files, start_time, initial_results)
+            
+        else:
+            # Small problem (Polyglot) - original flow
+            print("\n[STEP 2] Checking for existing tests...")
+            import glob
+            existing_tests = glob.glob("test*.py") + glob.glob("*_test.py")
+            if existing_tests:
+                print(f"[STEP 2] Using existing test file: {existing_tests[0]}")
+            else:
+                print("[STEP 2] ⚠️ No test file found - generating reproduction test...")
+                test_file = self.code_generator.generate_tests(problem, relevant_files)
+                if test_file:
+                    self.file_manager.write_files(test_file)
+                    print("[STEP 2] Created reproduction test")
+            
+            # Step 3: Refine
+            print("\n[STEP 3] Iterative fixing...")
+            config = RefinementConfig(max_iterations=5, stuck_threshold=2)
+            refinement_loop = RefinementLoop(
+                self.test_manager,
+                self.fix_manager,
+                self.arch_manager,
+                config
+            )
+            
+            refinement_loop.run(problem, relevant_files, start_time, None)
         
         # Generate patch
         print("\n[COMPLETE] Generating patch...")
@@ -2182,7 +2306,7 @@ class ParallelSolutionGenerator:
 def agent_main(input_data: Dict[str, Any]) -> str:
     """
     Independent entry point for the agent.
-    Called by benchmark system with problem data.
+    Called by benchmark system or Docker sandbox with problem data.
     
     Args:
         input_data: Dict with keys:
@@ -2205,11 +2329,24 @@ def agent_main(input_data: Dict[str, Any]) -> str:
     print(f"[SETUP] Working directory: {os.getcwd()}")
     print(f"[SETUP] Problem type: {mode or 'AUTO-DETECT'}")
     
-    # Change to repo directory if it exists (benchmark framework creates workspace/repo/)
-    repo_dir = os.path.join(os.getcwd(), "repo")
+    # Detect if we're in Docker sandbox or local benchmark
+    in_docker_sandbox = os.path.exists("/sandbox")
+    print(f"[SETUP] Environment: {'Docker Sandbox' if in_docker_sandbox else 'Local Benchmark'}")
+    
+    # Change to repo directory
+    # Docker sandbox: /sandbox/repo/
+    # Local benchmark: workspace/repo/
+    if in_docker_sandbox:
+        repo_dir = "/sandbox/repo"
+    else:
+        repo_dir = os.path.join(os.getcwd(), "repo")
+    
     if os.path.exists(repo_dir) and os.path.isdir(repo_dir):
         print(f"[SETUP] Changing to repo directory: {repo_dir}")
         os.chdir(repo_dir)
+    else:
+        print(f"[SETUP] Warning: Repo directory not found: {repo_dir}")
+        print(f"[SETUP] Staying in current directory: {os.getcwd()}")
     
     # Initialize git repo and commit skeleton files
     # This is CRITICAL for generating proper patches
@@ -2265,11 +2402,14 @@ def agent_main(input_data: Dict[str, Any]) -> str:
     
     print(f"[AGENT] Test-Driven Agent initialized - Mode: {mode.upper()}")
     
-    # Create concrete implementations (these would be imported from actual implementations)
-    # For now, these are placeholder - you need to implement these based on your existing code
+    # Create concrete implementations
+    # API URL: Use sandbox proxy in Docker, localhost in local benchmark
+    api_url = f"{SANDBOX_PROXY_URL}/v1/chat/completions" if in_docker_sandbox else "http://localhost:8000/v1/chat/completions"
+    print(f"[SETUP] Using API URL: {api_url}")
+    
     test_runner = PytestRunner()
-    code_generator = LLMCodeGenerator(api_url="http://localhost:8000/v1/chat/completions")
-    arch_generator = LLMArchitectureGenerator(api_url="http://localhost:8000/v1/chat/completions")
+    code_generator = LLMCodeGenerator(api_url=api_url)
+    arch_generator = LLMArchitectureGenerator(api_url=api_url)
     file_manager = LocalFileManager()
     
     # Configure based on mode
@@ -2304,31 +2444,68 @@ def agent_main(input_data: Dict[str, Any]) -> str:
         return ""
 
 # ============================================================================
-# Example Usage
+# Main Entry Point - Docker Sandbox Compatible
 # ============================================================================
 
 if __name__ == "__main__":
-    # Example 1: CREATE mode
-    input_data = {
-        'problem_statement': '''
-        Implement a reactive system with two types of cells:
-        - Input cells: Hold mutable values
-        - Compute cells: Calculate based on input cells
-        Cells can have callbacks that fire when values change.
-        ''',
-        'timeout': 1800,
-        'mode': 'create'
-    }
+    import json
+    import traceback
     
-    patch = agent_main(input_data)
-    print(f"\nGenerated patch:\n{patch}")
+    # Check if running in Docker sandbox (expects /sandbox/input.json and /sandbox/output.json)
+    if os.path.exists("/sandbox/input.json"):
+        print("[MAIN] Running in Docker sandbox mode")
+        
+        try:
+            # Read input from sandbox
+            with open("/sandbox/input.json", "r") as f:
+                input_data = json.load(f)
+            
+            print(f"[MAIN] Loaded input: {list(input_data.keys())}")
+            
+            # Run agent
+            patch = agent_main(input_data)
+            
+            # Write output
+            output = {
+                "success": True,
+                "output": patch
+            }
+            
+            with open("/sandbox/output.json", "w") as f:
+                json.dump(output, f, indent=2)
+            
+            print("[MAIN] ✓ Completed successfully")
+            
+        except Exception as e:
+            print(f"[MAIN] ✗ Agent failed: {e}")
+            traceback.print_exc()
+            
+            # Write error output
+            output = {
+                "success": False,
+                "error": str(e),
+                "traceback": traceback.format_exc(),
+                "output": ""
+            }
+            
+            with open("/sandbox/output.json", "w") as f:
+                json.dump(output, f, indent=2)
     
-    # Example 2: FIX mode
-    input_data = {
-        'problem_statement': 'Fix the bug where callbacks fire even when value doesn\'t change',
-        'timeout': 1800,
-        'mode': 'fix'
-    }
-    
-    patch = agent_main(input_data)
-    print(f"\nGenerated patch:\n{patch}")
+    else:
+        # Local testing mode - run example
+        print("[MAIN] Running in local testing mode")
+        
+        # Example 1: CREATE mode
+        input_data = {
+            'problem_statement': '''
+            Implement a reactive system with two types of cells:
+            - Input cells: Hold mutable values
+            - Compute cells: Calculate based on input cells
+            Cells can have callbacks that fire when values change.
+            ''',
+            'timeout': 1800,
+            'mode': 'create'
+        }
+        
+        patch = agent_main(input_data)
+        print(f"\nGenerated patch:\n{patch}")

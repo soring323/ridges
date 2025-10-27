@@ -31,8 +31,8 @@ console = Console()
 
 # Default test problems - edit this list
 DEFAULT_TEST_PROBLEMS = [
-    "affine-cipher",
-    # "beer-song", 
+    # "affine-cipher",
+    "beer-song", 
     # "react",
     # "react",
     # "react",
