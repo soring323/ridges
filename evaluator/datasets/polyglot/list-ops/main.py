@@ -21,11 +21,11 @@ def map(function: Callable, list: list) -> list:
     pass
 
 
-def foldl(function: Callable, list: list, initial: Any) -> Any:
+def foldl(function: Callable, list: list, initial: Any) -> Any:  # function(acc, el)
     pass
 
 
-def foldr(function: Callable, list: list, initial: Any) -> Any:
+def foldr(function: Callable, list: list, initial: Any) -> Any:  # function(acc, el)
     pass
 
 

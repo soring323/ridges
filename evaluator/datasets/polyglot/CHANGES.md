@@ -63,7 +63,7 @@ Added typing to `Hangman.__init__()`, `guess()`, `get_masked_word()`, and `get_s
 
 ## list-ops
 
-Added typing to all functions (`append()`, `concat()`, `filter()`, `length()`, `map()`, `foldl()`, `foldr()`, `reverse()`), as it is unclear what the parameter types should be and what the functions should return. The fold functions are particularly ambiguous regarding parameter order and types.
+Added typing to all functions (`append()`, `concat()`, `filter()`, `length()`, `map()`, `foldl()`, `foldr()`, `reverse()`), as it is unclear what the parameter types should be and what the functions should return. Added comments to `foldl()` and `foldr()` clarifying the function signature should be `function(acc, el)`, as the instructions mention argument ordering is significant but don't specify what that ordering is.
 
 ## phone-number
 
@@ -95,7 +95,7 @@ Added typing to `RestAPI.__init__()`, `get()`, and `post()`, as it is unclear wh
 
 ## robot-name
 
-Added the missing `name` property and `reset()` method with type hints. The instructions mention these behaviors but `main.py` had no indication that a `name` property or `reset()` method were needed.
+Added the missing `name` property and `reset()` method with type hints. The instructions mention these behaviors but `main.py` had no indication that a `name` property or `reset()` method were needed. Fixed `solution.py` to use a class variable `_used_names` for global name tracking instead of an instance variable, as the tests expect different Robot instances to have different names. Clarified in the instructions that names must be globally unique across all Robot instances.
 
 ## scale-generator
 
