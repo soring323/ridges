@@ -1392,7 +1392,11 @@ class TestDrivenAgent:
         
         # Check for existing tests first
         print("\n[STEP 1] Checking for existing test files...")
-        existing_tests = list(Path('.').glob('*test*.py'))
+        # Pattern must match: tests.py, test_main.py, main_test.py
+        existing_tests = (
+            list(Path('.').glob('test*.py')) +  # Matches tests.py, test_main.py
+            list(Path('.').glob('*_test.py'))   # Matches main_test.py
+        )
         
         if not existing_tests:
             print("[STEP 1] No existing tests found, generating test suite...")
