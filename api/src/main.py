@@ -113,4 +113,5 @@ app.include_router(evaluations_router, prefix="/evaluation")
 
 
 if __name__ == "__main__":
+    # TODO ADAM: .env
     uvicorn.run(app, host="0.0.0.0", port=8000)

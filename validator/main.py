@@ -88,7 +88,7 @@ async def set_weights_loop():
 # Sends an update-evaluation-run request to the Ridges platform. The extra
 # parameter is for fields that are not sent in all requests, such as agent_logs
 # and eval_logs, which are only sent on some state transitions.
-async def update_evaluation_run(evaluation_run_id: str, problem_name: str, updated_status: EvaluationRunStatus, extra: Dict[str, Any] = {}):
+async def update_evaluation_run(evaluation_run_id: UUID, problem_name: str, updated_status: EvaluationRunStatus, extra: Dict[str, Any] = {}):
     logger.info(f"Updating evaluation run {evaluation_run_id} for problem {problem_name} to {updated_status.value}...")
     
     await post_ridges_platform("/validator/update-evaluation-run", ValidatorUpdateEvaluationRunRequest(
@@ -108,7 +108,7 @@ def truncate_logs_if_required(log: str) -> str:
 
 
 # Simulate a run of an evaluation run, useful for testing, set SIMULATE_EVALUATION_RUNS=True in .env
-async def _simulate_run_evaluation_run(evaluation_run_id: str, problem_name: str):
+async def _simulate_run_evaluation_run(evaluation_run_id: UUID, problem_name: str):
     logger.info(f"Starting simulated evaluation run {evaluation_run_id} for problem {problem_name}...")
 
 
@@ -141,12 +141,12 @@ async def _simulate_run_evaluation_run(evaluation_run_id: str, problem_name: str
 
 
     
-    logger.info(f"Finished simulated evaluation run {evaluation_run_id} for problem {problem_name}...")
+    logger.info(f"Finished simulated evaluation run {evaluation_run_id} for problem {problem_name}")
 
 
 
 # Run an evaluation run
-async def _run_evaluation_run(evaluation_run_id: str, problem_name: str, agent_code: str):
+async def _run_evaluation_run(evaluation_run_id: UUID, problem_name: str, agent_code: str):
     try:
         # Figure out what problem suite this problem belongs to
         problem_suite: Optional[ProblemSuite] = None
@@ -253,7 +253,7 @@ async def _run_evaluation_run(evaluation_run_id: str, problem_name: str, agent_c
 
 
 
-        logger.info(f"Finished evaluation run {evaluation_run_id} for problem {problem_name}...")
+        logger.info(f"Finished evaluation run {evaluation_run_id} for problem {problem_name}")
 
     except Exception as e:
         logger.error(f"Error in _run_evaluation_run(): {type(e).__name__}: {e}")
