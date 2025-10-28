@@ -1,3 +1,4 @@
+# ADAM: Black magic file
 import time
 import asyncio
 import utils.logger as logger
@@ -15,11 +16,10 @@ DEBUG_LOCKS_LOCK = asyncio.Lock()
 
 
 class DebugLock:
-    def __init__(self, lock: asyncio.Lock, label: str):
+    def __init__(self, lock: asyncio.Lock, label: str, timeout: float = None):
         self.lock = lock
         self.label = label
-        self.waiting_at = None
-        self.acquired_at = None
+        self.timeout = timeout
 
     async def __aenter__(self):
         self.waiting_at = time.time()
@@ -30,7 +30,16 @@ class DebugLock:
         }
         async with DEBUG_LOCKS_LOCK:
             DEBUG_LOCKS["waiting"].append(waiting_entry)
-        await self.lock.acquire()
+        try:
+            if self.timeout is not None:
+                await asyncio.wait_for(self.lock.acquire(), timeout=self.timeout)
+            else:
+                await self.lock.acquire()
+        except asyncio.TimeoutError:
+            async with DEBUG_LOCKS_LOCK:
+                DEBUG_LOCKS["waiting"] = [x for x in DEBUG_LOCKS["waiting"] if not (x["label"] == self.label and x["waiting_at"] == self.waiting_at)]
+            logger.error(f"[DebugLock] {self.label}: Failed to acquire lock within {self.timeout} seconds")
+            raise 
         self.acquired_at = time.time()
         acquired_entry = {
             "label": self.label,

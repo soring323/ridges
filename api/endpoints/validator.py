@@ -321,14 +321,22 @@ async def validator_request_evaluation(
         lock = validator_request_evaluation_lock
         lock_name = "validator_request_evaluation_lock"
 
-    async with DebugLock(lock, f"{validator.name} ({validator.hotkey}) for {lock_name}"):
-        # Find the next agent awaiting an evaluation from this validator
-        agent_id = await get_next_agent_id_awaiting_evaluation_for_validator_hotkey(validator.hotkey)
-        if agent_id is None:
-            return None
+    # Try to acquire the lock, but don't hang forever
+    # TODO: .env
+    try:
+        async with DebugLock(lock, f"{validator.name} ({validator.hotkey}) for {lock_name}", timeout=30):
+            # Find the next agent awaiting an evaluation from this validator
+            agent_id = await get_next_agent_id_awaiting_evaluation_for_validator_hotkey(validator.hotkey)
+            if agent_id is None:
+                return None
 
-        # Create a new evaluation and evaluation runs for this agent & validator
-        evaluation, evaluation_runs = await create_new_evaluation_and_evaluation_runs(agent_id, validator.hotkey)
+            # Create a new evaluation and evaluation runs for this agent & validator
+            evaluation, evaluation_runs = await create_new_evaluation_and_evaluation_runs(agent_id, validator.hotkey)
+    except asyncio.TimeoutError:
+        # We couldn't acquire the lock, just act as though there are no evaluations available
+        # The validator will automatically retry in a few seconds
+        # This should prevent a ridiculous amount of lock contention
+        return None
 
     validator.current_evaluation_id = evaluation.evaluation_id
     validator.current_evaluation = evaluation
