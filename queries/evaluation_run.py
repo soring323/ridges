@@ -132,8 +132,9 @@ async def create_evaluation_runs(conn: DatabaseConnection, evaluation_id: UUID, 
             evaluation_run_id,
             evaluation_id,
             problem_name,
-            status
-        ) VALUES ($1, $2, $3, $4)
+            status,
+            created_at
+        ) VALUES ($1, $2, $3, $4, NOW())
         """,
         [(uuid4(), evaluation_id, problem_name, EvaluationRunStatus.pending.value) for problem_name in problem_names]
     )
