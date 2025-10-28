@@ -102,28 +102,35 @@ class DatabaseConnection:
         self.label = label
 
     async def execute(self, query: str, *args, **kwargs):
-        id = await _begin_db_operation(self.label, query)
+        id = await _begin_db_operation(self.label, "execute: " + query)
         try:
             return await self.conn.execute(query, *args, **kwargs)
         finally:
             await _end_db_operation(id)
 
+    async def executemany(self, query: str, *args, **kwargs):
+        id = await _begin_db_operation(self.label, "executemany: " + query)
+        try:
+            return await self.conn.executemany(query, *args, **kwargs)
+        finally:
+            await _end_db_operation(id)
+
     async def fetch(self, query: str, *args, **kwargs):
-        id = await _begin_db_operation(self.label, query)
+        id = await _begin_db_operation(self.label, "fetch: " + query)
         try:
             return await self.conn.fetch(query, *args, **kwargs)
         finally:
             await _end_db_operation(id)
 
     async def fetchrow(self, query: str, *args, **kwargs):
-        id = await _begin_db_operation(self.label, query)
+        id = await _begin_db_operation(self.label, "fetchrow: " + query)
         try:
             return await self.conn.fetchrow(query, *args, **kwargs)
         finally:
             await _end_db_operation(id)
 
     async def fetchval(self, query: str, *args, **kwargs):
-        id = await _begin_db_operation(self.label, query)
+        id = await _begin_db_operation(self.label, "fetchval: " + query)
         try:
             return await self.conn.fetchval(query, *args, **kwargs)
         finally:
