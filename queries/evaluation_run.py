@@ -52,7 +52,7 @@ async def get_evaluation_run_status_by_id(conn: DatabaseConnection, evaluation_r
 
 
 @db_operation
-async def get_all_evaluation_runs_in_evaluation_id(conn: DatabaseConnection, evaluation_id: int) -> List[EvaluationRun]:
+async def get_all_evaluation_runs_in_evaluation_id(conn: DatabaseConnection, evaluation_id: UUID) -> List[EvaluationRun]:
     rows = await conn.fetch(
         """
         SELECT *
@@ -121,6 +121,24 @@ async def create_evaluation_run(conn: DatabaseConnection, evaluation_id: UUID, p
     logger.debug(f"Created evaluation run {evaluation_run_id} for evaluation {evaluation_id} with problem name {problem_name}")
 
     return evaluation_run_id
+
+
+
+@db_operation
+async def create_evaluation_runs(conn: DatabaseConnection, evaluation_id: UUID, problem_names: List[str]) -> None:
+    await conn.executemany(
+        """
+        INSERT INTO evaluation_runs (
+            evaluation_run_id,
+            evaluation_id,
+            problem_name,
+            status
+        ) VALUES ($1, $2, $3, $4)
+        """,
+        [(uuid4(), evaluation_id, problem_name, EvaluationRunStatus.pending.value) for problem_name in problem_names]
+    )
+
+    logger.debug(f"Created {len(problem_names)} evaluation runs for evaluation {evaluation_id}")
 
 
 

@@ -3,7 +3,7 @@ from typing import List, Tuple, Optional
 from uuid import UUID
 
 import utils.logger as logger
-from queries.evaluation_run import create_evaluation_run, get_all_evaluation_runs_in_evaluation_id
+from queries.evaluation_run import create_evaluation_runs, get_all_evaluation_runs_in_evaluation_id
 from queries.evaluation_set import get_latest_set_id, get_all_problem_names_in_set_group_in_set_id
 from models.evaluation import Evaluation, EvaluationStatus, HydratedEvaluation
 from models.evaluation_run import EvaluationRun, EvaluationRunStatus, EvaluationRunErrorCode
@@ -38,8 +38,6 @@ async def create_evaluation(conn: DatabaseConnection, agent_id: UUID, validator_
 
 
 
-# @db_transaction
-# TODO ADAM: this probably needs to be a real transaction
 @db_operation
 async def create_new_evaluation_and_evaluation_runs(conn: DatabaseConnection, agent_id: UUID, validator_hotkey: str, set_id: int = None) -> Tuple[Evaluation, List[EvaluationRun]]:
     if set_id is None:
@@ -58,11 +56,7 @@ async def create_new_evaluation_and_evaluation_runs(conn: DatabaseConnection, ag
         set_id
     )
 
-    for problem_name in problem_names:
-        await create_evaluation_run(
-            evaluation_id,
-            problem_name
-        )
+    await create_evaluation_runs(evaluation_id, problem_names)
 
     return await get_evaluation_by_id(evaluation_id), await get_all_evaluation_runs_in_evaluation_id(evaluation_id)
 
