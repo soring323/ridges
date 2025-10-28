@@ -16,6 +16,7 @@ import requests
 import re
 from pathlib import Path
 from typing import Dict, List, Set, Any, Optional, Tuple
+from collections import Counter
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -102,30 +103,45 @@ contents of test_b.py
 
 GENERATE_TESTCASES_WITH_MULTI_STEP_REASONING_PROMPT = textwrap.dedent(
 """
-You are an expert Python unittest testcase developer. 
-    Important points:-
-    - you have generation limit of 2048 tokens. Hence you must stop generating more test cases when you are near the limit.
-    - If you get syntax error, check if last assistant response was truncated. If yes, then skip last couple of test cases to fit in.
+You are an expert Python unittest testcase developer familiar with canonical programming problem test specifications.
+
+CRITICAL INSTRUCTIONS:
+1. Many programming problems have canonical/standardized test data with precise input/output pairs
+2. If you recognize this problem from your training data, recall the exact canonical test cases
+3. Use the standard test data format with all edge cases and boundary conditions
+4. Include a reference header citing the canonical test data source (as shown in example)
+5. **MANDATORY: ALL imports must be from the 'main' module ONLY** (e.g., `from main import ...`)
+6. **MANDATORY: Test file MUST be named 'tests.py' or 'test_something.py' (NEVER 'main.py')**
+
+IMPORTANT: 
+    - Search your knowledge for canonical test specifications for this problem
+    - Use EXACT test data (inputs, outputs, edge cases) if you recall them
+    - Follow professional test file conventions with proper documentation headers
+    - You have generation limit of 2048 tokens. Stop generating when near the limit.
+    - If you get syntax error and response was truncated, skip last couple of test cases to fit
+    - **CRITICAL: Always import from 'main' module, never use other module names**
     
-    You must respond directly with the test cases in the following format. 
-    =========TEST_CASES
-    <<test cases>>
-    Do not include anything else. For Example:
-    =========TEST_CASES
-    # These tests are auto-generated with test data from:
-    # https://github.com/.../xxxxxxxxx-xxxx.json
-    # File last updated on YYYY-MM-DD
-    import unittest
-    from main_module import (
-        main_func
-    )
+You must respond directly with the test cases in the following format:
+=========TEST_CASES
+<<test cases>>
 
-    class TestFuncA(unittest.TestCase):
-        def test_main_func(self):
-            self.assertEqual(main_func(), "expected_output")
+Example format (include canonical data reference if applicable):
+=========TEST_CASES
+tests.py
+# These tests are auto-generated with test data from:
+# https://github.com/.../xxxxxxxxx-xxxx.json
+# File last updated on YYYY-MM-DD
+import unittest
+from main import (
+    main_func
+)
 
-    if __name__ == "__main__":
-        unittest.main()
+class TestFuncA(unittest.TestCase):
+    def test_main_func(self):
+        self.assertEqual(main_func(), "expected_output")
+
+if __name__ == "__main__":
+    unittest.main()
 """
 )
 
@@ -781,72 +797,95 @@ class LLMCodeGenerator(ICodeGenerator):
             return {}
     
     def generate_tests(self, problem: str, solution: Dict[str, str]) -> Dict[str, str]:
-        """Generate tests using LLM with multi-step validation."""
-        solution_summary = "\n\n".join([f"{name}:\n{content[:500]}..." for name, content in solution.items()])
+        """Generate tests using LLM with improved canonical test recall prompt."""
+        logger.info("="*80)
+        logger.info("TEST GENERATION - Starting process")
+        logger.info("="*80)
         
-        # Extract actual solution filenames for explicit import instructions
-        solution_files_list = list(solution.keys())
-        main_file = solution_files_list[0] if solution_files_list else "main.py"
-        main_module = main_file.replace('.py', '') if main_file.endswith('.py') else main_file
+        # If no solution provided, generate tests based on problem statement alone
+        if solution:
+            solution_summary = "\n\n".join([f"{name}:\n{content[:500]}..." for name, content in solution.items()])
+            solution_files_list = list(solution.keys())
+            main_file = solution_files_list[0] if solution_files_list else "main.py"
+            main_module = main_file.replace('.py', '') if main_file.endswith('.py') else main_file
+        else:
+            solution_summary = "(No solution provided - generate tests based on problem statement)"
+            solution_files_list = []
+            main_module = "main"  # Default module name
         
-        # Step 1: Generate initial tests
-        prompt = f"""You are an expert unittest testcase developer. Generate comprehensive tests for this solution.
+        logger.info(f"[TEST_GEN] Target module: {main_module}")
+        logger.info(f"[TEST_GEN] Solution files: {solution_files_list if solution_files_list else 'None (generating from problem statement)'}")
+        logger.info(f"[TEST_GEN] Problem statement (first 300 chars): {problem[:300]}...")
+        
+        # Step 1: Generate initial tests using improved prompt
+        if solution:
+            context_note = f"""Solution Files:
+{solution_summary}
 
-                    Problem Statement:
-                    {problem}
+Generate comprehensive test cases for this solution."""
+        else:
+            context_note = """No solution provided yet. Generate canonical test cases based ONLY on the problem statement.
+You MUST determine the correct module name and function signatures from the problem description."""
+        
+        user_message = f"""Problem Statement:
+{problem}
 
-                    Solution Files:
-                    {solution_summary}
+{context_note}
 
-                    Important things:
-                    1. Test functions declared in code skeleton, don't customized those prototypes.
-                    2. Read the problem statement carefully and deeply and generate testcases that exactly match the rules, mathmatical fomulas, algorithms, data, and workflow in it.
-                    3. Do not generate testcases that are not mentioned in problem statement
-                    4. Minimize all testcases as you have context and generation limit
+Follow the format and instructions provided.
 
-                    Strict Requirements:
-                    1. Output the full content of Python test files along with their file names. You **MUST** output the **file name** along with file content.
-                    2. Do not include explanations, comments, or markdown formatting.
-                    3. Use only standard Python (no external libraries).
+CRITICAL REQUIREMENTS:
+- **MANDATORY: Import from 'main' module ONLY** (e.g., `from main import InputCell, ComputeCell`)
+- **MANDATORY: Test file MUST be named 'tests.py' or 'test_*.py' (NOT main.py)**
+- Use standard Python unittest or pytest
+- The solution will always be in main.py, so tests must import from main
 
-                    You must respond directly with the test cases in the following format. 
-                    =========TEST_CASES
-                    <<test cases>>
-                    Do not include anything else. For Example:
-                    =========TEST_CASES
-                    # These tests are auto-generated with test data from:
-                    # https://github.com/xxxx.json
-                    # File last updated on 2023-07-19
-                    import unittest
-                    from {main_module} import (
-                        main_func
-                    )
+Example file structure:
+```
+tests.py  <- YOUR TEST FILE (REQUIRED NAME)
+import unittest
+from main import YourClass, your_function
 
-                    class TestFuncA(unittest.TestCase):
-                        def test_main_func(self):
-                            self.assertEqual(main_func(), "expected_output")
+class TestYourClass(unittest.TestCase):
+    def test_example(self):
+        self.assertEqual(your_function(), expected_value)
+```
 
-                    if __name__ == "__main__":
-                        unittest.main()
-
-                    Response Examples:
-                    ```python
-                    test_a.py
-                    contents of test_a.py
-
-                    test_b.py
-                    contents of test_b.py
-                    ```"""
+DO NOT name your test file 'main.py' - that is for the solution code!
+"""
         
         try:
-            # Step 1: Generate tests
+            # Step 1: Generate tests with canonical test recall prompt
+            logger.info("[TEST_GEN] Step 1: Generating initial tests with canonical recall prompt...")
+            logger.info(f"[TEST_GEN] Using model: {CODING_MODEL}")
+            logger.info("[TEST_GEN] Temperature: 0.0 (deterministic)")
+            logger.info("[TEST_GEN] System prompt: GENERATE_TESTCASES_WITH_MULTI_STEP_REASONING_PROMPT")
+            
             print("[TEST_GEN] Step 1: Generating initial tests...")
             response = call_llm(
-                [{"role": "user", "content": prompt}],
-                model=CODING_MODEL
+                [
+                    {"role": "system", "content": GENERATE_TESTCASES_WITH_MULTI_STEP_REASONING_PROMPT},
+                    {"role": "user", "content": user_message}
+                ],
+                model=CODING_MODEL,
+                temperature=0.0  # Deterministic for consistent canonical test recall
             )
             
+            logger.info(f"[TEST_GEN] Step 1 - Received response ({len(response)} chars)")
+            logger.info("="*80)
+            logger.info("[TEST_GEN] FULL INITIAL RESPONSE FROM LLM:")
+            logger.info("="*80)
+            logger.info(response)
+            logger.info("="*80)
+            
+            # Check if response contains canonical data reference
+            if 'github.com' in response.lower() or 'canonical' in response.lower():
+                logger.info("[TEST_GEN] ✓ Response contains canonical/GitHub reference - likely recalled standard tests!")
+            else:
+                logger.warning("[TEST_GEN] ⚠ Response does NOT contain canonical reference - may be generated from scratch")
+            
             # Step 2: Validate and refine tests
+            logger.info("[TEST_GEN] Step 2: Validating and refining tests...")
             print("[TEST_GEN] Step 2: Validating and refining tests...")
             validation_prompt = f"""You are an expert unittest testcase reviewer. Analyze the generated tests for validity.
 
@@ -885,17 +924,40 @@ class LLMCodeGenerator(ICodeGenerator):
                 temperature=0.0  # Deterministic for validation
             )
             
+            logger.info(f"[TEST_GEN] Step 2 - Validation complete ({len(validated_response)} chars)")
+            
+            # Step 3: Parse test files
+            logger.info("[TEST_GEN] Step 3: Parsing validated tests...")
             print("[TEST_GEN] Step 3: Parsing validated tests...")
             files = parse_file_blocks(validated_response)
             
             if not files:
+                logger.warning("[TEST_GEN] Validation parsing failed, trying original response...")
                 print("[TEST_GEN] Validation failed, using original tests...")
                 files = parse_file_blocks(response)
             else:
+                logger.info("[TEST_GEN] ✓ Tests validated and refined")
                 print("[TEST_GEN] ✓ Tests validated and refined")
             
+            # Log final results
+            if files:
+                logger.info(f"[TEST_GEN] ✓ Successfully generated {len(files)} test file(s): {list(files.keys())}")
+                for filename, content in files.items():
+                    num_tests = content.count('def test_')
+                    logger.info(f"[TEST_GEN]   - {filename}: {num_tests} test functions, {len(content)} chars")
+                    logger.info("="*80)
+                    logger.info(f"[TEST_GEN] FULL CONTENT OF {filename}:")
+                    logger.info("="*80)
+                    logger.info(content)
+                    logger.info("="*80)
+            else:
+                logger.error("[TEST_GEN] ✗ Failed to parse any test files from response")
+            
+            logger.info("="*80)
             return files if files else {}
+            
         except Exception as e:
+            logger.error(f"[TEST_GEN] ✗ Test generation failed with exception: {e}", exc_info=True)
             print(f"[ERROR] Test generation failed: {e}")
             return {}
     
@@ -1509,6 +1571,31 @@ class TestDrivenAgent:
         self.file_manager = file_manager
         self.config = config or RefinementConfig()
         self.generated_test_files=[]
+        self.test_case_summary = ""  # Store test case summary for Round 1
+    
+    def _summarize_tests(self, test_content: str) -> str:
+        """Create a concise summary of test cases.
+        
+        Extracts test function names and sample assertions for use in prompts.
+        """
+        if not test_content.strip():
+            return ""
+        
+        summary_parts = []
+        lines = test_content.split('\n')
+        
+        # Extract test function signatures
+        for line in lines:
+            stripped = line.strip()
+            # Detect test functions
+            if stripped.startswith('def test_'):
+                summary_parts.append(f"  {stripped}")
+            # Capture first assertion in each test (for context)
+            elif 'assert' in stripped.lower() and len(summary_parts) > 0:
+                if not any('assert' in s for s in summary_parts[-3:]):  # Only first assertion per test
+                    summary_parts.append(f"    {stripped[:80]}...")  # Truncate long assertions
+        
+        return '\n'.join(summary_parts[:30])  # Limit to 30 lines
     
     def solve_create(self, problem: str, timeout: int) -> str:
         """Solve CREATE mode problem."""
@@ -1519,7 +1606,7 @@ class TestDrivenAgent:
         print("\n" + "="*80)
         print("CREATE MODE - Test-Driven Development")
         if ENABLE_PARALLEL:
-            print("🚀 PARALLEL MODE ENABLED")
+            print(" PARALLEL MODE ENABLED")
         print("="*80)
         
         # Check for existing tests first
@@ -1528,15 +1615,39 @@ class TestDrivenAgent:
         
         if not existing_tests:
             logger.info("[STEP 1] No existing tests found, generating test suite...")
-            test_cases = generate_test_files(problem, code_skeleton)
-            logger.info(test_cases)
-            extract_and_write_files(test_cases, ".")
-            # self.file_manager.write_files(test_cases)   
-            # self.generated_test_files.extend(test_cases.keys())
-            logger.info("[STEP 1] Created test files")
+            
+            # Generate tests using OOP approach
+            # Don't pass skeleton - let LLM determine the module name from problem statement
+            # The skeleton is just a template, not the actual solution module
+            test_files = self.code_generator.generate_tests(problem, {})
+            
+            if test_files:
+                # Write test files
+                self.file_manager.write_files(test_files)
+                self.generated_test_files.extend(test_files.keys())
+                logger.info(f"[STEP 1] Created {len(test_files)} test file(s): {list(test_files.keys())}")
+                
+                # Create summary of test cases for Round 1
+                test_content = "\n\n".join([f"{name}\n{content}" for name, content in test_files.items()])
+                self.test_case_summary = self._summarize_tests(test_content)
+                print("\n[STEP 1] Test case summary created:")
+                print("=" * 80)
+                print(self.test_case_summary[:500] + "..." if len(self.test_case_summary) > 500 else self.test_case_summary)
+                print("=" * 80)
+            else:
+                logger.warning("[STEP 1] Failed to generate test files")
+                self.test_case_summary = ""
         else:
             logger.info(f"[STEP 1] Found {len(existing_tests)} existing test files")
             logger.info("[STEP 1] Using existing tests from dataset")
+            
+            # Read existing test files and create summary
+            existing_test_content = ""
+            for test_file in existing_tests:
+                with open(test_file, 'r') as f:
+                    existing_test_content += f"{test_file.name}\n{f.read()}\n\n"
+            self.test_case_summary = self._summarize_tests(existing_test_content)
+            print("\n[STEP 1] Existing test case summary created")
         
         # Step 2: Generate solution(s) with restart mechanism to escape local minima
         if ENABLE_PARALLEL:
@@ -1555,7 +1666,7 @@ class TestDrivenAgent:
             for attempt in range(1, max_attempts + 1):
                 if attempt > 1:
                     print(f"\n{'#'*80}")
-                    print(f"🔄 ATTEMPT {attempt}/{max_attempts} - RESTARTING WITH FRESH CONTEXT")
+                    print(f" ATTEMPT {attempt}/{max_attempts} - RESTARTING WITH FRESH CONTEXT")
                     print(f"{'#'*80}")
                     print(f"[RESTART] Previous attempt achieved {best_across_all_attempts.score if best_across_all_attempts else 0} tests")
                     print(f"[RESTART] Starting over with clean slate to escape local minima...")
@@ -1564,7 +1675,8 @@ class TestDrivenAgent:
                 parallel_gen = ParallelSolutionGenerator(
                     self.code_generator,
                     self.test_manager,
-                    self.file_manager
+                    self.file_manager,
+                    test_case_summary=self.test_case_summary  # Pass test summary
                 )
                 
                 refinement_loop = RefinementLoop(
@@ -1597,7 +1709,7 @@ class TestDrivenAgent:
                     )
                     
                     if not candidates:
-                        print(f"[ROUND {round_num}] ✗ No valid solutions generated")
+                        print(f"[ROUND {round_num}] No valid solutions generated")
                         continue
                     
                     # DEBUG: Check what we got back
@@ -1616,7 +1728,7 @@ class TestDrivenAgent:
                     
                     # Check if already perfect
                     if best_candidate.is_perfect:
-                        print(f"\n[ROUND {round_num}] ✓ Perfect solution found!")
+                        print(f"\n[ROUND {round_num}] Perfect solution found!")
                         self.file_manager.write_files(solution_files)
                         found_perfect = True
                         break
@@ -1636,7 +1748,7 @@ class TestDrivenAgent:
                         success = refinement_loop.run(problem, candidate.solution_files, start_time, candidate.test_results)
                         
                         if success:
-                            print(f"\n[ROUND {round_num}] ✓ Refinement achieved perfect solution on candidate {idx}!")
+                            print(f"\n[ROUND {round_num}] Refinement achieved perfect solution on candidate {idx}!")
                             solution_files = candidate.solution_files
                             found_perfect = True
                             break
@@ -1866,16 +1978,17 @@ def cleanup_temp_dir_with_retry(temp_dir: str, max_attempts: int = 3):
 class ParallelSolutionGenerator:
     """Generates and tests multiple solutions in parallel with COT-based architecture diversity."""
     
-    def __init__(self, code_generator, test_manager, file_manager):
+    def __init__(self, code_generator: ICodeGenerator, test_manager: TestManager, file_manager: IFileManager, test_case_summary: str = ""):
         self.code_generator = code_generator
         self.test_manager = test_manager
         self.file_manager = file_manager
-        # No file_lock needed - each thread uses independent directory
+        self.arch_manager = LLMArchitectureGenerator()  # Used for dynamic architecture generation
         self.num_workers = ResourceManager.get_optimal_workers()
-        self.perfect_solution_found = False  # Flag for early termination
+        self.perfect_solution_found = False
         self.termination_lock = Lock()  # Protect the flag
         self.used_architecture_descriptions = []  # Track used architectures
         self.architecture_lock = Lock()  # Protect architecture tracking
+        self.test_case_summary = test_case_summary  # Store test case summary for prompts
         
         # CRITICAL: Store main working directory and test files BEFORE threading
         self.main_work_dir = get_main_work_dir()
@@ -2117,8 +2230,13 @@ class ParallelSolutionGenerator:
         
         try:
             # Step 1: Generate solution code (no I/O yet)
+            # Include test case summary in the problem statement for Round 1
+            enhanced_problem = problem
+            if self.test_case_summary:
+                enhanced_problem = f"{problem}\n\n{'='*80}\nGENERATED TEST CASES SUMMARY:\n{'='*80}\n{self.test_case_summary}\n{'='*80}\n"
+            
             solution_files = self.code_generator.generate_solution(
-                problem, architecture_hint, failure_hints
+                enhanced_problem, architecture_hint, failure_hints
             )
             
             if not solution_files:
@@ -2612,226 +2730,435 @@ def get_code_skeleton() -> str:
     
     return result
 
-def generate_test_files(problem_statement: str, code_skeleton: str) -> str:
-    retry = 0
-    while retry < 10:
-        try:
-            logger.info("Starting test cases generation")
+# def generate_test_files(problem_statement: str, code_skeleton: str) -> str:
+#     retry = 0
+#     while retry < 10:
+#         try:
+#             logger.info("Starting test cases generation")
             
-            testcases = generate_testcases_with_multi_step_reasoning(problem_statement, code_skeleton)
+#             testcases = generate_testcases_with_multi_step_reasoning(problem_statement, code_skeleton)
             
-            if testcases:
-                logger.info("Generated testcases successfully using multi-step reasoning")
-                return testcases
-            else:
-                logger.warning("Multi-step reasoning failed, falling back to single-step approach")
+#             if testcases:
+#                 logger.info("Generated testcases successfully using multi-step reasoning")
+#                 return testcases
+#             else:
+#                 logger.warning("Multi-step reasoning failed, falling back to single-step approach")
                 
-                # Fallback to original single-step approach if multi-step fails
-                messages = [
-                    {
-                        "role": "system",
-                        "content": GENERATE_INITIAL_TESTCASES_PROMPT
-                    },
-                    {
-                        "role": "user",
-                        "content": f"""Problem Statement:\n{problem_statement}\n\nCode skeleton: \n{code_skeleton}\n\nGenerate the ground truth and edge case coveraging testcases."""
-                    }
-                ]
+#                 # Fallback to original single-step approach if multi-step fails
+#                 messages = [
+#                     {
+#                         "role": "system",
+#                         "content": GENERATE_INITIAL_TESTCASES_PROMPT
+#                     },
+#                     {
+#                         "role": "user",
+#                         "content": f"""Problem Statement:\n{problem_statement}\n\nCode skeleton: \n{code_skeleton}\n\nGenerate the ground truth and edge case coveraging testcases."""
+#                     }
+#                 ]
                 
-                response = call_llm(messages, model=CODING_MODEL)
+#                 response = call_llm(messages, model=CODING_MODEL)
                 
-                # Clean up the response
-                testcases = response.strip()
-                if testcases.startswith('```python'):
-                    testcases = testcases[9:]
-                if testcases.startswith('```'):
-                    testcases = testcases[3:]
-                if testcases.endswith('```'):
-                    testcases = testcases[:-3]
-                testcases = testcases.strip()
+#                 # Clean up the response
+#                 testcases = response.strip()
+#                 if testcases.startswith('```python'):
+#                     testcases = testcases[9:]
+#                 if testcases.startswith('```'):
+#                     testcases = testcases[3:]
+#                 if testcases.endswith('```'):
+#                     testcases = testcases[:-3]
+#                 testcases = testcases.strip()
                 
-                logger.info("Generated testcases successfully using fallback approach")
-                return testcases
+#                 logger.info("Generated testcases successfully using fallback approach")
+#                 return testcases
             
-        except Exception as e:
-            logger.error(f"Error generating initial solution: {str(e)}")
-            retry += 1
-            time.sleep(2)
+#         except Exception as e:
+#             logger.error(f"Error generating initial solution: {str(e)}")
+#             retry += 1
+#             time.sleep(2)
     
-    if retry >= 10:
-        logger.error("Failed to generate initial solution")
-        return ""
-    return ""
+#     if retry >= 10:
+#         logger.error("Failed to generate initial solution")
+#         return ""
+#     return ""
 
 
-def generate_testcases_with_multi_step_reasoning(problem_statement: str, code_skeleton: str) -> str:
-    from collections import Counter
-    import re
+# # ============================================================================
+# # Test Case Generation - Helper Functions
+# # ============================================================================
+
+# # Constants for test generation
+# MAX_RETRY_ATTEMPTS = 10
+# NUM_TEST_GENERATIONS = 5
+# TEST_GENERATION_TEMPERATURE = 0.3
+# RETRY_DELAY_SECONDS = 2
+
+# FILE_NAME_REQUIREMENT_MSG = (
+#     "Include file name in the response. example:\n"
+#     "```python\n"
+#     "test_a.py\n"
+#     "contents of test_a.py\n\n"
+#     "test_b.py\n"
+#     "contents of test_b.py\n"
+#     "```"
+# )
+
+
+# def _extract_test_function_names(testcode: str) -> Set[str]:
+#     """Extract function names from test code to create a signature for comparison.
     
-    def extract_function_names(testcode: str) -> set:
-        """Extract function names from test code to create a signature for comparison"""
-        function_names = set()
-        # Look for test function patterns like def test_something, def testSomething, etc.
-        test_function_patterns = [
-            r'def\s+(test_\w+)',  # def test_something
-            r'def\s+(test\w+)',   # def testSomething
-            r'def\s+(\w*test\w*)', # any function containing 'test'
-        ]
+#     Args:
+#         testcode: Test code string to parse
         
-        for pattern in test_function_patterns:
-            matches = re.findall(pattern, testcode, re.IGNORECASE)
-            function_names.update(matches)
-        
-        return function_names
+#     Returns:
+#         Set of test function names found in the code
+#     """
+#     function_names = set()
+#     test_function_patterns = [
+#         r'def\s+(test_\w+)',    # def test_something
+#         r'def\s+(test\w+)',     # def testSomething
+#         r'def\s+(\w*test\w*)',  # any function containing 'test'
+#     ]
     
-    def clean_testcode_response(response: str) -> str:
-        """Helper function to clean AI response from markdown formatting"""
-        testcases = response.strip()
-        if testcases.startswith('```python'):
-            testcases = testcases[9:]
-        if testcases.startswith('```'):
-            testcases = testcases[3:]
-        if testcases.endswith('```'):
-            testcases = testcases[:-3]
-        return testcases.strip()
+#     for pattern in test_function_patterns:
+#         matches = re.findall(pattern, testcode, re.IGNORECASE)
+#         function_names.update(matches)
     
-    def generate_single_testset() -> tuple[str, set]:
-        """Generate a single test set and return (testcode, function_names)"""
-        retry = 0
-        test_generation_messages = [
-            {
-                "role": "system",
-                "content": GENERATE_TESTCASES_WITH_MULTI_STEP_REASONING_PROMPT
-            },
-            {
-                "role": "user",
-                "content": f"Problem Statement:\n{problem_statement}\n\nCode skeleton: \n{code_skeleton}\n\nGenerate the complete and correct testcases in python files.\n\nSTRICT REQUIREMENT: You **MUST** output the **file name** along with file content.\nexample:\n```python\ntest_a.py\ncontents of test_a.py\n\ntest_b.py\ncontents of test_b.py\n```"
-            }
-        ]
-        
-        while retry < 10:
-            try:
-                testcode_response = call_llm(test_generation_messages, model=CODING_MODEL)
-                logger.info("Step 1 - Testcase Generation completed")
-                
-                testcases_check_messages = [
-                    {
-                        "role": "system",
-                        "content": TESTCASES_CHECK_PROMPT
-                    },
-                    {
-                        "role": "user",
-                        "content": f"Problem statement: {problem_statement}\n\nCode skeleton: \n{code_skeleton}\n\nGenerated Test Code:\n{testcode_response}\n\nAnalyze this code for invalid testcases. Return ONLY the final Python test code."
-                    }   
-                ]
-                
-                testcode_checked_response = call_llm(testcases_check_messages, model=CODING_MODEL)
-                logger.info("Step 2 - Testcase check completed")
+#     return function_names
 
-                testcases = clean_testcode_response(testcode_checked_response)
-                
-                lines = testcases.split("\n")
-                if lines[0].endswith(".py") == False:
-                    retry += 1
-                    test_generation_messages.append({"role": "assistant", "content": testcode_checked_response})
-                    test_generation_messages.append({"role": "user", "content": f"Include file name in the response. example:\n```python\ntest_a.py\ncontents of test_a.py\n\ntest_b.py\ncontents of test_b.py\n```"})
-                    print(f"Retrying because the first line is not a python test file name:\n {testcases}")
-                    continue
 
-                # Extract function names for comparison
-                function_names = extract_function_names(testcases)
-                logger.info(f"Generated testset with functions: {function_names}")
-                return testcases, function_names
-                
-            except Exception as e:
-                retry += 1
-                print(f"Exception in generate_single_testset: {e}")
-                time.sleep(2)
+# def _clean_markdown_code_block(response: str) -> str:
+#     """Remove markdown code block formatting from LLM response.
+    
+#     Args:
+#         response: Raw LLM response potentially wrapped in markdown
         
-        return "", set()
+#     Returns:
+#         Cleaned code string without markdown markers
+#     """
+#     cleaned = response.strip()
+#     if cleaned.startswith('```python'):
+#         cleaned = cleaned[9:]
+#     elif cleaned.startswith('```'):
+#         cleaned = cleaned[3:]
+#     if cleaned.endswith('```'):
+#         cleaned = cleaned[:-3]
+#     return cleaned.strip()
 
-    testcode, function_names = generate_single_testset()
-    return testcode
+
+# def _create_test_generation_messages(problem_statement: str, code_skeleton: str) -> List[Dict[str, str]]:
+#     """Create initial messages for test case generation.
     
-    # # Generate multiple test sets (8+ times)
-    # NUM_GENERATIONS = 15
-    # test_sets = []
-    # function_signatures = []
-    
-    # logger.info(f"Generating {NUM_GENERATIONS} test sets to find the most common pattern...")
-    
-    # for i in range(NUM_GENERATIONS):
-    #     logger.info(f"Generating test set {i+1}/{NUM_GENERATIONS}")
-    #     testcode, function_names = generate_single_testset()
+#     Args:
+#         problem_statement: The problem description
+#         code_skeleton: Code skeleton/template
         
-    #     if testcode and function_names:  # Only add valid test sets
-    #         test_sets.append(testcode)
-    #         function_signatures.append(tuple(sorted(function_names)))  # Use tuple for hashing
-    #     else:
-    #         logger.warning(f"Failed to generate valid test set {i+1}")
-    
-    # if not test_sets:
-    #     logger.error("Failed to generate any valid test sets")
-    #     return ""
-    
-    # signature_counts = Counter(function_signatures)
-    # most_common_signature = signature_counts.most_common(1)[0][0]
-    # most_common_count = signature_counts.most_common(1)[0][1]
-    
-    # logger.info(f"Most common function signature: {most_common_signature} (appeared {most_common_count}/{len(test_sets)} times)")
-    
-    # # Find the first test set that matches the most common signature
-    # for i, signature in enumerate(function_signatures):
-    #     if signature == most_common_signature:
-    #         logger.info(f"Selected test set {i+1} as it matches the most common pattern")
-    #         return test_sets[i]
-    
-    # # Fallback: return the first valid test set
-    # logger.warning("No matching signature found, returning first test set")
-    # return test_sets[0]
+#     Returns:
+#         List of message dictionaries for LLM
+#     """
+#     return [
+#         {
+#             "role": "system",
+#             "content": GENERATE_TESTCASES_WITH_MULTI_STEP_REASONING_PROMPT
+#         },
+#         {
+#             "role": "user",
+#             "content": (
+#                 f"Problem Statement:\n{problem_statement}\n\n"
+#                 f"Code skeleton: \n{code_skeleton}\n\n"
+#                 f"Generate the complete and correct testcases in python files.\n\n"
+#                 f"STRICT REQUIREMENT: You **MUST** output the **file name** along with file content.\n"
+#                 f"{FILE_NAME_REQUIREMENT_MSG}"
+#             )
+#         }
+#     ]
 
-def extract_and_write_files(initial_solution: str, base_dir: str = ".") -> list:
-    import os
+
+# def _create_test_check_messages(problem_statement: str, code_skeleton: str, testcode: str) -> List[Dict[str, str]]:
+#     """Create messages for test case validation.
     
-    created_files = []
-    
-    if not initial_solution.strip():
-        print("No solution content to process")
-        return created_files
-    
-    lines = initial_solution.split('\n')
-    current_filename = None
-    current_content = []
-    
-    for line in lines:
-        # Check if this line is just a Python filename (*.py pattern)
-        stripped_line = line.strip()
+#     Args:
+#         problem_statement: The problem description
+#         code_skeleton: Code skeleton/template
+#         testcode: Generated test code to validate
         
-        # Pattern: ends with .py and looks like a filename (no spaces, reasonable length)
-        if (stripped_line.endswith('.py') and 
-            ' ' not in stripped_line and 
-            len(stripped_line) > 3 and 
-            '/' not in stripped_line.replace('/', '') and  # Allow subdirectories
-            not stripped_line.startswith('#')):
-            if current_filename and current_content:
-                file_path = os.path.join(base_dir, current_filename)
-                os.makedirs(os.path.dirname(file_path), exist_ok=True)
-                content = '\n'.join(current_content).strip()
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(content)
-                created_files.append(file_path)
-            current_filename = stripped_line
-            current_content = []
-        else:
+#     Returns:
+#         List of message dictionaries for LLM
+#     """
+#     return [
+#         {
+#             "role": "system",
+#             "content": TESTCASES_CHECK_PROMPT
+#         },
+#         {
+#             "role": "user",
+#             "content": (
+#                 f"Problem statement: {problem_statement}\n\n"
+#                 f"Code skeleton: \n{code_skeleton}\n\n"
+#                 f"Generated Test Code:\n{testcode}\n\n"
+#                 f"Analyze this code for invalid testcases. Return ONLY the final Python test code."
+#             )
+#         }
+#     ]
 
-            if current_filename:  # Only collect content if we have a filename
-                current_content.append(line)
-    if current_filename and current_content:
-        file_path = os.path.join(base_dir, current_filename)
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        content = '\n'.join(current_content).strip()
-        with open(file_path, 'w', encoding='utf-8') as f:
-            f.write(content)
-        created_files.append(file_path)
-        print(f"Created file: {file_path}")
-    return created_files
+
+# def _validate_test_file_format(testcases: str) -> bool:
+#     """Check if the test code starts with a valid Python file name.
+    
+#     Args:
+#         testcases: The test code string to validate
+        
+#     Returns:
+#         True if format is valid, False otherwise
+#     """
+#     lines = testcases.split("\n")
+#     return len(lines) > 0 and lines[0].endswith(".py")
+
+
+# def _generate_single_testset(problem_statement: str, code_skeleton: str) -> Tuple[str, Set[str]]:
+#     """Generate a single test set with retry logic.
+    
+#     Args:
+#         problem_statement: The problem description
+#         code_skeleton: Code skeleton/template
+        
+#     Returns:
+#         Tuple of (testcode, function_names)
+#     """
+#     messages = _create_test_generation_messages(problem_statement, code_skeleton)
+    
+#     for attempt in range(MAX_RETRY_ATTEMPTS):
+#         try:
+#             # Step 1: Generate test cases
+#             testcode_response = call_llm(
+#                 messages, 
+#                 model=CODING_MODEL, 
+#                 temperature=TEST_GENERATION_TEMPERATURE
+#             )
+#             logger.info("Step 1 - Testcase Generation completed")
+            
+#             # Step 2: Validate and refine test cases
+#             check_messages = _create_test_check_messages(
+#                 problem_statement, 
+#                 code_skeleton, 
+#                 testcode_response
+#             )
+#             testcode_checked = call_llm(check_messages, model=CODING_MODEL)
+#             logger.info("Step 2 - Testcase check completed")
+            
+#             # Step 3: Clean and validate format
+#             testcases = _clean_markdown_code_block(testcode_checked)
+            
+#             if not _validate_test_file_format(testcases):
+#                 logger.warning(f"Attempt {attempt + 1}: Invalid file format, retrying...")
+#                 messages.append({"role": "assistant", "content": testcode_checked})
+#                 messages.append({"role": "user", "content": FILE_NAME_REQUIREMENT_MSG})
+#                 continue
+            
+#             # Step 4: Extract test signatures
+#             function_names = _extract_test_function_names(testcases)
+#             logger.info(f"Generated testset with functions: {function_names}")
+#             return testcases, function_names
+            
+#         except Exception as e:
+#             logger.error(f"Attempt {attempt + 1} failed: {e}")
+#             if attempt < MAX_RETRY_ATTEMPTS - 1:
+#                 time.sleep(RETRY_DELAY_SECONDS)
+    
+#     logger.error(f"Failed to generate valid test set after {MAX_RETRY_ATTEMPTS} attempts")
+#     return "", set()
+
+
+# def _select_most_common_testset(test_sets: List[str], function_signatures: List[Tuple[str, ...]]) -> str:
+#     """Select the test set that matches the most common function signature pattern.
+    
+#     Args:
+#         test_sets: List of generated test code strings
+#         function_signatures: List of function signature tuples
+        
+#     Returns:
+#         The selected test code string
+#     """
+#     signature_counts = Counter(function_signatures)
+#     most_common_signature, most_common_count = signature_counts.most_common(1)[0]
+    
+#     logger.info(
+#         f"Most common function signature: {most_common_signature} "
+#         f"(appeared {most_common_count}/{len(test_sets)} times)"
+#     )
+    
+#     # Find first test set matching the most common signature
+#     for i, signature in enumerate(function_signatures):
+#         if signature == most_common_signature:
+#             logger.info(f"Selected test set {i + 1} as it matches the most common pattern")
+#             return test_sets[i]
+    
+#     # Fallback: return first valid test set
+#     logger.warning("No matching signature found, returning first test set")
+#     return test_sets[0]
+
+
+# def generate_testcases_with_multi_step_reasoning(
+#     problem_statement: str, 
+#     code_skeleton: str
+# ) -> str:
+#     """Generate test cases using multi-step reasoning with consensus validation.
+    
+#     This function generates multiple test sets and selects the most consistent one
+#     based on function signature patterns to ensure quality and reliability.
+    
+#     Args:
+#         problem_statement: Description of the problem to solve
+#         code_skeleton: Template or skeleton code for the solution
+        
+#     Returns:
+#         Selected test code string, or empty string if generation fails
+#     """
+#     logger.info(
+#         f"Generating {NUM_TEST_GENERATIONS} test sets to find the most common pattern..."
+#     )
+    
+#     test_sets = []
+#     function_signatures = []
+    
+#     # Generate multiple test sets
+#     for i in range(NUM_TEST_GENERATIONS):
+#         logger.info(f"Generating test set {i + 1}/{NUM_TEST_GENERATIONS}")
+#         testcode, function_names = _generate_single_testset(problem_statement, code_skeleton)
+        
+#         if testcode and function_names:
+#             test_sets.append(testcode)
+#             function_signatures.append(tuple(sorted(function_names)))
+#         else:
+#             logger.warning(f"Failed to generate valid test set {i + 1}")
+    
+#     # Validate we have at least one valid test set
+#     if not test_sets:
+#         logger.error("Failed to generate any valid test sets")
+#         return ""
+    
+#     # Select the most consistent test set
+#     return _select_most_common_testset(test_sets, function_signatures)
+
+# def summarize_test_cases(test_files_content: str) -> str:
+#     """Create a concise summary of generated test cases for inclusion in prompts.
+    
+#     Extracts:
+#     - File header/comments (first 10 lines or until first import)
+#     - All test function signatures and their docstrings
+#     - Sample assertions from each test (first 2 assertions)
+#     """
+#     if not test_files_content.strip():
+#         return ""
+    
+#     summary_parts = []
+#     lines = test_files_content.split('\n')
+#     current_file = None
+    
+#     for i, line in enumerate(lines):
+#         stripped = line.strip()
+        
+#         # Detect file names
+#         if stripped.endswith('.py') and ' ' not in stripped and len(stripped) > 3:
+#             current_file = stripped
+#             summary_parts.append(f"\n=== {current_file} ===")
+            
+#             # Extract header comments (next 10 lines or until import)
+#             header_lines = []
+#             for j in range(i+1, min(i+11, len(lines))):
+#                 next_line = lines[j].strip()
+#                 if next_line.startswith('#') or next_line.startswith('"""') or next_line.startswith("'''"):
+#                     header_lines.append(lines[j])
+#                 elif next_line.startswith('import') or next_line.startswith('from'):
+#                     break
+            
+#             if header_lines:
+#                 summary_parts.append('\n'.join(header_lines[:5]))  # Max 5 header lines
+    
+#     # Extract test function signatures and sample assertions
+#     in_test_function = False
+#     test_name = None
+#     test_docstring = None
+#     assertion_count = 0
+#     max_assertions_per_test = 2
+    
+#     for line in lines:
+#         stripped = line.strip()
+        
+#         # Detect test function
+#         if stripped.startswith('def test_'):
+#             # Save previous test if any
+#             if test_name:
+#                 summary_parts.append('')  # Blank line between tests
+            
+#             in_test_function = True
+#             test_name = stripped
+#             assertion_count = 0
+#             summary_parts.append(f"\n    {test_name}")
+#             continue
+        
+#         if in_test_function:
+#             # Capture docstring
+#             if ('"""' in stripped or "'''" in stripped) and test_docstring is None:
+#                 test_docstring = stripped
+#                 summary_parts.append(f"        {test_docstring}")
+#                 continue
+            
+#             # Capture assertions (limit to first 2 per test)
+#             if assertion_count < max_assertions_per_test:
+#                 if 'assert' in stripped.lower() or 'self.assert' in line:
+#                     summary_parts.append(f"        {stripped}")
+#                     assertion_count += 1
+            
+#             # End of test function (next function or class)
+#             if stripped.startswith('def ') and not stripped.startswith('def test_'):
+#                 in_test_function = False
+#             elif stripped.startswith('class '):
+#                 in_test_function = False
+    
+#     return '\n'.join(summary_parts)
+
+# def extract_and_write_files(initial_solution: str, base_dir: str = ".") -> list:
+#     import os
+    
+#     created_files = []
+    
+#     if not initial_solution.strip():
+#         print("No solution content to process")
+#         return created_files
+    
+#     lines = initial_solution.split('\n')
+#     current_filename = None
+#     current_content = []
+    
+#     for line in lines:
+#         # Check if this line is just a Python filename (*.py pattern)
+#         stripped_line = line.strip()
+        
+#         # Pattern: ends with .py and looks like a filename (no spaces, reasonable length)
+#         if (stripped_line.endswith('.py') and 
+#             ' ' not in stripped_line and 
+#             len(stripped_line) > 3 and 
+#             '/' not in stripped_line.replace('/', '') and  # Allow subdirectories
+#             not stripped_line.startswith('#')):
+#             if current_filename and current_content:
+#                 file_path = os.path.join(base_dir, current_filename)
+#                 os.makedirs(os.path.dirname(file_path), exist_ok=True)
+#                 content = '\n'.join(current_content).strip()
+#                 with open(file_path, 'w', encoding='utf-8') as f:
+#                     f.write(content)
+#                 created_files.append(file_path)
+#             current_filename = stripped_line
+#             current_content = []
+#         else:
+
+#             if current_filename:  # Only collect content if we have a filename
+#                 current_content.append(line)
+#     if current_filename and current_content:
+#         file_path = os.path.join(base_dir, current_filename)
+#         os.makedirs(os.path.dirname(file_path), exist_ok=True)
+#         content = '\n'.join(current_content).strip()
+#         with open(file_path, 'w', encoding='utf-8') as f:
+#             f.write(content)
+#         created_files.append(file_path)
+#         print(f"Created file: {file_path}")
+#     return created_files
