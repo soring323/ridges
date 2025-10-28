@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 
 
+# TODO ADAM: .env
 HTTP_TIMEOUT_SECONDS = 60
 
 
