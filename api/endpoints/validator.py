@@ -293,6 +293,8 @@ async def validator_register_as_screener(
 
 # /validator/request-evaluation
 validator_request_evaluation_lock = asyncio.Lock()
+screener_1_request_evaluation_lock = asyncio.Lock()
+screener_2_request_evaluation_lock = asyncio.Lock()
 
 @router.post("/request-evaluation")
 @handle_validator_http_exceptions
@@ -308,7 +310,18 @@ async def validator_request_evaluation(
             detail=f"This validator is already running an evaluation, and validators may only run one evaluation at a time."
         )
 
-    async with DebugLock(validator_request_evaluation_lock, f"{validator.name} ({validator.hotkey}) for validator_request_evaluation_lock"):
+    # Choose the appropriate lock based on the validator's hotkey
+    if validator.hotkey.startswith("screener-1"):
+        lock = screener_1_request_evaluation_lock
+        lock_name = "screener_1_request_evaluation_lock"
+    elif validator.hotkey.startswith("screener-2"):
+        lock = screener_2_request_evaluation_lock
+        lock_name = "screener_2_request_evaluation_lock"
+    else:
+        lock = validator_request_evaluation_lock
+        lock_name = "validator_request_evaluation_lock"
+
+    async with DebugLock(lock, f"{validator.name} ({validator.hotkey}) for {lock_name}"):
         # Find the next agent awaiting an evaluation from this validator
         agent_id = await get_next_agent_id_awaiting_evaluation_for_validator_hotkey(validator.hotkey)
         if agent_id is None:
