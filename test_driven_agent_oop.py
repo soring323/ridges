@@ -7,12 +7,6 @@ SOLID Principles:
 - Liskov Substitution: Interfaces can be swapped
 - Interface Segregation: Focused interfaces
 - Dependency Inversion: Depend on abstractions
-
-Sandbox Compatibility:
-- Uses SANDBOX_PROXY_URL for LLM API calls
-- Uses os.getloadavg() instead of psutil for resource management
-- Configured with RUN_ID for tracking in sandbox environment
-- Includes proper logging setup for sandbox monitoring
 """
 
 import time
@@ -31,6 +25,7 @@ from threading import Lock
 import multiprocessing
 import logging
 import sys
+import textwrap
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -38,6 +33,25 @@ logger.setLevel(logging.DEBUG)
 for h in list(logger.handlers):
     logger.removeHandler(h)
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+# ============================================================================
+# Thread-Safety Infrastructure
+# ============================================================================
+
+# Module-level locks for shared state
+_git_init_lock = Lock()  # Protect git initialization
+_main_work_dir = None    # Store main working directory (set once at startup)
+
+def set_main_work_dir(path: str):
+    """Set main working directory once at agent startup (before threading)."""
+    global _main_work_dir
+    if _main_work_dir is None:
+        _main_work_dir = os.path.abspath(path)
+        logger.info(f"[INIT] Main work dir set to: {_main_work_dir}")
+
+def get_main_work_dir() -> str:
+    """Get the main working directory (thread-safe read)."""
+    return _main_work_dir or os.getcwd()
 
 stream_handler = logging.StreamHandler(sys.stdout)
 stream_handler.setLevel(logging.DEBUG)
@@ -59,6 +73,87 @@ CODING_MODEL = "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"
 FAST_MODEL = "deepseek-ai/DeepSeek-V3-0324"
 
 MAX_ITERATIONS = 30
+
+
+GENERATE_INITIAL_TESTCASES_PROMPT = textwrap.dedent("""
+You are an expert Python testcase developer. Your task is to generate a complete testcases for the given problem statement.
+
+Important things:
+1. Test functions declared in code skeleton, don't customized those prototypes.
+2. Read the problem statement carefully and deeply and generate testcases that exactly match the rules, mathmatical fomulas, algorithms, data, and workflow in it.
+3. Do not generate testcases that are not mentioned in problem statement
+4. Minimize all testcases as you have context and generation limit
+
+Strict Requirements:
+1. Output the full content of Python test files along with their file names. You **MUST** output the **file name** along with file content.
+2. Do not include explanations, comments, or markdown formatting.
+3. Use only standard Python (no external libraries).
+
+Response Examples:
+```python
+test_a.py
+contents of test_a.py
+
+test_b.py
+contents of test_b.py
+```
+"""
+)
+
+GENERATE_TESTCASES_WITH_MULTI_STEP_REASONING_PROMPT = textwrap.dedent(
+"""
+You are an expert Python unittest testcase developer. 
+    Important points:-
+    - you have generation limit of 2048 tokens. Hence you must stop generating more test cases when you are near the limit.
+    - If you get syntax error, check if last assistant response was truncated. If yes, then skip last couple of test cases to fit in.
+    
+    You must respond directly with the test cases in the following format. 
+    =========TEST_CASES
+    <<test cases>>
+    Do not include anything else. For Example:
+    =========TEST_CASES
+    # These tests are auto-generated with test data from:
+    # https://github.com/.../xxxxxxxxx-xxxx.json
+    # File last updated on YYYY-MM-DD
+    import unittest
+    from main_module import (
+        main_func
+    )
+
+    class TestFuncA(unittest.TestCase):
+        def test_main_func(self):
+            self.assertEqual(main_func(), "expected_output")
+
+    if __name__ == "__main__":
+        unittest.main()
+"""
+)
+
+
+TESTCASES_CHECK_PROMPT = textwrap.dedent(
+"""
+You are an expert testcases reviewer specializing in invalid testcases detection and prevention. Your task is to analyze the generated test code if it's all valid for the problem statement.
+
+Important:
+1. Check for incorrect/invalid intput/output pair based on the problem statement and fix them or remove if it's impossible to fix
+2. Check if testcases are not covering critical edgecases for the problem statement and add missing testcases
+3. Minimize all testcases as you have context and generation limit
+
+If no invalid testcases are detected and covered all critical edge cases:
+- Return the original code unchanged
+
+STRICT REQUIREMENT: Return the final Python test code along with their file names. Do not include any explanations, comments, or additional text.
+
+example:
+```python
+test_a.py
+contents of test_a.py
+
+test_b.py
+contents of test_b.py
+```
+"""
+)
 
 # ============================================================================
 # Resource Management & Parallel Execution
@@ -178,8 +273,8 @@ class ICodeGenerator(ABC):
     """Interface for code generation."""
     
     @abstractmethod
-    def generate_solution(self, problem: str, architecture_hint: Optional[str] = None) -> Dict[str, str]:
-        """Generate initial solution with optional architecture hint for diversity."""
+    def generate_solution(self, problem: str, architecture_hint: Optional[str] = None, failure_hints: Optional[str] = None) -> Dict[str, str]:
+        """Generate initial solution with optional architecture hint for diversity and failure hints from previous attempts."""
         pass
     
     @abstractmethod
@@ -376,13 +471,22 @@ def write_files_helper(files: Dict[str, str]) -> List[str]:
             print(f"[FILES] Error writing {filename}: {e}")
     return created
 
-def run_tests_helper(test_file: Optional[str] = None, timeout: int = 30) -> Tuple[bool, str]:
-    """Run tests and return (success, output)."""
+def run_tests_helper(test_file: Optional[str] = None, timeout: int = 30, work_dir: Optional[str] = None) -> Tuple[bool, str]:
+    """Run tests and return (success, output).
+    
+    Args:
+        test_file: Specific test file to run
+        timeout: Test timeout in seconds
+        work_dir: Working directory for tests (explicit, not cwd!)
+    """
     try:
+        if work_dir is None:
+            work_dir = os.getcwd()
+        
         test_files_found = []
-        for f in Path('.').glob('*.py'):
+        for f in Path(work_dir).glob('*.py'):
             if f.name.startswith('test_') or f.name == 'tests.py':
-                test_files_found.append(str(f))
+                test_files_found.append(str(f.name))  # Use relative name
         
         if not test_files_found and not test_file:
             return False, "[TEST ERROR] No test files found"
@@ -395,7 +499,13 @@ def run_tests_helper(test_file: Optional[str] = None, timeout: int = 30) -> Tupl
             else:
                 cmd = ["python", "-m", "pytest", "-v", "--tb=short"]
         
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=os.getcwd())
+        result = subprocess.run(
+            cmd, 
+            capture_output=True, 
+            text=True, 
+            timeout=timeout, 
+            cwd=work_dir  # EXPLICIT CWD!
+        )
         output = result.stdout + "\n" + result.stderr
         success = result.returncode == 0
         
@@ -475,61 +585,79 @@ def parse_test_results_helper(output: str) -> Dict[str, Any]:
     
     return results
 
-def get_git_diff_helper() -> str:
-    """Generate git diff patch that can always be applied."""
-    try:
-        # Stage all Python files
-        subprocess.run("git add *.py", shell=True, capture_output=True, cwd=".")
+def ensure_git_initialized():
+    """Initialize git repository if not already initialized (THREAD-SAFE)."""
+    with _git_init_lock:  # Serialize all git initialization
+        work_dir = get_main_work_dir()  # Use stored directory, never getcwd()!
         
-        # Generate diff from the initial commit (skeleton) to current STAGED state
-        # Use --cached to show staged changes (after git add)
-        result = subprocess.run(
-            ["git", "diff", "--cached", "HEAD", "--relative", "--binary"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            cwd="."
-        )
+        logger.info(f"[GIT] Checking git initialization in {work_dir}")
         
-        patch = result.stdout
+        git_dir = os.path.join(work_dir, ".git")
         
-        # If no diff (files unchanged), generate a patch from scratch
-        if not patch:
-            # Get all Python files and create a patch manually
-            py_files = list(Path('.').glob('*.py'))
-            if py_files:
-                # Create a unified diff format patch
-                patch_lines = []
-                for py_file in py_files:
-                    with open(py_file, 'r') as f:
-                        content = f.read()
-                    
-                    # Create a patch that adds the entire file
-                    lines = content.split('\n')
-                    patch_lines.append(f"diff --git a/{py_file.name} b/{py_file.name}")
-                    patch_lines.append(f"new file mode 100644")
-                    patch_lines.append(f"index 0000000..{hash(content) % 10000000:07x}")
-                    patch_lines.append(f"--- /dev/null")
-                    patch_lines.append(f"+++ b/{py_file.name}")
-                    patch_lines.append(f"@@ -0,0 +1,{len(lines)} @@")
-                    for line in lines:
-                        patch_lines.append(f"+{line.rstrip()}")
-                    patch_lines.append("")
-                
-                patch = '\n'.join(patch_lines)
+        # Check if already initialized
+        if os.path.exists(git_dir):
+            logger.info("[GIT] Repository already initialized")
+            # Ensure safe directory (idempotent)
+            subprocess.run(
+                ["git", "config", "--global", "--add", "safe.directory", work_dir],
+                check=False  # Don't fail if already exists
+            )
+            return
         
-        # Strip trailing whitespace from each line to avoid git warnings
-        if patch:
-            lines = patch.split('\n')
-            cleaned_lines = [line.rstrip() for line in lines]
-            patch = '\n'.join(cleaned_lines)
+        # Initialize new repository
+        logger.info("[GIT] Initializing new repository")
         
-        return patch
-    except Exception as e:
-        print(f"[GIT] Error getting diff: {e}")
-        import traceback
-        traceback.print_exc()
-        return ""
+        try:
+            # Use explicit cwd parameter instead of chdir
+            subprocess.run(
+                ["git", "init"],
+                cwd=work_dir,
+                check=True,
+                capture_output=True
+            )
+            
+            subprocess.run(
+                ["git", "config", "--global", "--add", "safe.directory", work_dir],
+                check=True
+            )
+            
+            # Set local git config
+            subprocess.run(
+                ["git", "config", "user.email", "agent@sandbox.local"],
+                cwd=work_dir,
+                check=True
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "sandbox_agent"],
+                cwd=work_dir,
+                check=True
+            )
+            
+            # Add and commit all files
+            subprocess.run(
+                ["git", "add", "."],
+                cwd=work_dir,
+                check=True
+            )
+            
+            result = subprocess.run(
+                ["git", "commit", "-m", "Initial commit"],
+                cwd=work_dir,
+                check=False,
+                capture_output=True,
+                text=True
+            )
+            
+            if result.returncode == 0:
+                logger.info("[GIT] Initial commit created")
+            else:
+                logger.info(f"[GIT] Commit result: {result.stderr.strip()}")
+            
+            logger.info("[GIT] Initialization completed")
+            
+        except Exception as e:
+            logger.error(f"[GIT] ERROR: Could not initialize git repository: {e}")
+
 
 # ============================================================================
 # Concrete Implementations
@@ -557,11 +685,8 @@ class PytestRunner(ITestRunner):
 class LLMCodeGenerator(ICodeGenerator):
     """Concrete implementation using LLM API."""
     
-    def __init__(self, api_url: str):
-        self.api_url = api_url
-    
-    def generate_solution(self, problem: str, architecture_hint: Optional[str] = None) -> Dict[str, str]:
-        """Generate solution using LLM with optional architecture hint for diversity."""
+    def generate_solution(self, problem: str, architecture_hint: Optional[str] = None, failure_hints: Optional[str] = None) -> Dict[str, str]:
+        """Generate solution using LLM with optional architecture hint for diversity and failure hints from previous attempts."""
         # Truncate problem statement to avoid context overflow
         problem = truncate_text(problem, max_chars=5000)
         
@@ -594,12 +719,18 @@ class LLMCodeGenerator(ICodeGenerator):
         if architecture_hint:
             architecture_guidance = f"\n\n🎯 REQUIRED ARCHITECTURE APPROACH:\n{architecture_hint}\n\nYou MUST follow this architectural approach in your solution.\n"
         
+        # Add failure hints if provided (critical for learning from previous attempts)
+        failure_guidance = ""
+        if failure_hints:
+            failure_guidance = f"\n{failure_hints}\n"
+        
         prompt = f"""You are an expert Python developer. Use step-by-step reasoning to solve this problem.
 
                     Problem Statement:
                     {problem}
                     {test_examples}
                     {architecture_guidance}
+                    {failure_guidance}
                     
                     STEP 1 - ANALYZE THE PROBLEM:
                     - What is the core problem asking for?
@@ -653,8 +784,13 @@ class LLMCodeGenerator(ICodeGenerator):
         """Generate tests using LLM with multi-step validation."""
         solution_summary = "\n\n".join([f"{name}:\n{content[:500]}..." for name, content in solution.items()])
         
+        # Extract actual solution filenames for explicit import instructions
+        solution_files_list = list(solution.keys())
+        main_file = solution_files_list[0] if solution_files_list else "main.py"
+        main_module = main_file.replace('.py', '') if main_file.endswith('.py') else main_file
+        
         # Step 1: Generate initial tests
-        prompt = f"""You are an expert test developer. Generate comprehensive tests for this solution.
+        prompt = f"""You are an expert unittest testcase developer. Generate comprehensive tests for this solution.
 
                     Problem Statement:
                     {problem}
@@ -668,28 +804,39 @@ class LLMCodeGenerator(ICodeGenerator):
                     3. Do not generate testcases that are not mentioned in problem statement
                     4. Minimize all testcases as you have context and generation limit
 
-                    Requirements:
-                    1. Use pytest framework
-                    2. Test all functions and edge cases
-                    3. Include boundary conditions, empty inputs, invalid inputs
-                    4. Output in format: test_filename.py followed by test code
-                    5. **CRITICAL**: Import ONLY from 'main' module
-                       - DO NOT infer module name from the problem statement
-                       - DO NOT use problem-specific module names
-                       - The solution is ALWAYS in main.py
+                    Strict Requirements:
+                    1. Output the full content of Python test files along with their file names. You **MUST** output the **file name** along with file content.
+                    2. Do not include explanations, comments, or markdown formatting.
+                    3. Use only standard Python (no external libraries).
 
-                    Example format:
-                    tests.py
-                    import pytest
-                    from main import function_name  # ← Import from 'main' only!
+                    You must respond directly with the test cases in the following format. 
+                    =========TEST_CASES
+                    <<test cases>>
+                    Do not include anything else. For Example:
+                    =========TEST_CASES
+                    # These tests are auto-generated with test data from:
+                    # https://github.com/xxxx.json
+                    # File last updated on 2023-07-19
+                    import unittest
+                    from {main_module} import (
+                        main_func
+                    )
 
-                    def test_basic():
-                        assert solution() == expected
+                    class TestFuncA(unittest.TestCase):
+                        def test_main_func(self):
+                            self.assertEqual(main_func(), "expected_output")
 
-                    def test_edge_case():
-                        assert solution(edge_input) == expected
+                    if __name__ == "__main__":
+                        unittest.main()
 
-                    Generate comprehensive tests now:"""
+                    Response Examples:
+                    ```python
+                    test_a.py
+                    contents of test_a.py
+
+                    test_b.py
+                    contents of test_b.py
+                    ```"""
         
         try:
             # Step 1: Generate tests
@@ -701,7 +848,7 @@ class LLMCodeGenerator(ICodeGenerator):
             
             # Step 2: Validate and refine tests
             print("[TEST_GEN] Step 2: Validating and refining tests...")
-            validation_prompt = f"""You are an expert test reviewer. Analyze the generated tests for validity.
+            validation_prompt = f"""You are an expert unittest testcase reviewer. Analyze the generated tests for validity.
 
                 Problem Statement:
                 {problem}
@@ -716,19 +863,20 @@ class LLMCodeGenerator(ICodeGenerator):
                 1. Incorrect/invalid input/output pairs based on problem statement - fix or remove them
                 2. Missing critical edge cases - add them
                 3. Minimize testcases (context limit)
+                4. If a file is not testcase file, remove it.
 
                 If tests are valid and complete:
                 - Return the original tests unchanged
 
                 STRICT REQUIREMENT: Return ONLY the final Python test code with file names.
 
-                Example format:
-                test_main.py
+                Example format (using actual solution file "{main_module}"):
+                tests.py
                 import pytest
-                from main import solution
+                from {main_module} import function_name
 
                 def test_basic():
-                    assert solution() == expected
+                    assert function_name() == expected
                 """
             
             validated_response = call_llm(
@@ -745,22 +893,6 @@ class LLMCodeGenerator(ICodeGenerator):
                 files = parse_file_blocks(response)
             else:
                 print("[TEST_GEN] ✓ Tests validated and refined")
-            
-            # Debug: Show what test files were parsed
-            if files:
-                print(f"[TEST_GEN] Parsed test files: {list(files.keys())}")
-                
-                # CRITICAL FIX: Rename any file to 'tests.py' to avoid overwriting solution
-                # The LLM sometimes returns 'main.py' or other names
-                if 'tests.py' not in files:
-                    # Take the first file and rename it to tests.py
-                    first_key = list(files.keys())[0]
-                    test_content = files[first_key]
-                    files = {'tests.py': test_content}
-                    print(f"[TEST_GEN] ⚠️ Renamed '{first_key}' to 'tests.py' to avoid conflicts")
-            else:
-                print("[TEST_GEN] ✗ No test files parsed!")
-                print(f"[TEST_GEN] Response preview: {validated_response[:500]}")
             
             return files if files else {}
         except Exception as e:
@@ -878,9 +1010,6 @@ class LLMCodeGenerator(ICodeGenerator):
 
 class LLMArchitectureGenerator(IArchitectureGenerator):
     """Concrete implementation for generating alternative architectures."""
-    
-    def __init__(self, api_url: str):
-        self.api_url = api_url
     
     def generate_alternative(
         self,
@@ -1379,10 +1508,13 @@ class TestDrivenAgent:
         self.code_generator = code_generator
         self.file_manager = file_manager
         self.config = config or RefinementConfig()
+        self.generated_test_files=[]
     
     def solve_create(self, problem: str, timeout: int) -> str:
         """Solve CREATE mode problem."""
         start_time = time.time()
+
+        code_skeleton = get_code_skeleton()
         
         print("\n" + "="*80)
         print("CREATE MODE - Test-Driven Development")
@@ -1392,20 +1524,19 @@ class TestDrivenAgent:
         
         # Check for existing tests first
         print("\n[STEP 1] Checking for existing test files...")
-        # Pattern must match: tests.py, test_main.py, main_test.py
-        existing_tests = (
-            list(Path('.').glob('test*.py')) +  # Matches tests.py, test_main.py
-            list(Path('.').glob('*_test.py'))   # Matches main_test.py
-        )
+        existing_tests = list(Path('.').glob('*test*.py'))
         
         if not existing_tests:
-            print("[STEP 1] No existing tests found, generating test suite...")
-            test_files = self.code_generator.generate_tests(problem, {})
-            self.file_manager.write_files(test_files)
-            print("[STEP 1] Created test files")
+            logger.info("[STEP 1] No existing tests found, generating test suite...")
+            test_cases = generate_test_files(problem, code_skeleton)
+            logger.info(test_cases)
+            extract_and_write_files(test_cases, ".")
+            # self.file_manager.write_files(test_cases)   
+            # self.generated_test_files.extend(test_cases.keys())
+            logger.info("[STEP 1] Created test files")
         else:
-            print(f"[STEP 1] Found {len(existing_tests)} existing test files")
-            print("[STEP 1] Using existing tests from dataset")
+            logger.info(f"[STEP 1] Found {len(existing_tests)} existing test files")
+            logger.info("[STEP 1] Using existing tests from dataset")
         
         # Step 2: Generate solution(s) with restart mechanism to escape local minima
         if ENABLE_PARALLEL:
@@ -1602,7 +1733,7 @@ class TestDrivenAgent:
         if not solution_files:
             print("[ERROR] No solution files generated - cannot create patch")
             return ""
-        patch = self._generate_patch(solution_files)
+        patch = self.get_final_git_patch()
         print(f"[COMPLETE] Generated patch ({len(patch)} bytes)")
         return patch
     
@@ -1619,75 +1750,114 @@ class TestDrivenAgent:
         relevant_files = self.file_manager.read_files(['*.py'])
         print(f"[STEP 1] Found {len(relevant_files)} relevant files")
         
-        # Detect if this is a SWEBench problem (large repo)
-        is_swebench = len(relevant_files) > 100
+        # Step 2: Generate reproduction test
+        print("\n[STEP 2] Generating reproduction test...")
+        test_file = self.code_generator.generate_tests(problem, relevant_files)
+        if test_file:
+            self.file_manager.write_files(test_file)
+            # self.generated_test_files.extend(test_file.keys())
+            print("[STEP 2] Created reproduction test")
         
-        if is_swebench:
-            print(f"[STEP 2] 🔍 Detected SWEBench problem ({len(relevant_files)} files)")
-            print("[STEP 2] Setting up proper test environment for SWEBench...")
-            
-            # For SWEBench, we need to:
-            # 1. Use the repo's existing test infrastructure
-            # 2. Run tests in a proper venv with dependencies
-            # 3. This is similar to how benchmark does it
-            
-            # The test_manager should already be configured to use the repo's tests
-            # We just need to make sure we're running in the right environment
-            
-            # Try to run initial tests to see baseline
-            print("[STEP 2] Running baseline tests...")
-            initial_results, _ = self.test_manager.run_and_parse()
-            print(f"[STEP 2] Baseline: {initial_results.passed}/{initial_results.total} tests passing")
-            
-            # Step 3: Iterative fixing with proper test feedback
-            print("\n[STEP 3] Iterative fixing with test feedback...")
-            config = RefinementConfig(max_iterations=8, stuck_threshold=3)  # More iterations for SWEBench
-            refinement_loop = RefinementLoop(
-                self.test_manager,
-                self.fix_manager,
-                self.arch_manager,
-                config
-            )
-            
-            # Run refinement with initial test results as feedback
-            refinement_loop.run(problem, relevant_files, start_time, initial_results)
-            
-        else:
-            # Small problem (Polyglot) - original flow
-            print("\n[STEP 2] Checking for existing tests...")
-            import glob
-            existing_tests = glob.glob("test*.py") + glob.glob("*_test.py")
-            if existing_tests:
-                print(f"[STEP 2] Using existing test file: {existing_tests[0]}")
-            else:
-                print("[STEP 2] ⚠️ No test file found - generating reproduction test...")
-                test_file = self.code_generator.generate_tests(problem, relevant_files)
-                if test_file:
-                    self.file_manager.write_files(test_file)
-                    print("[STEP 2] Created reproduction test")
-            
-            # Step 3: Refine
-            print("\n[STEP 3] Iterative fixing...")
-            config = RefinementConfig(max_iterations=5, stuck_threshold=2)
-            refinement_loop = RefinementLoop(
-                self.test_manager,
-                self.fix_manager,
-                self.arch_manager,
-                config
-            )
-            
-            refinement_loop.run(problem, relevant_files, start_time, None)
+        # Step 3: Refine
+        print("\n[STEP 3] Iterative fixing...")
+        config = RefinementConfig(max_alternatives=5)  # Fewer alternatives for FIX
+        refinement_loop = RefinementLoop(
+            self.test_manager,
+            self.fix_manager,
+            self.arch_manager,
+            config
+        )
+        
+        refinement_loop.run(problem, relevant_files, start_time, None)
         
         # Generate patch
         print("\n[COMPLETE] Generating patch...")
-        patch = self._generate_patch(relevant_files)
+        patch = self.get_final_git_patch()
         print(f"[COMPLETE] Generated patch ({len(patch)} bytes)")
         
         return patch
     
-    def _generate_patch(self, files: Dict[str, str]) -> str:
-        """Generate git diff patch using helper function."""
-        return get_git_diff_helper()
+    def get_final_git_patch(self) -> str:
+        """
+        Generate a clean unified diff (staged changes only) that tools like `patch`
+        or `git apply` can consume. THREAD-SAFE: Uses explicit working directory.
+        """
+        try:
+            # Use explicit working directory - never rely on CWD!
+            work_dir = get_main_work_dir()
+            logger.info(f"[PATCH] Generating patch in {work_dir}")
+            
+            # Stage modified/untracked files with desired extensions, excluding agent files.
+            exts = (".py", ".ini", ".cfg", ".toml")
+            exclude = {"src/agent.py", "src/agent_runner.py"}
+            # Exclude any generated test files or files modified via test generation tool
+            try:
+                for _p in getattr(self, "generated_test_files", []):
+                    # store as relative paths similar to git ls-files output
+                    exclude.add(os.path.relpath(_p, work_dir))
+            except Exception:
+                pass
+
+            # Discover modified + untracked files
+            ls = subprocess.run(
+                ["git", "ls-files", "-m", "-o", "--exclude-standard"],
+                cwd=work_dir,  # EXPLICIT!
+                capture_output=True, 
+                text=True, 
+                timeout=30, 
+                check=True
+            ).stdout.splitlines()
+
+            to_add = [f for f in ls if f.endswith(exts) and f not in exclude]
+            if to_add:
+                logger.info(f"[PATCH] Staging {len(to_add)} files")
+                subprocess.run(
+                    ["git", "add", "--"] + to_add, 
+                    cwd=work_dir,  # EXPLICIT!
+                    check=True, 
+                    timeout=30
+                )
+            else:
+                logger.warning("[PATCH] No files to stage! Modified files: %s, Excluded: %s", ls, exclude)
+
+            # Produce a clean, parseable patch (no colors; standard unified diff).
+            diff = subprocess.run(
+                ["git", "diff", "--cached", "--no-color", "--unified=3"],
+                cwd=work_dir,  # EXPLICIT!
+                capture_output=True, 
+                text=True, 
+                timeout=30, 
+                check=True
+            )
+
+            # Log stderr separately so it never pollutes the patch.
+            if diff.stderr:
+                logger.warning("git diff (stderr): %s", diff.stderr.strip())
+
+            patch_text = diff.stdout or ""
+            logger.info(f"[PATCH] Generated {len(patch_text)} byte patch")
+            return patch_text
+        except Exception as e:
+            logger.exception("Error generating git patch")
+            return f"Error generating git patch: {e}"
+
+# ============================================================================
+# Helper Functions for Thread-Safe Operations
+# ============================================================================
+
+def cleanup_temp_dir_with_retry(temp_dir: str, max_attempts: int = 3):
+    """Cleanup temp directory with retry for locked files."""
+    import shutil
+    for attempt in range(max_attempts):
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=(attempt < max_attempts - 1))
+            logger.debug(f"[CLEANUP] Removed {temp_dir}")
+            return
+        except (PermissionError, OSError) as e:
+            if attempt < max_attempts - 1:
+                time.sleep(0.2 * (attempt + 1))  # Exponential backoff
+            else:
+                logger.warning(f"[CLEANUP] Could not remove {temp_dir}: {e}")
 
 # ============================================================================
 # Parallel Solution Generator
@@ -1706,6 +1876,20 @@ class ParallelSolutionGenerator:
         self.termination_lock = Lock()  # Protect the flag
         self.used_architecture_descriptions = []  # Track used architectures
         self.architecture_lock = Lock()  # Protect architecture tracking
+        
+        # CRITICAL: Store main working directory and test files BEFORE threading
+        self.main_work_dir = get_main_work_dir()
+        
+        # Discover test files once
+        import glob
+        self.test_files = []
+        for pattern in ["test*.py", "*_test.py"]:
+            self.test_files.extend(
+                glob.glob(os.path.join(self.main_work_dir, pattern))
+            )
+        
+        logger.info(f"[PARALLEL] Main work dir: {self.main_work_dir}")
+        logger.info(f"[PARALLEL] Found {len(self.test_files)} test files")
     
     def generate_diverse_architectures(self, problem: str, num_architectures: int, best_candidate_info: Optional[Dict] = None) -> List[str]:
         """Use COT to generate N diverse architectural approaches for the problem.
@@ -1916,65 +2100,66 @@ class ParallelSolutionGenerator:
         return breakdown
     
     def generate_and_test_solution(self, problem: str, architecture_hint: Optional[str] = None, failure_hints: Optional[str] = None) -> Optional[SolutionCandidate]:
-        """Generate a single solution and test it in an independent directory (fully parallel). Returns None if terminated early."""
-        # Check if another thread already found a perfect solution
+        """Generate a single solution and test it in an isolated directory.
+        
+        THREAD-SAFE: Each execution uses isolated temp directory.
+        NEVER uses os.chdir() - all operations use explicit paths.
+        """
+        # Check early termination
         with self.termination_lock:
             if self.perfect_solution_found:
-                print(f"[PARALLEL] Skipping '{architecture_hint or 'default'}' - perfect solution already found")
+                logger.info(f"[PARALLEL] Skipping '{architecture_hint or 'default'}' - perfect solution found")
                 return None
         
         start_time = time.time()
+        temp_dir = None
+        arch_name = architecture_hint or "default"
         
         try:
-            # Generate solution
-            solution_files = self.code_generator.generate_solution(problem, architecture_hint)
-            arch_name = architecture_hint or "default"
+            # Step 1: Generate solution code (no I/O yet)
+            solution_files = self.code_generator.generate_solution(
+                problem, architecture_hint, failure_hints
+            )
             
-            # Check again before expensive testing
+            if not solution_files:
+                logger.warning(f"[PARALLEL] No solution files generated for '{arch_name}'")
+                return SolutionCandidate(
+                    solution_files={},
+                    test_results=None,
+                    architecture_name=arch_name,
+                    generation_time=time.time() - start_time
+                )
+            
+            # Check early termination before expensive testing
             with self.termination_lock:
                 if self.perfect_solution_found:
-                    print(f"[PARALLEL] Skipping test for '{arch_name}' - perfect solution already found")
                     return None
             
-            # Create per-task temporary directory for parallel testing
+            # Step 2: Create isolated temp directory (atomic)
             import tempfile
             import shutil
+            temp_dir = tempfile.mkdtemp(prefix=f"sol_{arch_name[:20]}_", dir="/tmp")
+            logger.debug(f"[PARALLEL] Created temp dir: {temp_dir}")
             
-            # Create unique temp directory per task (not per thread!)
-            # Use UUID to ensure uniqueness even if thread is reused by dynamic queue
-            task_id = str(uuid4())[:12]
-            temp_dir = f"/tmp/task_{task_id}"
-            
-            try:
-                os.makedirs(temp_dir, exist_ok=True)
-                
-                # Save current directory
-                original_cwd = os.getcwd()
-                
-                # Copy test files to temp directory (CRITICAL!)
-                import glob
-                test_files = glob.glob(os.path.join(original_cwd, "test*.py")) + glob.glob(os.path.join(original_cwd, "*_test.py"))
-                for test_file in test_files:
-                    shutil.copy2(test_file, temp_dir)
-                
-                # Change to temp directory
-                os.chdir(temp_dir)
-                
-                # Write solution files in temp directory
-                self.file_manager.write_files(solution_files)
-                
-                # Run tests in temp directory
-                test_results, _ = self.test_manager.run_and_parse()
-                
-            finally:
-                # Always restore original directory
-                os.chdir(original_cwd)
-                
-                # Clean up temp directory
+            # Step 3: Copy test files to temp directory
+            for test_file in self.test_files:
                 try:
-                    shutil.rmtree(temp_dir, ignore_errors=True)
-                except Exception:
-                    pass  # Ignore cleanup errors
+                    shutil.copy2(test_file, temp_dir)
+                except Exception as e:
+                    logger.warning(f"[PARALLEL] Could not copy {test_file}: {e}")
+            
+            # Step 4: Write solution files to temp directory (EXPLICIT paths)
+            for filename, content in solution_files.items():
+                filepath = os.path.join(temp_dir, filename)
+                os.makedirs(os.path.dirname(filepath), exist_ok=True)
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    f.write(content)
+            
+            # Step 5: Run tests with EXPLICIT working directory (no chdir!)
+            success, output = run_tests_helper(work_dir=temp_dir, timeout=30)
+            
+            # Step 6: Parse results
+            test_results = self.test_manager.runner.parse_results(output)
             
             generation_time = time.time() - start_time
             
@@ -1985,22 +2170,30 @@ class ParallelSolutionGenerator:
                 generation_time=generation_time
             )
             
-            # If this is a perfect solution, signal other threads to stop
+            # Step 7: Signal early termination if perfect
             if candidate.is_perfect:
                 with self.termination_lock:
                     self.perfect_solution_found = True
-                print(f"[PARALLEL] ⚡ Perfect solution found: '{arch_name}' - signaling early termination")
+                logger.info(f"[PARALLEL] ⚡ Perfect solution: '{arch_name}'")
             
             return candidate
-        
+            
         except Exception as e:
-            print(f"[PARALLEL] Error generating solution: {e}")
+            logger.error(f"[PARALLEL] Error in '{arch_name}': {e}")
+            import traceback
+            logger.debug(f"[PARALLEL] Traceback: {traceback.format_exc()}")
+            
             return SolutionCandidate(
                 solution_files={},
                 test_results=None,
-                architecture_name=architecture_hint or "failed",
+                architecture_name=arch_name,
                 generation_time=time.time() - start_time
             )
+        
+        finally:
+            # Step 8: Cleanup temp directory (with retry)
+            if temp_dir and os.path.exists(temp_dir):
+                cleanup_temp_dir_with_retry(temp_dir, max_attempts=3)
     
     def generate_multiple_solutions(
         self, 
@@ -2017,6 +2210,8 @@ class ParallelSolutionGenerator:
             architecture_hints: Pre-generated architecture hints (optional)
             best_candidate_info: Info about best previous candidate (architecture, test_results, failed_tests, errors)
         """
+        # Reset futures counter for this round
+        self._futures_after_perfect = 0
         
         # CRITICAL: Generate diverse architectures BEFORE threading to guarantee uniqueness
         if not architecture_hints:
@@ -2127,14 +2322,37 @@ class ParallelSolutionGenerator:
                         
                         # Shutdown executor without waiting for running threads
                         print("[PARALLEL] Shutting down executor without waiting for running threads...")
-                        executor.shutdown(wait=False, cancel_futures=True)
+                        try:
+                            executor.shutdown(wait=False, cancel_futures=True)
+                        except TypeError:
+                            # Python < 3.9 doesn't support cancel_futures parameter
+                            executor.shutdown(wait=False)
                         
                         # Break out of the loop
                         break
                     elif self.perfect_solution_found:
                         # Perfect solution found by another thread but not yet in candidates list
-                        # Continue processing to get it
-                        print(f"[DEBUG] Perfect solution flag set but not in candidates yet, continuing to collect...")
+                        # Wait for at most 2 more futures to collect the perfect solution, then force exit
+                        print("[DEBUG] Perfect solution flag set but not in candidates yet, will process at most 2 more futures...")
+                        max_futures_after_perfect = 2
+                        futures_processed_after_perfect = getattr(self, '_futures_after_perfect', 0)
+                        self._futures_after_perfect = futures_processed_after_perfect + 1
+                        
+                        if self._futures_after_perfect > max_futures_after_perfect:
+                            print(f"[PARALLEL] ⚠️ Processed {self._futures_after_perfect} futures after perfect flag set, but perfect candidate not in list")
+                            print("[PARALLEL] Force exiting with best available candidate to prevent hang")
+                            # Sort and return best candidate we have
+                            if candidates:
+                                candidates.sort(key=lambda c: (not c.is_perfect, -c.score))
+                                try:
+                                    executor.shutdown(wait=False, cancel_futures=True)
+                                except TypeError:
+                                    executor.shutdown(wait=False)
+                                break
+                            else:
+                                print("[PARALLEL] ERROR: No candidates available, continuing...")
+                                # Reset counter and continue
+                                self._futures_after_perfect = 0
                     
                     # Dynamic queue: Generate new architecture and submit new task
                     if use_dynamic_queue and not self.perfect_solution_found:
@@ -2265,57 +2483,28 @@ def agent_main(input_data: Dict[str, Any]) -> str:
     timeout = input_data.get('timeout', 1800)
     mode = input_data.get('mode', None)
     
-    print(f"[AGENT] Test-Driven Agent initialized - Mode: {mode or 'AUTO'}")
+    logger.info(f"[AGENT] Test-Driven Agent - Mode: {mode or 'AUTO'}")
     print(f"\n{'='*80}")
     print("TEST-DRIVEN ITERATIVE AGENT")
     print("="*80)
-    print(f"[SETUP] Working directory: {os.getcwd()}")
-    print(f"[SETUP] Problem type: {mode or 'AUTO-DETECT'}")
     
-    # Change to repo directory if it exists (benchmark framework creates workspace/repo/)
-    repo_dir = os.path.join(os.getcwd(), "repo")
-    if os.path.exists(repo_dir) and os.path.isdir(repo_dir):
-        print(f"[SETUP] Changing to repo directory: {repo_dir}")
+    # Step 1: Setup working directory (BEFORE any threading)
+    repo_dir = os.path.abspath("repo")
+    sys.path.insert(0, repo_dir)
+
+    if os.path.exists(repo_dir):
         os.chdir(repo_dir)
     
-    # Initialize git repo and commit skeleton files
-    # This is CRITICAL for generating proper patches
-    try:
-        # Check if git repo exists
-        result = subprocess.run(["git", "rev-parse", "--git-dir"], capture_output=True, cwd=".")
-        if result.returncode != 0:
-            # Initialize git repo
-            print("[SETUP] Initializing git repository...")
-            subprocess.run(["git", "init"], capture_output=True, cwd=".", check=True)
-            subprocess.run(["git", "config", "user.email", "agent@test.com"], capture_output=True, cwd=".")
-            subprocess.run(["git", "config", "user.name", "Test Agent"], capture_output=True, cwd=".")
-            
-            # Commit skeleton files (all Python files in current directory)
-            # Use shell=True for glob expansion
-            add_result = subprocess.run("git add *.py", shell=True, capture_output=True, cwd=".", text=True)
-            if add_result.returncode != 0:
-                print(f"[SETUP] Warning: Git add failed: {add_result.stderr}")
-            
-            commit_result = subprocess.run(["git", "commit", "-m", "Initial skeleton"], capture_output=True, cwd=".", text=True)
-            if commit_result.returncode == 0:
-                print("[SETUP] ✓ Git repository initialized with skeleton files")
-            else:
-                # Check if there were no files to commit
-                if "nothing to commit" in commit_result.stdout or "nothing to commit" in commit_result.stderr:
-                    print("[SETUP] ✓ Git repository initialized (no skeleton files to commit)")
-                else:
-                    print(f"[SETUP] Warning: Git commit failed: {commit_result.stderr}")
-        else:
-            print("[SETUP] Git repository already exists")
-            # Even if git exists, commit any uncommitted skeleton files
-            add_result = subprocess.run("git add *.py", shell=True, capture_output=True, cwd=".", text=True)
-            commit_result = subprocess.run(["git", "commit", "-m", "Commit skeleton files"], capture_output=True, cwd=".", text=True)
-            if commit_result.returncode == 0:
-                print("[SETUP] ✓ Committed skeleton files")
-    except Exception as e:
-        print(f"[SETUP] Warning: Could not initialize git: {e}")
-    
-    # Auto-detect mode if not specified
+    # Step 2: Store main working directory globally (CRITICAL!)
+    set_main_work_dir(os.getcwd())
+    logger.info(f"[AGENT] Main work dir: {get_main_work_dir()}")
+    print(f"[SETUP] Working directory: {get_main_work_dir()}")
+    print(f"[SETUP] Problem type: {mode or 'AUTO-DETECT'}")
+
+    # Step 3: Initialize git (BEFORE any threading)
+    ensure_git_initialized()
+
+    # Step 4: Auto-detect mode if not specified
     if mode is None:
         # Simple heuristic: check for existing Python files
         py_files = list(Path('.').rglob('*.py'))
@@ -2330,13 +2519,13 @@ def agent_main(input_data: Dict[str, Any]) -> str:
         
         mode = "fix" if (has_existing_code and fix_score > create_score) else "create"
     
-    print(f"[AGENT] Test-Driven Agent initialized - Mode: {mode.upper()}")
+    logger.info(f"[AGENT] Mode: {mode.upper()}")
     
     # Create concrete implementations (these would be imported from actual implementations)
     # For now, these are placeholder - you need to implement these based on your existing code
     test_runner = PytestRunner()
-    code_generator = LLMCodeGenerator(api_url="http://localhost:8000/v1/chat/completions")
-    arch_generator = LLMArchitectureGenerator(api_url="http://localhost:8000/v1/chat/completions")
+    code_generator = LLMCodeGenerator()
+    arch_generator = LLMArchitectureGenerator()
     file_manager = LocalFileManager()
     
     # Configure based on mode
@@ -2362,10 +2551,16 @@ def agent_main(input_data: Dict[str, Any]) -> str:
         else:
             patch = agent.solve_fix(problem_statement, timeout)
         
+        # Reset git state with explicit cwd
+        subprocess.run(
+            ["git", "reset", "--hard"],
+            cwd=get_main_work_dir(),  # EXPLICIT!
+            check=False
+        )
         return patch
     
-    except Exception as e:
-        print(f"[ERROR] Agent failed: {e}")
+    except Exception:
+        logger.exception("[AGENT] Agent failed")
         import traceback
         traceback.print_exc()
         return ""
@@ -2399,3 +2594,244 @@ if __name__ == "__main__":
     
     patch = agent_main(input_data)
     print(f"\nGenerated patch:\n{patch}")
+
+def get_code_skeleton() -> str:
+    # Initialize the result string
+    result = ""
+    
+    # Walk through the current directory
+    for root, _, files in os.walk("."):
+        for file in files:
+            # Check if the file is a Python file
+            if file.endswith(".py"):
+                file_path = os.path.join(root, file)
+                with open(file_path, "r") as f:
+                    content = f.read()
+                # Concatenate the file name and content
+                result += f"{file}\n{{\n{content}\n}}\n\n"
+    
+    return result
+
+def generate_test_files(problem_statement: str, code_skeleton: str) -> str:
+    retry = 0
+    while retry < 10:
+        try:
+            logger.info("Starting test cases generation")
+            
+            testcases = generate_testcases_with_multi_step_reasoning(problem_statement, code_skeleton)
+            
+            if testcases:
+                logger.info("Generated testcases successfully using multi-step reasoning")
+                return testcases
+            else:
+                logger.warning("Multi-step reasoning failed, falling back to single-step approach")
+                
+                # Fallback to original single-step approach if multi-step fails
+                messages = [
+                    {
+                        "role": "system",
+                        "content": GENERATE_INITIAL_TESTCASES_PROMPT
+                    },
+                    {
+                        "role": "user",
+                        "content": f"""Problem Statement:\n{problem_statement}\n\nCode skeleton: \n{code_skeleton}\n\nGenerate the ground truth and edge case coveraging testcases."""
+                    }
+                ]
+                
+                response = call_llm(messages, model=CODING_MODEL)
+                
+                # Clean up the response
+                testcases = response.strip()
+                if testcases.startswith('```python'):
+                    testcases = testcases[9:]
+                if testcases.startswith('```'):
+                    testcases = testcases[3:]
+                if testcases.endswith('```'):
+                    testcases = testcases[:-3]
+                testcases = testcases.strip()
+                
+                logger.info("Generated testcases successfully using fallback approach")
+                return testcases
+            
+        except Exception as e:
+            logger.error(f"Error generating initial solution: {str(e)}")
+            retry += 1
+            time.sleep(2)
+    
+    if retry >= 10:
+        logger.error("Failed to generate initial solution")
+        return ""
+    return ""
+
+
+def generate_testcases_with_multi_step_reasoning(problem_statement: str, code_skeleton: str) -> str:
+    from collections import Counter
+    import re
+    
+    def extract_function_names(testcode: str) -> set:
+        """Extract function names from test code to create a signature for comparison"""
+        function_names = set()
+        # Look for test function patterns like def test_something, def testSomething, etc.
+        test_function_patterns = [
+            r'def\s+(test_\w+)',  # def test_something
+            r'def\s+(test\w+)',   # def testSomething
+            r'def\s+(\w*test\w*)', # any function containing 'test'
+        ]
+        
+        for pattern in test_function_patterns:
+            matches = re.findall(pattern, testcode, re.IGNORECASE)
+            function_names.update(matches)
+        
+        return function_names
+    
+    def clean_testcode_response(response: str) -> str:
+        """Helper function to clean AI response from markdown formatting"""
+        testcases = response.strip()
+        if testcases.startswith('```python'):
+            testcases = testcases[9:]
+        if testcases.startswith('```'):
+            testcases = testcases[3:]
+        if testcases.endswith('```'):
+            testcases = testcases[:-3]
+        return testcases.strip()
+    
+    def generate_single_testset() -> tuple[str, set]:
+        """Generate a single test set and return (testcode, function_names)"""
+        retry = 0
+        test_generation_messages = [
+            {
+                "role": "system",
+                "content": GENERATE_TESTCASES_WITH_MULTI_STEP_REASONING_PROMPT
+            },
+            {
+                "role": "user",
+                "content": f"Problem Statement:\n{problem_statement}\n\nCode skeleton: \n{code_skeleton}\n\nGenerate the complete and correct testcases in python files.\n\nSTRICT REQUIREMENT: You **MUST** output the **file name** along with file content.\nexample:\n```python\ntest_a.py\ncontents of test_a.py\n\ntest_b.py\ncontents of test_b.py\n```"
+            }
+        ]
+        
+        while retry < 10:
+            try:
+                testcode_response = call_llm(test_generation_messages, model=CODING_MODEL)
+                logger.info("Step 1 - Testcase Generation completed")
+                
+                testcases_check_messages = [
+                    {
+                        "role": "system",
+                        "content": TESTCASES_CHECK_PROMPT
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Problem statement: {problem_statement}\n\nCode skeleton: \n{code_skeleton}\n\nGenerated Test Code:\n{testcode_response}\n\nAnalyze this code for invalid testcases. Return ONLY the final Python test code."
+                    }   
+                ]
+                
+                testcode_checked_response = call_llm(testcases_check_messages, model=CODING_MODEL)
+                logger.info("Step 2 - Testcase check completed")
+
+                testcases = clean_testcode_response(testcode_checked_response)
+                
+                lines = testcases.split("\n")
+                if lines[0].endswith(".py") == False:
+                    retry += 1
+                    test_generation_messages.append({"role": "assistant", "content": testcode_checked_response})
+                    test_generation_messages.append({"role": "user", "content": f"Include file name in the response. example:\n```python\ntest_a.py\ncontents of test_a.py\n\ntest_b.py\ncontents of test_b.py\n```"})
+                    print(f"Retrying because the first line is not a python test file name:\n {testcases}")
+                    continue
+
+                # Extract function names for comparison
+                function_names = extract_function_names(testcases)
+                logger.info(f"Generated testset with functions: {function_names}")
+                return testcases, function_names
+                
+            except Exception as e:
+                retry += 1
+                print(f"Exception in generate_single_testset: {e}")
+                time.sleep(2)
+        
+        return "", set()
+
+    testcode, function_names = generate_single_testset()
+    return testcode
+    
+    # # Generate multiple test sets (8+ times)
+    # NUM_GENERATIONS = 15
+    # test_sets = []
+    # function_signatures = []
+    
+    # logger.info(f"Generating {NUM_GENERATIONS} test sets to find the most common pattern...")
+    
+    # for i in range(NUM_GENERATIONS):
+    #     logger.info(f"Generating test set {i+1}/{NUM_GENERATIONS}")
+    #     testcode, function_names = generate_single_testset()
+        
+    #     if testcode and function_names:  # Only add valid test sets
+    #         test_sets.append(testcode)
+    #         function_signatures.append(tuple(sorted(function_names)))  # Use tuple for hashing
+    #     else:
+    #         logger.warning(f"Failed to generate valid test set {i+1}")
+    
+    # if not test_sets:
+    #     logger.error("Failed to generate any valid test sets")
+    #     return ""
+    
+    # signature_counts = Counter(function_signatures)
+    # most_common_signature = signature_counts.most_common(1)[0][0]
+    # most_common_count = signature_counts.most_common(1)[0][1]
+    
+    # logger.info(f"Most common function signature: {most_common_signature} (appeared {most_common_count}/{len(test_sets)} times)")
+    
+    # # Find the first test set that matches the most common signature
+    # for i, signature in enumerate(function_signatures):
+    #     if signature == most_common_signature:
+    #         logger.info(f"Selected test set {i+1} as it matches the most common pattern")
+    #         return test_sets[i]
+    
+    # # Fallback: return the first valid test set
+    # logger.warning("No matching signature found, returning first test set")
+    # return test_sets[0]
+
+def extract_and_write_files(initial_solution: str, base_dir: str = ".") -> list:
+    import os
+    
+    created_files = []
+    
+    if not initial_solution.strip():
+        print("No solution content to process")
+        return created_files
+    
+    lines = initial_solution.split('\n')
+    current_filename = None
+    current_content = []
+    
+    for line in lines:
+        # Check if this line is just a Python filename (*.py pattern)
+        stripped_line = line.strip()
+        
+        # Pattern: ends with .py and looks like a filename (no spaces, reasonable length)
+        if (stripped_line.endswith('.py') and 
+            ' ' not in stripped_line and 
+            len(stripped_line) > 3 and 
+            '/' not in stripped_line.replace('/', '') and  # Allow subdirectories
+            not stripped_line.startswith('#')):
+            if current_filename and current_content:
+                file_path = os.path.join(base_dir, current_filename)
+                os.makedirs(os.path.dirname(file_path), exist_ok=True)
+                content = '\n'.join(current_content).strip()
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                created_files.append(file_path)
+            current_filename = stripped_line
+            current_content = []
+        else:
+
+            if current_filename:  # Only collect content if we have a filename
+                current_content.append(line)
+    if current_filename and current_content:
+        file_path = os.path.join(base_dir, current_filename)
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        content = '\n'.join(current_content).strip()
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        created_files.append(file_path)
+        print(f"Created file: {file_path}")
+    return created_files
