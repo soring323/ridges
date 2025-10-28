@@ -259,8 +259,8 @@ class AlternativeArchitecture:
 @dataclass
 class RefinementConfig:
     """Configuration for refinement process."""
-    max_iterations: int = 8  # Keep low - rely on diverse architectures instead
-    stuck_threshold: int = 2  # Keep low - quickly move to next architecture
+    max_iterations: int = 15  # Increased - give high-scoring solutions more attempts
+    stuck_threshold: int = 5  # Increased - don't give up on almost-perfect solutions
     timeout: int = 1800
 
 class ProblemMode(Enum):
@@ -574,13 +574,13 @@ def parse_test_results_helper(output: str) -> Dict[str, Any]:
             # Extract error details for each test
             current_test = None
             error_lines = []
-            for line in failure_section.split('\n')[:200]:  # Limit to avoid huge logs
+            for line in failure_section.split('\n')[:300]:  # Increased from 200 to 300
                 if line.startswith('_'):  # Test separator like "_ test_name _"
                     # Save previous test's error
                     if current_test and error_lines:
                         results['error_details'].append({
                             'test': current_test,
-                            'error': '\n'.join(error_lines[:10])  # First 10 lines of error
+                            'error': '\n'.join(error_lines[:30])  # Increased from 10 to 30 lines
                         })
                     # Start new test
                     current_test = line.strip('_ ')
@@ -592,7 +592,7 @@ def parse_test_results_helper(output: str) -> Dict[str, Any]:
             if current_test and error_lines:
                 results['error_details'].append({
                     'test': current_test,
-                    'error': '\n'.join(error_lines[:10])
+                    'error': '\n'.join(error_lines[:30])  # Increased from 10 to 30 lines
                 })
     
     # Debug output
@@ -2035,13 +2035,15 @@ class ParallelSolutionGenerator:
                 
                 if failed_tests:
                     failure_analysis += f"\n❌ FAILED TESTS ({len(failed_tests)}):\n"
-                    for i, test_name in enumerate(failed_tests[:3], 1):  # Show top 3 failures
+                    # Show ALL failed tests (not just 3) since we need complete context
+                    for i, test_name in enumerate(failed_tests, 1):
                         failure_analysis += f"{i}. {test_name}\n"
                 
                 if error_details:
                     failure_analysis += "\n🔍 ERROR DETAILS (what went wrong):\n"
-                    for i, error in enumerate(error_details[:3], 1):  # Show top 3 errors
-                        error_msg = truncate_text(str(error), max_chars=200)
+                    # Show ALL errors with MORE detail (increased from 200 to 800 chars)
+                    for i, error in enumerate(error_details, 1):
+                        error_msg = truncate_text(str(error), max_chars=800)
                         failure_analysis += f"{i}. {error_msg}\n"
                     
                     failure_analysis += "\n💡 YOUR TASK:\n"
@@ -2156,60 +2158,87 @@ class ParallelSolutionGenerator:
             return [f"Approach {i+1}" for i in range(num_architectures)]
     
     def _build_failure_context(self, candidates: List[SolutionCandidate]) -> Optional[Dict]:
-        """Build failure context from all completed candidates for dynamic queue."""
+        """Build failure context with PRIORITY on best candidate's errors.
+        
+        Strategy: Always include ALL errors from best candidate, then add errors from others
+        to fill context budget. This prevents best candidate errors from being truncated.
+        """
         if not candidates:
             return None
         
+        # Find best candidate first (highest priority)
+        best = max(candidates, key=lambda c: c.score)
+        
         # Collect all unique failed tests across all candidates
         all_failed_tests = set()
-        all_errors = []
         
-        for candidate in candidates:
+        # PRIORITY 1: Best candidate's errors (NEVER truncated)
+        best_errors = []
+        if best.test_results:
+            if best.test_results.failed > 0:
+                all_failed_tests.update(best.test_results.failed_tests)
+                if hasattr(best.test_results, 'error_details'):
+                    best_errors = best.test_results.error_details  # ALL errors from best
+        
+        # PRIORITY 2: Other candidates' errors (truncated to conserve context)
+        other_errors = []
+        other_candidates = [c for c in candidates if c != best]
+        for candidate in other_candidates:
             if candidate.test_results and candidate.test_results.failed > 0:
-                # Get failed test names
-                failed_names = [name for name in candidate.test_results.failed_tests if name]
-                all_failed_tests.update(failed_names)
-                
-                # Get error details
+                all_failed_tests.update(candidate.test_results.failed_tests)
                 if hasattr(candidate.test_results, 'error_details'):
-                    all_errors.extend(candidate.test_results.error_details[:2])  # Top 2 errors per candidate
+                    # Only take 1 error per other candidate (heavily truncated)
+                    other_errors.extend(candidate.test_results.error_details[:1])
         
         if not all_failed_tests:
             return None
         
-        # Find best candidate for context
-        best = max(candidates, key=lambda c: c.score)
+        # Combine: ALL best errors + limited other errors (max 3 from others)
+        combined_errors = best_errors + other_errors[:3]
         
         return {
             'architecture': best.architecture_name,
             'test_results': best.test_results,
             'failed_tests': list(all_failed_tests),
-            'error_details': all_errors[:5],  # Top 5 errors total
-            'num_completed': len(candidates)
+            'error_details': combined_errors,  # Best errors ALWAYS included in full
+            'num_completed': len(candidates),
+            'best_error_count': len(best_errors),  # For debugging
+            'other_error_count': len(other_errors[:3])
         }
     
     def _build_failure_breakdown(self, context: Dict) -> str:
-        """Build detailed failure breakdown text for code generator."""
+        """Build detailed failure breakdown text for code generator with prioritized errors."""
         if not context:
             return ""
         
         breakdown = "\n\n🎯 FAILURE ANALYSIS FROM PREVIOUS ATTEMPTS:\n"
         breakdown += f"Completed solutions: {context.get('num_completed', 0)}\n"
+        breakdown += f"Best candidate: {context.get('architecture', 'Unknown')}\n"
+        
+        # Show error prioritization info
+        best_err_count = context.get('best_error_count', 0)
+        other_err_count = context.get('other_error_count', 0)
+        if best_err_count > 0:
+            breakdown += f"📊 Errors: {best_err_count} from best candidate (full detail), {other_err_count} from others (summarized)\n"
         
         failed_tests = context.get('failed_tests', [])
         if failed_tests:
             breakdown += f"\n❌ FAILED TESTS ({len(failed_tests)}):\n"
-            for i, test in enumerate(failed_tests[:5], 1):
+            # Show all failed tests (important context)
+            for i, test in enumerate(failed_tests, 1):
                 breakdown += f"  {i}. {test}\n"
         
         errors = context.get('error_details', [])
         if errors:
-            breakdown += "\n🔍 ERROR PATTERNS:\n"
-            for i, error in enumerate(errors[:3], 1):
-                error_str = str(error)[:150]
-                breakdown += f"  {i}. {error_str}\n"
+            breakdown += f"\n🔍 DETAILED ERROR ANALYSIS ({len(errors)} errors):\n"
+            # Show all errors with more detail (prioritized: best candidate errors come first)
+            for i, error in enumerate(errors, 1):
+                error_str = str(error)[:500]  # Increased from 150 to 500 chars
+                marker = "⭐" if i <= best_err_count else "•"  # Mark best candidate errors
+                breakdown += f"  {marker} Error {i}: {error_str}\n"
         
-        breakdown += "\n💡 Focus on fixing these specific failures in your implementation.\n"
+        breakdown += "\n💡 CRITICAL: Focus on the ⭐ starred errors first (from best candidate).\n"
+        breakdown += "These are the remaining issues preventing a perfect solution.\n"
         return breakdown
     
     def generate_and_test_solution(self, problem: str, architecture_hint: Optional[str] = None, failure_hints: Optional[str] = None) -> Optional[SolutionCandidate]:
@@ -2353,14 +2382,21 @@ class ParallelSolutionGenerator:
         print("[PARALLEL] Each thread will use a UNIQUE architecture pattern")
         print("[PARALLEL] 🚀 Dynamic queue enabled - will generate new architectures as solutions complete")
         
+        # Build failure hints from best_candidate_info (CRITICAL: pass to solution generator!)
+        failure_hints = None
+        if best_candidate_info:
+            failure_hints = self._build_failure_context(best_candidate_info)
+            if failure_hints:
+                print("[PARALLEL] 📋 Passing failure context from best candidate to ALL solution generators")
+        
         candidates = []
         use_dynamic_queue = True  # Enable dynamic architecture generation
         
         # Use ThreadPoolExecutor for parallel generation
         with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-            # Submit initial tasks
+            # Submit initial tasks WITH failure_hints
             future_to_hint = {
-                executor.submit(self.generate_and_test_solution, problem, hint): hint
+                executor.submit(self.generate_and_test_solution, problem, hint, failure_hints): hint
                 for hint in architecture_hints[:num_solutions]
             }
             
