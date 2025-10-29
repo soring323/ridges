@@ -2125,12 +2125,13 @@ class PEVWorkflow:
 class FixTaskEnhancedToolManager(EnhancedToolManager):
 
     def __init__(self, available_tools: Optional[list[str]] = [], test_runner: str = "pytest",
-                 test_runner_mode: str = "FILE"):
+                 test_runner_mode: str = "FILE", problem_type: str = "FIX"):
         self.new_files_created = []
         self.is_solution_approved = False
         self.test_runner = test_runner
         self.test_runner_mode = test_runner_mode
         self.generated_test_files = []
+        self.problem_type = problem_type  # CREATE or FIX
         for cls in self.__class__.__mro__:
             for name, attr in cls.__dict__.items():
                 if getattr(attr, "is_tool", False) and name not in self.TOOL_LIST:
@@ -2604,11 +2605,20 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
         try:
             exts = (".py", ".ini", ".cfg", ".toml")
             exclude = {"src/agent.py", "src/agent_runner.py"}
+            
+            # Add generated test files to exclusion list
             try:
                 for _p in getattr(self, "generated_test_files", []):
-                    exclude.add(os.path.relpath(_p))
-            except Exception:
+                    # Handle both absolute and relative paths
+                    rel_path = os.path.relpath(_p) if os.path.isabs(_p) else _p
+                    # Remove leading ./ if present
+                    rel_path = rel_path.lstrip('./')
+                    exclude.add(rel_path)
+                    # Also add with ./ prefix in case git reports it that way
+                    exclude.add(f"./{rel_path}")
+            except Exception as e:
                 pass
+            
             ls = subprocess.run(
                 ["git", "ls-files", "-m", "-o", "--exclude-standard"],
                 capture_output=True, text=True, timeout=30, check=True
@@ -2638,6 +2648,13 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
         Output:
             Success message or error message
         '''
+        # Block test file edits in CREATE mode - tests are generated upfront and should not be modified
+        if self.problem_type == "CREATE":
+            raise EnhancedToolManager.Error(
+                EnhancedToolManager.Error.ErrorType.INVALID_TOOL_CALL.name,
+                "Error: In CREATE mode, test files are generated upfront and cannot be modified during the workflow. Focus on implementing the solution in main.py to pass the existing tests."
+            )
+        
         if not file_path.endswith('.py'):
             raise EnhancedToolManager.Error(
                 EnhancedToolManager.Error.ErrorType.INVALID_FILE_PATH.name,
@@ -2858,6 +2875,14 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
                 EnhancedToolManager.Error.ErrorType.INVALID_TOOL_CALL.name,
                 f"Error: You cannot use this tool before you have approval from user on your proposed solution. Please call get_approval_for_solution tool first with list of proposed solutions."
             )
+        
+        # Block test file edits in CREATE mode - tests are generated upfront and should not be modified
+        if self.problem_type == "CREATE" and ("test" in file_path.lower()):
+            raise EnhancedToolManager.Error(
+                EnhancedToolManager.Error.ErrorType.INVALID_TOOL_CALL.name,
+                f"Error: In CREATE mode, test files cannot be modified. The tests are pre-generated and you must implement the solution in main.py to pass them. Do not edit {file_path}."
+            )
+        
         if not os.path.exists(file_path):
             raise EnhancedToolManager.Error(
                 EnhancedToolManager.Error.ErrorType.FILE_NOT_FOUND.name,
@@ -2898,20 +2923,58 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
     @EnhancedToolManager.tool
     def finish(self, investigation_summary: str):
         '''
-        Signals completion of the current workflow execution
+        Signals completion of the current workflow execution. Only succeeds if all tests are passing.
         Arguments:
             investigation_summary: Please provide a detailed summary of the findings from your investigation and detailed solution to the problem.Use the following format:
                 Problem: <problem_statement>
                 Investigation: <investigation_summary>
                 Solution: <your solution>
         '''
-        qa_response = {"is_patch_correct": "yes"}
-        if qa_response.get("is_patch_correct", "no").lower() == "yes":
-            return "finish"
-        else:
+        # Find test files to run
+        test_files = getattr(self, 'generated_test_files', [])
+        if not test_files:
+            # Try to find test files in current directory
+            import glob
+            test_files = glob.glob("test*.py") + glob.glob("*test*.py")
+        
+        if not test_files:
             raise EnhancedToolManager.Error(
-                EnhancedToolManager.Error.ErrorType.BUG_REPORT_REQUIRED.name,
-                qa_response.get("analysis", "")
+                EnhancedToolManager.Error.ErrorType.INVALID_TOOL_CALL.name,
+                "Error: Cannot finish - no test files found to verify solution."
+            )
+        
+        # Run tests to verify all pass before allowing finish
+        try:
+            test_output = self.run_repo_tests(test_files)
+            
+            # Parse test output to count passed/failed
+            passed_count = test_output.count("PASSED") + test_output.count("passed") + test_output.count("OK")
+            failed_count = test_output.count("FAILED") + test_output.count("failed") + test_output.count("FAIL")
+            error_count = test_output.count("ERROR") + test_output.count("error:")
+            
+            # Check for explicit failure indicators
+            has_failures = (failed_count > 0 or error_count > 0 or 
+                          "failed" in test_output.lower() or 
+                          "error" in test_output.lower() or
+                          "traceback" in test_output.lower())
+            
+            if has_failures:
+                raise EnhancedToolManager.Error(
+                    EnhancedToolManager.Error.ErrorType.INVALID_TOOL_CALL.name,
+                    f"Error: Cannot finish - tests are failing!\n\nTest output:\n{test_output[:500]}\n\nYou must fix all failing tests before calling finish."
+                )
+            
+            # All tests passing - allow finish
+            return f"finish - Tests verified passing"
+            
+        except EnhancedToolManager.Error:
+            # Re-raise our own errors
+            raise
+        except Exception as e:
+            # If test execution fails, don't allow finish
+            raise EnhancedToolManager.Error(
+                EnhancedToolManager.Error.ErrorType.INVALID_TOOL_CALL.name,
+                f"Error: Cannot finish - failed to run tests: {str(e)}"
             )
 
 
@@ -3206,29 +3269,6 @@ def process_fix_task(input_dict: Dict[str, Any], enable_pev: bool = True, enable
     return patch_text
 
 
-def check_problem_type(problem_statement: str) -> str:
-    retry = 0
-    while retry < 10:
-        try:
-            messages = [
-                {"role": "system", "content": PROBLEM_TYPE_CHECK_PROMPT},
-                {"role": "user", "content": f"{problem_statement}\n# Project Tree Structure: \n{get_directory_tree()}"}
-            ]
-
-            response = EnhancedNetwork.make_request(messages, model=QWEN_MODEL_NAME)
-
-            if response not in [PROBLEM_TYPE_CREATE, PROBLEM_TYPE_FIX]:
-                retry += 1
-            else:
-                break
-        except Exception as e:
-            retry += 1
-
-        time.sleep(2)
-
-    return response
-
-
 def post_process_instruction(instruction: str) -> str:
     """
     Post-processes instruction to mark whitespaces and empty lines explicitly.
@@ -3447,8 +3487,22 @@ class LLMTestGenerator():
             logger.info("="*80)
             logger.info("TEST GENERATION - 2-Step Process with Link Validation")
             logger.info("="*80)
-            logger.info(f"[TEST_GEN] DEBUG: Received problem type: {type(problem)}, solution type: {type(solution)}, code_skeleton type: {type(code_skeleton)}")
-            logger.info(f"[TEST_GEN] DEBUG: Solution is None? {solution is None}, Solution bool: {bool(solution)}")
+            
+            # Log actual values, not types
+            problem_preview = problem[:200] + "..." if len(problem) > 200 else problem
+            logger.info(f"[TEST_GEN] Problem statement: {problem_preview}")
+            
+            if solution is None:
+                logger.info("[TEST_GEN] Solution: None (will generate tests from problem statement only)")
+            elif isinstance(solution, list):
+                logger.info(f"[TEST_GEN] Solution: list with {len(solution)} file paths: {solution}")
+            elif isinstance(solution, dict):
+                logger.info(f"[TEST_GEN] Solution: dict with {len(solution)} files: {list(solution.keys())}")
+            else:
+                logger.info(f"[TEST_GEN] Solution: {type(solution).__name__} (unexpected type)")
+            
+            skeleton_preview = code_skeleton[:100] + "..." if len(code_skeleton) > 100 else code_skeleton
+            logger.info(f"[TEST_GEN] Code skeleton: {skeleton_preview}")
             
             # Convert solution list to dict if needed
             if isinstance(solution, list):
@@ -3605,17 +3659,37 @@ class LLMTestGenerator():
                 logger.info("[TEST_GEN] ✓ Tests validated and refined")
                 print("[TEST_GEN] ✓ Tests validated and refined")
             
-            # Log final results
+            # Apply auto-fixes FIRST before logging
             if files:
                 logger.info(f"[TEST_GEN] ✓ Successfully generated {len(files)} test file(s): {list(files.keys())}")
+                
+                # Apply auto-fixes to all files
+                for filename, content in list(files.items()):
+                    # Lightweight API sanity check
+                    api_warnings = quick_api_sanity_check(content, code_skeleton)
+                    if api_warnings:
+                        for warning in api_warnings:
+                            logger.warning(f"[TEST_GEN] {warning}")
+                    
+                    # Auto-fix API mismatches if detected
+                    fixed_content = auto_fix_api_mismatches(content, code_skeleton)
+                    if fixed_content != content:
+                        logger.info(f"[TEST_GEN] Applied auto-fixes to match skeleton API")
+                        files[filename] = fixed_content
+                
+                # Now log the FIXED final content (preview only to save context)
                 for filename, content in files.items():
                     num_tests = content.count('def test_')
                     logger.info(f"[TEST_GEN]   - {filename}: {num_tests} test functions, {len(content)} chars")
+                    
+                    # Log preview only (first 500 chars) to avoid context overflow
+                    preview = content[:500] + "..." if len(content) > 500 else content
                     logger.info("="*80)
-                    logger.info(f"[TEST_GEN] FULL CONTENT OF {filename}:")
+                    logger.info(f"[TEST_GEN] FINAL CONTENT PREVIEW OF {filename} (after auto-fixes):")
                     logger.info("="*80)
-                    logger.info(content)
+                    logger.info(preview)
                     logger.info("="*80)
+                    logger.info(f"[TEST_GEN] Full content: {len(content)} chars (truncated in logs to save context)")
             else:
                 logger.error("[TEST_GEN] ✗ Failed to parse any test files from response")
             
@@ -3627,6 +3701,55 @@ class LLMTestGenerator():
             print(f"[ERROR] Test generation failed: {e}")
             return {}
  
+def quick_api_sanity_check(test_code: str, skeleton_code: str) -> List[str]:
+    """
+    Quick sanity check for obvious API mismatches between tests and skeleton.
+    Returns list of warning messages (empty if no issues).
+    """
+    warnings = []
+    
+    # Check if tests use set_value() but skeleton doesn't define it
+    if "set_value(" in test_code and "def set_value" not in skeleton_code:
+        warnings.append("⚠️  Tests use set_value() method but skeleton doesn't define it - use direct assignment (obj.value = x) instead")
+    
+    # Check if tests use add_callback() but skeleton doesn't define it  
+    if "add_callback(" in test_code and "def add_callback" not in skeleton_code:
+        warnings.append("⚠️  Tests use add_callback() method but skeleton doesn't define it")
+    
+    # Check if tests use remove_callback() but skeleton doesn't define it
+    if "remove_callback(" in test_code and "def remove_callback" not in skeleton_code:
+        warnings.append("⚠️  Tests use remove_callback() method but skeleton doesn't define it")
+    
+    return warnings
+
+
+def auto_fix_api_mismatches(test_code: str, skeleton_code: str) -> str:
+    """
+    Automatically fix common API mismatches between generated tests and skeleton.
+    Returns corrected test code.
+    """
+    import re
+    
+    fixed_code = test_code
+    fixes_applied = []
+    
+    # Fix 1: Replace obj.set_value(x) with obj.value = x if skeleton doesn't have set_value method
+    if "set_value(" in test_code and "def set_value" not in skeleton_code:
+        # Pattern: variable_name.set_value(value)
+        # Replace with: variable_name.value = value
+        pattern = r'(\w+)\.set_value\(([^)]+)\)'
+        replacement = r'\1.value = \2'
+        new_code = re.sub(pattern, replacement, fixed_code)
+        if new_code != fixed_code:
+            fixes_applied.append("set_value() → direct assignment")
+            fixed_code = new_code
+    
+    if fixes_applied:
+        logger.info(f"[TEST_GEN] Auto-fixes applied: {', '.join(fixes_applied)}")
+    
+    return fixed_code
+
+
 def parse_file_blocks(text: str) -> Dict[str, str]:
     """Parse text containing multiple files."""
     files = {}
@@ -3659,7 +3782,27 @@ def parse_file_blocks(text: str) -> Dict[str, str]:
         if 'def ' in text or 'class ' in text or 'import ' in text:
             files['main.py'] = text.strip()
     
-    return files
+    # Fix test filename collisions: rename test files to tests.py if they conflict with main.py
+    fixed_files = {}
+    for filename, content in files.items():
+        # Detect if this is a test file (contains test imports/classes/functions)
+        is_test_file = any([
+            'import unittest' in content,
+            'import pytest' in content,
+            'from unittest' in content,
+            'class Test' in content,
+            'def test_' in content,
+            'if __name__ == \'__main__\':\n    unittest.main()' in content
+        ])
+        
+        # If it's a test file but named main.py or solution.py, rename it to tests.py
+        if is_test_file and filename in ['main.py', 'solution.py', 'src.py']:
+            logger.warning(f"[TEST_GEN] ⚠️  Test file incorrectly named '{filename}' - renaming to 'tests.py'")
+            fixed_files['tests.py'] = content
+        else:
+            fixed_files[filename] = content
+    
+    return fixed_files
 
 
 def validate_edge_case_comments(solution: str) -> dict:
@@ -4018,6 +4161,41 @@ def determine_temperature(problem_statement: str) -> float:
             return 0
 
     return 0
+
+
+PROBLEM_TYPE_CHECK_PROMPT = textwrap.dedent(
+    '''
+    You are the problem type checker that will categories problem type into:
+    
+    1. CREATE: If the problem statement is about creating a new functionality from scratch.
+    2. FIX: If the problem statement is about fixing a bug, creating a new functionality or improving the existing codebase.
+    
+    Only respond with the "FIX" or "CREATE".
+    '''
+)
+
+
+def check_problem_type(problem_statement: str) -> str:
+    retry = 0
+    while retry < 10:
+        try:
+            messages = [
+                {"role": "system", "content": PROBLEM_TYPE_CHECK_PROMPT},
+                {"role": "user", "content": f"{problem_statement}\n# Project Tree Structure: \n{get_directory_tree()}"}
+            ]
+
+            response = EnhancedNetwork.make_request(messages, model=QWEN_MODEL_NAME)
+
+            if response not in [PROBLEM_TYPE_CREATE, PROBLEM_TYPE_FIX]:
+                retry += 1
+            else:
+                break
+        except Exception:
+            retry += 1
+
+        time.sleep(2)
+
+    return response
 
 
 def generate_solution_with_multi_step_reasoning(problem_statement: str, code_skeleton: str, temperature: float) -> str:
@@ -4431,17 +4609,20 @@ def process_create_task(input_dict, enable_pev: bool = True, enable_test_guidanc
     logger.info("="*80)
     
     patch = None
+    workflow_tool_manager = None
     try:
-        patch = fix_task_solve_workflow(
+        # Pass test_files to workflow so it can track them for exclusion from patch
+        patch, workflow_tool_manager = fix_task_solve_workflow(
             problem_statement,
             timeout=timeout,
             run_id_1=run_id,
             test_runner="unittest",
             test_runner_mode="FILE",
-            n_max_steps=60,
+            n_max_steps=150,  # Increased to 150 to allow more time for complex implementations and recovery from resets
             enable_pev=enable_pev,
             enable_test_guidance=enable_test_guidance,
-            extra_fix_request=SOLVE_TASK_NON_FUNCTIONAL_TEST_PROMPT
+            extra_fix_request=SOLVE_TASK_NON_FUNCTIONAL_TEST_PROMPT,
+            generated_test_files=test_files  # Pass test files written in CREATE_TASK
         )
         logger.info("="*80)
         logger.info("[CREATE_TASK] fix_task_solve_workflow completed SUCCESSFULLY")
@@ -4464,14 +4645,26 @@ def process_create_task(input_dict, enable_pev: bool = True, enable_test_guidanc
         logger.warning("[CREATE_TASK] Patch is None, falling back to initial solution")
         extract_and_write_files(initial_solution)
 
-    tool_manager = EnhancedToolManager()
+    # Use the tool_manager from workflow if available (it has test file tracking)
+    # Otherwise create a new one and manually populate test files
+    if workflow_tool_manager:
+        tool_manager = workflow_tool_manager
+        logger.info(f"[CREATE_TASK] Using workflow tool_manager with {len(tool_manager.generated_test_files)} tracked test files")
+    else:
+        tool_manager = EnhancedToolManager()
+        # Populate generated_test_files to exclude them from patch
+        if test_files:
+            tool_manager.generated_test_files = test_files[:]
+            logger.info(f"[CREATE_TASK] Excluding {len(test_files)} test files from patch: {test_files}")
+    
     patch = tool_manager.get_final_git_patch()
     return patch
 
 
 def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: str, \
                             test_runner: str = "pytest", test_runner_mode: str = "FILE", n_max_steps=MAX_FIX_TASK_STEPS,
-                            enable_pev: bool = True, enable_test_guidance: bool = True, extra_fix_request="") -> tuple[
+                            enable_pev: bool = True, enable_test_guidance: bool = True, extra_fix_request="",
+                            generated_test_files: List[str] = None) -> tuple[
     str, List[str], List[str]]:
     logger.info("="*80)
     logger.info("[FIX_WORKFLOW] ENTERED fix_task_solve_workflow")
@@ -4494,7 +4687,7 @@ def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: s
         raise
 
     # Determine problem type for strategy and guidance
-    problem_type = "bug_fix"  # Can be enhanced with problem_statement analysis
+    problem_type = check_problem_type(problem_statement)
     logger.info(f"[FIX_WORKFLOW] Problem type determined: {problem_type}")
     
     # Run planning with problem type for better strategy selection
@@ -4534,8 +4727,15 @@ def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: s
             "finish"
         ],
         test_runner=test_runner,
-        test_runner_mode=test_runner_mode
+        test_runner_mode=test_runner_mode,
+        problem_type=problem_type  # Pass CREATE or FIX mode to enable/disable test file editing
     )
+    
+    # Initialize with test files from CREATE_TASK so they're excluded from patch
+    if generated_test_files:
+        tool_manager.generated_test_files = generated_test_files[:]
+        logger.info(f"[FIX_WORKFLOW] Initialized with {len(generated_test_files)} pre-generated test files for exclusion: {generated_test_files}")
+    
     phase_manager = PhaseManager(problem_statement, n_max_steps)
     use_multi_phase = phase_manager.use_multi_phase_workflow()
     system_prompt = FIX_TASK_SYSTEM_PROMPT.format(
@@ -4551,7 +4751,7 @@ def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: s
     logs: List[str] = []
     logs.append(f"cwd: {os.getcwd()}")
 
-    # Progress monitoring to detect stuck states
+    # Progress monitoring to detect stuck states (DYNAMIC DETECTION WITH SAFEGUARDS)
     progress_tracker = {
         'last_test_results': [],
         'stuck_counter': 0,
@@ -4559,15 +4759,28 @@ def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: s
         'last_strategy_name': strategy.get('name', 'Unknown'),
         'strategy_change_count': 0,
         'intervention_tier': 0,  # Track escalation level: 0=none, 1=soft, 2=strong, 3=nuclear
-        'last_intervention_step': 0
+        'last_intervention_step': 0,
+        'progress_history': [],  # [(step, passing_tests, failing_tests), ...]
+        'last_progress_step': 0,  # Last step where we saw progress
+        'last_start_over_step': 0,  # Last step where start_over was called
+        'recent_tools': [],  # Track last 10 tool calls to detect activity patterns
+        'code_edit_count': 0,  # Count apply_code_edit calls since last check
+        'implementation_active': False,  # True if agent is actively implementing
+        'best_checkpoint': {  # Track best solution state
+            'step': 0,
+            'pass_rate': 0.0,
+            'commit_sha': None,
+            'test_results': None
+        }
     }
     
-    # Escalation thresholds
-    TIER1_TRIGGER = 15  # Soft intervention: Strong prompt + force strategy re-plan
-    TIER2_TRIGGER = 30  # Strong intervention: Limited tools + final warning
-    TIER3_TRIGGER = 45  # Nuclear: Forced start_over
-    TEST_CHECK_INTERVAL = 5  # Check progress every 5 steps
-    STRATEGY_REEVAL_CHECKPOINTS = [20, 40]  # Additional strategy checkpoints
+    # DYNAMIC thresholds - adapt based on behavior
+    CONSECUTIVE_STUCK_TOLERANCE = 8  # Allow 8 consecutive checks with no progress before intervention
+    MIN_STEPS_BEFORE_INTERVENTION = 10  # Minimum steps before any intervention
+    PROGRESS_CHECK_INTERVAL = 5  # Check progress every 5 steps
+    TIER_ESCALATION_WAIT = 10  # Wait 10 steps between tier escalations
+    STRATEGY_REEVAL_FREQUENCY = 15  # Suggest strategy re-eval every 15 steps if stuck
+    GRACE_PERIOD_AFTER_RESET = 15  # Give agent 15 steps after start_over before checking stuck
     
     # Find test files once for progress monitoring
     import glob
@@ -4602,9 +4815,9 @@ def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: s
             )
             break
 
-        # ========== 3-TIER ESCALATION SYSTEM ==========
-        # Check progress at regular intervals and escalate interventions
-        if step % TEST_CHECK_INTERVAL == 0 and step > 0:
+        # ========== DYNAMIC PROGRESS MONITORING ==========
+        # Check progress at regular intervals
+        if step % PROGRESS_CHECK_INTERVAL == 0 and step > 0:
             logger.info(f"[FIX_WORKFLOW] Progress checkpoint at step {step}")
             
             # Run tests to check current state
@@ -4615,20 +4828,56 @@ def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: s
                 failed_count = test_result_str.count("FAILED") + test_result_str.count("failed")
                 current_result = f"{passed_count}p_{failed_count}f"
                 
-                # Track result
+                # Track in history
+                progress_tracker['progress_history'].append((step, passed_count, failed_count))
                 progress_tracker['last_test_results'].append(current_result)
                 
-                # Detect stuck: same result for last 3 checks
-                if len(progress_tracker['last_test_results']) >= 3:
-                    recent_results = progress_tracker['last_test_results'][-3:]
-                    if len(set(recent_results)) == 1:
-                        progress_tracker['stuck_counter'] += 1
-                        logger.warning(f"[FIX_WORKFLOW] ⚠️  Stuck detected! Same test results for {len(recent_results)*TEST_CHECK_INTERVAL} steps: {recent_results[0]}")
-                    else:
+                # Detect progress: did pass count increase or fail count decrease?
+                if len(progress_tracker['progress_history']) >= 2:
+                    prev_step, prev_pass, prev_fail = progress_tracker['progress_history'][-2]
+                    curr_step, curr_pass, curr_fail = progress_tracker['progress_history'][-1]
+                    
+                    if curr_pass > prev_pass or curr_fail < prev_fail:
+                        # PROGRESS MADE!
                         progress_tracker['stuck_counter'] = 0
-                        logger.info(f"[FIX_WORKFLOW] ✓ Progress made: {progress_tracker['last_test_results'][-4] if len(progress_tracker['last_test_results']) >= 4 else 'N/A'} → {current_result}")
+                        progress_tracker['last_progress_step'] = step
+                        logger.info(f"[FIX_WORKFLOW] ✓ Progress! {prev_pass}p_{prev_fail}f → {curr_pass}p_{curr_fail}f")
+                        
+                        # Calculate pass rate and save checkpoint if it's the best so far
+                        total_tests = curr_pass + curr_fail
+                        if total_tests > 0:
+                            curr_pass_rate = curr_pass / total_tests
+                            if curr_pass_rate > progress_tracker['best_checkpoint']['pass_rate']:
+                                try:
+                                    # Create git commit for this checkpoint
+                                    subprocess.run(["git", "add", "-A"], check=True, timeout=10, capture_output=True)
+                                    commit_result = subprocess.run(
+                                        ["git", "commit", "-m", f"Checkpoint step {step}: {curr_pass}/{total_tests} tests passing"],
+                                        check=True, timeout=10, capture_output=True, text=True
+                                    )
+                                    # Get the commit SHA
+                                    sha_result = subprocess.run(
+                                        ["git", "rev-parse", "HEAD"],
+                                        check=True, timeout=10, capture_output=True, text=True
+                                    )
+                                    commit_sha = sha_result.stdout.strip()
+                                    
+                                    progress_tracker['best_checkpoint'] = {
+                                        'step': step,
+                                        'pass_rate': curr_pass_rate,
+                                        'commit_sha': commit_sha,
+                                        'test_results': f"{curr_pass}p_{curr_fail}f"
+                                    }
+                                    logger.info(f"[FIX_WORKFLOW] 💾 Saved checkpoint: {curr_pass}/{total_tests} tests ({curr_pass_rate:.1%}) at commit {commit_sha[:8]}")
+                                except Exception as e:
+                                    logger.warning(f"[FIX_WORKFLOW] Failed to save checkpoint: {e}")
+                    elif current_result == f"{prev_pass}p_{prev_fail}f":
+                        # NO PROGRESS - same result
+                        progress_tracker['stuck_counter'] += 1
+                        steps_since_progress = step - progress_tracker['last_progress_step']
+                        logger.warning(f"[FIX_WORKFLOW] ⚠️  No progress: {progress_tracker['stuck_counter']} consecutive checks, {steps_since_progress} steps since last progress")
                 
-                # Build messages with appropriate intervention tier
+                # Build messages
                 messages = [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": instance_prompt},
@@ -4636,22 +4885,37 @@ def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: s
                 
             except Exception as e:
                 logger.warning(f"[FIX_WORKFLOW] Progress check failed: {e}")
-                # Build normal messages
                 messages = [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": instance_prompt},
                 ]
         else:
-            # Build normal messages
             messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": instance_prompt},
             ]
         
-        # ========== TIER 1: SOFT INTERVENTION (Step 15+) ==========
-        if step >= TIER1_TRIGGER and progress_tracker['intervention_tier'] == 0 and progress_tracker['stuck_counter'] >= 3:
+        # ========== TIER 1: SOFT INTERVENTION (Dynamic with Safeguards) ==========
+        # Trigger when: stuck for CONSECUTIVE_STUCK_TOLERANCE checks AND min steps met AND no prior intervention
+        steps_since_last_intervention = step - progress_tracker['last_intervention_step']
+        steps_since_reset = step - progress_tracker['last_start_over_step']
+        in_grace_period = steps_since_reset < GRACE_PERIOD_AFTER_RESET
+        actively_implementing = progress_tracker['code_edit_count'] >= 3  # 3+ edits since last check suggests active work
+        
+        # SAFEGUARD: Don't intervene if agent is actively implementing or just reset
+        if in_grace_period:
+            logger.info(f"[FIX_WORKFLOW] In grace period after start_over ({steps_since_reset}/{GRACE_PERIOD_AFTER_RESET} steps) - skipping intervention")
+        elif actively_implementing:
+            logger.info(f"[FIX_WORKFLOW] Agent actively implementing ({progress_tracker['code_edit_count']} recent edits) - skipping intervention")
+            progress_tracker['code_edit_count'] = 0  # Reset for next check
+        
+        if (step >= MIN_STEPS_BEFORE_INTERVENTION and 
+            progress_tracker['intervention_tier'] == 0 and 
+            progress_tracker['stuck_counter'] >= CONSECUTIVE_STUCK_TOLERANCE // PROGRESS_CHECK_INTERVAL and
+            not in_grace_period and  # SAFEGUARD: Respect grace period
+            not actively_implementing):  # SAFEGUARD: Don't interrupt active work
             logger.error(f"[FIX_WORKFLOW] 🟡 TIER 1 INTERVENTION at step {step}")
-            logger.error(f"[FIX_WORKFLOW] Agent stuck for {progress_tracker['stuck_counter']*TEST_CHECK_INTERVAL} steps - forcing strategy re-plan")
+            logger.error(f"[FIX_WORKFLOW] Agent stuck for {progress_tracker['stuck_counter']*PROGRESS_CHECK_INTERVAL} steps - forcing strategy re-plan")
             
             progress_tracker['intervention_tier'] = 1
             progress_tracker['last_intervention_step'] = step
@@ -4685,7 +4949,7 @@ def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: s
             tier1_prompt = f"""
 🟡 TIER 1 INTERVENTION - STRATEGY CHANGE REQUIRED
 
-You have been stuck for {progress_tracker['stuck_counter']*TEST_CHECK_INTERVAL} steps with no progress.
+You have been stuck for {progress_tracker['stuck_counter']*PROGRESS_CHECK_INTERVAL} steps with no progress.
 Your previous strategy '{progress_tracker['approaches_tried']}' is NOT working.
 
 A NEW strategy has been selected: {progress_tracker['last_strategy_name']}
@@ -4700,8 +4964,11 @@ Your current approach is in a LOCAL MINIMUM. Break out of it.
             messages.append({"role": "system", "content": tier1_prompt})
             logger.info("[FIX_WORKFLOW] Tier 1 intervention prompt added")
         
-        # ========== TIER 2: STRONG INTERVENTION (Step 30+) ==========
-        elif step >= TIER2_TRIGGER and progress_tracker['intervention_tier'] == 1 and progress_tracker['stuck_counter'] >= 2:
+        # ========== TIER 2: STRONG INTERVENTION (Dynamic) ==========
+        # Trigger when: Tier 1 didn't work after waiting TIER_ESCALATION_WAIT more steps
+        elif (progress_tracker['intervention_tier'] == 1 and 
+              steps_since_last_intervention >= TIER_ESCALATION_WAIT and
+              progress_tracker['stuck_counter'] >= 2):
             logger.error(f"[FIX_WORKFLOW] 🟠 TIER 2 INTERVENTION at step {step}")
             logger.error(f"[FIX_WORKFLOW] Still stuck after Tier 1 - restricting tools and issuing final warning")
             
@@ -4712,7 +4979,7 @@ Your current approach is in a LOCAL MINIMUM. Break out of it.
 🟠 TIER 2 INTERVENTION - FINAL WARNING BEFORE FORCED RESET
 
 You remain stuck after Tier 1 intervention at step {progress_tracker['last_intervention_step']}.
-You have {TIER3_TRIGGER - step} steps before FORCED RESET.
+You have {TIER_ESCALATION_WAIT} more steps before FORCED RESET.
 
 This is your LAST CHANCE to solve this on your own.
 
@@ -4730,13 +4997,15 @@ Available tools are now limited. You can:
 ❌ No more get_context_around_line - stop analyzing, start implementing
 ❌ No more search tools - you know what needs to be done
 
-If you don't solve this by step {TIER3_TRIGGER}, the system will FORCE a reset.
+If you don't solve this in the next {TIER_ESCALATION_WAIT} steps, the system will FORCE a reset.
 """
             messages.append({"role": "system", "content": tier2_prompt})
             logger.info("[FIX_WORKFLOW] Tier 2 intervention prompt added - final warning issued")
         
-        # ========== TIER 3: NUCLEAR OPTION (Step 45+) ==========
-        elif step >= TIER3_TRIGGER and progress_tracker['intervention_tier'] == 2:
+        # ========== TIER 3: NUCLEAR OPTION (Dynamic) ==========
+        # Trigger when: Tier 2 didn't work after waiting TIER_ESCALATION_WAIT more steps
+        elif (progress_tracker['intervention_tier'] == 2 and 
+              steps_since_last_intervention >= TIER_ESCALATION_WAIT):
             logger.error(f"[FIX_WORKFLOW] 🔴 TIER 3 INTERVENTION (NUCLEAR) at step {step}")
             logger.error(f"[FIX_WORKFLOW] Agent failed to self-correct after Tier 1 and Tier 2 interventions")
             logger.error(f"[FIX_WORKFLOW] FORCING automatic start_over and strategy change")
@@ -4787,8 +5056,12 @@ You have {n_max_steps - step} steps remaining.
                 # Add prompt anyway
                 messages.append({"role": "system", "content": f"🔴 System attempted forced reset but encountered error: {e}. You MUST call start_over manually NOW."})
         
-        # ========== STRATEGY RE-EVALUATION AT CHECKPOINTS ==========
-        if step in STRATEGY_REEVAL_CHECKPOINTS:
+        # ========== DYNAMIC STRATEGY RE-EVALUATION ==========
+        # Suggest strategy change every STRATEGY_REEVAL_FREQUENCY steps if stuck
+        if (step % STRATEGY_REEVAL_FREQUENCY == 0 and 
+            step > 0 and 
+            progress_tracker['stuck_counter'] > 0 and
+            progress_tracker['intervention_tier'] == 0):  # Only before interventions start
             logger.info(f"[FIX_WORKFLOW] 🔄 Strategy re-evaluation checkpoint at step {step}")
             try:
                 # Check if tests are passing
@@ -4798,11 +5071,7 @@ You have {n_max_steps - step} steps remaining.
                 if not all_passing:
                     logger.warning(f"[FIX_WORKFLOW] Tests still failing at checkpoint {step}, considering strategy change...")
                     
-                    # Re-run strategy selection with context
-                    context_msg = f"Current strategy '{progress_tracker['last_strategy_name']}' has not solved the problem after {step} steps. Need different approach."
-                    logger.info(f"[FIX_WORKFLOW] Re-planning with context: {context_msg}")
-                    
-                    # Get new strategy (simplified - just note that we tried this approach)
+                    # Note that we tried this approach
                     progress_tracker['approaches_tried'].add(progress_tracker['last_strategy_name'])
                     progress_tracker['strategy_change_count'] += 1
                     
@@ -4822,6 +5091,17 @@ Review the test failures and choose a new architectural direction.
                 logger.warning(f"[FIX_WORKFLOW] Strategy re-evaluation failed: {e}")
 
         messages.extend(cot.to_str())
+        
+        # Trim messages to prevent context overflow (keep first 2 system messages + last N turns)
+        MAX_CONTEXT_MESSAGES = 40  # Keep ~20 turns of conversation
+        original_count = len(messages)
+        if original_count > MAX_CONTEXT_MESSAGES + 2:
+            # Keep system messages (first 2) + last N messages
+            system_messages = messages[:2]
+            recent_messages = messages[-(MAX_CONTEXT_MESSAGES):]
+            messages = system_messages + recent_messages
+            logger.info(f"[FIX_WORKFLOW] Trimmed context: kept {len(messages)} messages (trimmed from {original_count})")
+        
         if use_multi_phase:
             phase_guidance = phase_manager.get_phase_guidance()
             messages.append({"role": "system", "content": phase_guidance})
@@ -4900,6 +5180,20 @@ Review the test failures and choose a new architectural direction.
                     request_data=messages
                 )
             )
+            
+            # Track tool usage for implementation activity detection
+            progress_tracker['recent_tools'].append(next_tool_name)
+            if len(progress_tracker['recent_tools']) > 10:
+                progress_tracker['recent_tools'].pop(0)  # Keep only last 10
+            
+            # Track code edits and start_over calls
+            if next_tool_name == 'apply_code_edit':
+                progress_tracker['code_edit_count'] += 1
+            elif next_tool_name == 'start_over':
+                progress_tracker['last_start_over_step'] = step
+                progress_tracker['code_edit_count'] = 0
+                logger.info(f"[FIX_WORKFLOW] start_over detected - grace period of {GRACE_PERIOD_AFTER_RESET} steps begins")
+            
             if use_multi_phase and next_tool_name in ['run_repo_tests', 'apply_code_edit', 'get_approval_for_solution']:
                 test_results = {}
                 if 'passed' in str(next_observation).lower() or 'failed' in str(next_observation).lower():
@@ -5007,22 +5301,42 @@ Review the test failures and choose a new architectural direction.
         )
     
     logger.info("="*80)
+    
+    # If not successful and we have a better checkpoint, restore to it
+    best_checkpoint = progress_tracker.get('best_checkpoint', {})
+    if not overall_success and best_checkpoint.get('commit_sha') and best_checkpoint.get('pass_rate', 0) > 0:
+        logger.info(f"[FIX_WORKFLOW] ⚠️  Workflow incomplete, but found better checkpoint at step {best_checkpoint['step']}")
+        logger.info(f"[FIX_WORKFLOW] 🔄 Restoring to best checkpoint: {best_checkpoint['test_results']} ({best_checkpoint['pass_rate']:.1%})")
+        try:
+            # Reset to best checkpoint
+            subprocess.run(
+                ["git", "reset", "--hard", best_checkpoint['commit_sha']], 
+                check=True, timeout=10, capture_output=True
+            )
+            logger.info(f"[FIX_WORKFLOW] ✓ Restored to checkpoint {best_checkpoint['commit_sha'][:8]}")
+        except Exception as e:
+            logger.error(f"[FIX_WORKFLOW] Failed to restore checkpoint: {e}")
+    
     logger.info("[FIX_WORKFLOW] Generating final git patch...")
     patch = tool_manager.get_final_git_patch()
     
     if patch:
         logger.info(f"[FIX_WORKFLOW] ✓ Patch generated ({len(patch)} chars)")
         logger.info(f"[FIX_WORKFLOW] Patch preview: {patch[:300]}...")
+        if best_checkpoint.get('commit_sha'):
+            logger.info(f"[FIX_WORKFLOW] 📊 Best checkpoint: {best_checkpoint['test_results']} ({best_checkpoint['pass_rate']:.1%}) at step {best_checkpoint['step']}")
     else:
         logger.warning("[FIX_WORKFLOW] ⚠️  Patch is EMPTY or None!")
         logger.warning("[FIX_WORKFLOW] This means no files were modified during execution")
         logger.warning(f"[FIX_WORKFLOW] Total steps executed: {step}")
         logger.warning(f"[FIX_WORKFLOW] Last tool called: {next_tool_name if 'next_tool_name' in locals() else 'unknown'}")
+        if best_checkpoint.get('pass_rate', 0) > 0:
+            logger.warning(f"[FIX_WORKFLOW] Note: Best checkpoint had {best_checkpoint['test_results']} ({best_checkpoint['pass_rate']:.1%}) at step {best_checkpoint['step']}")
     
     logger.info("[FIX_WORKFLOW] EXITING fix_task_solve_workflow")
     logger.info("="*80)
 
-    return patch
+    return patch, tool_manager
 
 
 def get_code_skeleton() -> str:
