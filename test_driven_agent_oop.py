@@ -101,6 +101,31 @@ contents of test_b.py
 """
 )
 
+PROBLEM_NAME_VERIFICATION_PROMPT = textwrap.dedent("""
+    You are an expert problem statement checker. Your task is to find the correct problem slug from {repository} problem list.
+
+    Generated tests reference problem: {generated_problem_summary}
+    
+    Actual problem instruction:
+    {instruction}
+
+    CRITICAL: Extract the problem SLUG (identifier), not regular words.
+    - Look at the first heading/title (e.g., "# POV" or "# Instructions\n\nPOV")
+    - The slug is the main identifier word(s), converted to lowercase with hyphens
+    - Skip common words like "the", "a", "an", "instructions"
+    
+    Examples:
+    - "# POV" → slug is "pov"
+    - "# Two Fer" → slug is "two-fer"
+    - "# Instructions\n\nRobot Name" → slug is "robot-name"
+
+    Compare "{generated_problem_summary}" with the actual problem slug.
+    If they match, respond with "{generated_problem_summary}".
+    If they don't match, respond with the CORRECT slug.
+
+    Response format: problem-slug (lowercase with hyphens, no spaces)
+""")
+
 GENERATE_TESTCASES_WITH_MULTI_STEP_REASONING_PROMPT = textwrap.dedent(
 """
 You are an expert Python unittest testcase developer familiar with canonical programming problem test specifications.
@@ -796,10 +821,97 @@ class LLMCodeGenerator(ICodeGenerator):
             print(f"[ERROR] Solution generation failed: {e}")
             return {}
     
+    def validate_tests(self, problem: str, generated_tests: str, context_note: str) -> str:
+        """Validate generated tests and correct if they reference wrong problem.
+        
+        Args:
+            problem: Problem instructions
+            generated_tests: Initially generated test content
+            context_note: Context note for regeneration
+        
+        Returns:
+            Validated/corrected test content
+        """
+        import re
+        
+        # Extract base URL from generated tests (look for domain.com/org pattern)
+        is_matched = re.search(r'([a-z0-9.-]+\.[a-z]{2,}/[a-z0-9-]+)', generated_tests, re.IGNORECASE)
+        if not is_matched:
+            logger.info("[TEST_GEN] No URL found in tests, skipping validation")
+            return generated_tests
+        
+        base_url = is_matched.group(1)
+        logger.info(f"[TEST_GEN] Extracted base URL: '{base_url}'")
+        
+        # Extract problem name from generated link
+        problem_match = re.search(r'/([a-z0-9-]+)/[a-z0-9_-]+\.[a-z]+', generated_tests, re.IGNORECASE)
+        generated_problem_summary = problem_match.group(1) if problem_match else "unknown"
+        logger.info(f"[TEST_GEN] Generated tests reference: '{generated_problem_summary}'")
+        
+        # Extract repository name
+        repository_name = base_url.split('/')[-1] if base_url else "unknown"
+        logger.info(f"[TEST_GEN] Repository: '{repository_name}'")
+        
+        # Ask LLM to verify problem name
+        verification_prompt = PROBLEM_NAME_VERIFICATION_PROMPT.format(
+            repository=repository_name,
+            generated_problem_summary=generated_problem_summary,
+            instruction=problem[:1500]
+        )
+        
+        try:
+            verify_response = call_llm(
+                [{"role": "user", "content": verification_prompt}],
+                model=FAST_MODEL,
+                temperature=0.0
+            )
+            verified_problem_summary = verify_response.strip().lower().strip('"\'\'`').split()[0]
+            
+            if verified_problem_summary != generated_problem_summary:
+                logger.warning(f"[TEST_GEN] Problem mismatch: '{generated_problem_summary}' → '{verified_problem_summary}'")
+                print(f"[TEST_GEN] ❌ MISMATCH: '{generated_problem_summary}' → '{verified_problem_summary}'")
+                print("[TEST_GEN] Regenerating with correct problem...")
+                
+                # Regenerate with correct problem
+                corrected_message = f"""Problem Statement:
+                {problem}
+
+                {context_note}
+
+                🎯 CRITICAL: The correct problem is '{verified_problem_summary}' (NOT '{generated_problem_summary}').
+                Generate tests for '{verified_problem_summary}' using repository: {base_url}
+
+                CRITICAL REQUIREMENTS:
+                - Import from 'main' module ONLY
+                - Test file MUST be 'tests.py'
+                - Reference '{verified_problem_summary}' in canonical data URL
+                """
+                
+                regenerated = call_llm(
+                    [
+                        {"role": "system", "content": GENERATE_TESTCASES_WITH_MULTI_STEP_REASONING_PROMPT},
+                        {"role": "user", "content": corrected_message}
+                    ],
+                    model=CODING_MODEL,
+                    temperature=0.0
+                )
+                print(f"[TEST_GEN] ✅ Regenerated for '{verified_problem_summary}'")
+                logger.info(f"[TEST_GEN] Regenerated with correct problem: '{verified_problem_summary}'")
+                return regenerated
+            else:
+                print(f"[TEST_GEN] ✅ VALIDATED: '{verified_problem_summary}' is correct")
+                logger.info(f"[TEST_GEN] Validation success: '{verified_problem_summary}'")
+                return generated_tests
+                
+        except Exception as e:
+            logger.warning(f"[TEST_GEN] Verification failed: {e}")
+            print("[TEST_GEN] ⚠️ Verification failed, using generated tests as-is")
+            return generated_tests
+    
     def generate_tests(self, problem: str, solution: Dict[str, str]) -> Dict[str, str]:
-        """Generate tests using LLM with improved canonical test recall prompt."""
+        """Generate tests with 2-step validation: (1) Generate, (2) Validate link matches problem."""
         logger.info("="*80)
-        logger.info("TEST GENERATION - Starting process")
+        logger.info("TEST GENERATION - 2-Step Process with Link Validation")
         logger.info("="*80)
         
         # If no solution provided, generate tests based on problem statement alone
@@ -820,48 +932,46 @@ class LLMCodeGenerator(ICodeGenerator):
         # Step 1: Generate initial tests using improved prompt
         if solution:
             context_note = f"""Solution Files:
-{solution_summary}
-
-Generate comprehensive test cases for this solution."""
+                {solution_summary}
+            Generate comprehensive test cases for this solution."""
         else:
             context_note = """No solution provided yet. Generate canonical test cases based ONLY on the problem statement.
-You MUST determine the correct module name and function signatures from the problem description."""
+                You MUST determine the correct module name and function signatures from the problem description."""
         
         user_message = f"""Problem Statement:
-{problem}
+                {problem}
 
-{context_note}
+                {context_note}
 
-Follow the format and instructions provided.
+                Follow the format and instructions provided.
 
-CRITICAL REQUIREMENTS:
-- **MANDATORY: Import from 'main' module ONLY** (e.g., `from main import InputCell, ComputeCell`)
-- **MANDATORY: Test file MUST be named 'tests.py' or 'test_*.py' (NOT main.py)**
-- Use standard Python unittest or pytest
-- The solution will always be in main.py, so tests must import from main
+                CRITICAL REQUIREMENTS:
+                - **MANDATORY: Import from 'main' module ONLY** (e.g., `from main import InputCell, ComputeCell`)
+                - **MANDATORY: Test file MUST be named 'tests.py' or 'test_*.py' (NOT main.py)**
+                - Use standard Python unittest or pytest
+                - The solution will always be in main.py, so tests must import from main
 
-Example file structure:
-```
-tests.py  <- YOUR TEST FILE (REQUIRED NAME)
-import unittest
-from main import YourClass, your_function
+                Example file structure:
+                ```
+                tests.py  <- YOUR TEST FILE (REQUIRED NAME)
+                import unittest
+                from main import YourClass, your_function
 
-class TestYourClass(unittest.TestCase):
-    def test_example(self):
-        self.assertEqual(your_function(), expected_value)
-```
+                class TestYourClass(unittest.TestCase):
+                    def test_example(self):
+                        self.assertEqual(your_function(), expected_value)
+                ```
 
-DO NOT name your test file 'main.py' - that is for the solution code!
-"""
+                DO NOT name your test file 'main.py' - that is for the solution code!
+                """
         
         try:
-            # Step 1: Generate tests with canonical test recall prompt
-            logger.info("[TEST_GEN] Step 1: Generating initial tests with canonical recall prompt...")
+            # STEP 1: Generate initial tests (LLM will use its natural URL)
+            logger.info("[TEST_GEN] Step 1: Generating initial tests...")
             logger.info(f"[TEST_GEN] Using model: {CODING_MODEL}")
             logger.info("[TEST_GEN] Temperature: 0.0 (deterministic)")
-            logger.info("[TEST_GEN] System prompt: GENERATE_TESTCASES_WITH_MULTI_STEP_REASONING_PROMPT")
             
-            print("[TEST_GEN] Step 1: Generating initial tests...")
+            print("\n[TEST_GEN] Step 1: Generating initial tests...")
             response = call_llm(
                 [
                     {"role": "system", "content": GENERATE_TESTCASES_WITH_MULTI_STEP_REASONING_PROMPT},
@@ -872,21 +982,16 @@ DO NOT name your test file 'main.py' - that is for the solution code!
             )
             
             logger.info(f"[TEST_GEN] Step 1 - Received response ({len(response)} chars)")
-            logger.info("="*80)
-            logger.info("[TEST_GEN] FULL INITIAL RESPONSE FROM LLM:")
-            logger.info("="*80)
-            logger.info(response)
-            logger.info("="*80)
             
-            # Check if response contains canonical data reference
-            if 'github.com' in response.lower() or 'canonical' in response.lower():
-                logger.info("[TEST_GEN] ✓ Response contains canonical/GitHub reference - likely recalled standard tests!")
-            else:
-                logger.warning("[TEST_GEN] ⚠ Response does NOT contain canonical reference - may be generated from scratch")
+            # STEP 2: Validate and correct tests if needed
+            print("\n[TEST_GEN] Step 2: Validating generated tests...")
+            logger.info("[TEST_GEN] Step 2: Validating problem name and correcting if needed...")
             
-            # Step 2: Validate and refine tests
-            logger.info("[TEST_GEN] Step 2: Validating and refining tests...")
-            print("[TEST_GEN] Step 2: Validating and refining tests...")
+            response = self.validate_tests(problem, response, context_note)
+            
+            # STEP 3: Final validation and refinement
+            logger.info("[TEST_GEN] Step 4: Final validation and refinement...")
+            print("\n[TEST_GEN] Step 4: Final validation and refinement...")
             validation_prompt = f"""You are an expert unittest testcase reviewer. Analyze the generated tests for validity.
 
                 Problem Statement:
@@ -924,16 +1029,16 @@ DO NOT name your test file 'main.py' - that is for the solution code!
                 temperature=0.0  # Deterministic for validation
             )
             
-            logger.info(f"[TEST_GEN] Step 2 - Validation complete ({len(validated_response)} chars)")
+            logger.info(f"[TEST_GEN] Step 4 - Validation complete ({len(validated_response)} chars)")
             
-            # Step 3: Parse test files
-            logger.info("[TEST_GEN] Step 3: Parsing validated tests...")
-            print("[TEST_GEN] Step 3: Parsing validated tests...")
+            # STEP 5: Parse final test files
+            logger.info("[TEST_GEN] Step 5: Parsing final validated tests...")
+            print("\n[TEST_GEN] Step 5: Parsing final tests...")
             files = parse_file_blocks(validated_response)
             
             if not files:
-                logger.warning("[TEST_GEN] Validation parsing failed, trying original response...")
-                print("[TEST_GEN] Validation failed, using original tests...")
+                logger.warning("[TEST_GEN] Validation parsing failed, using original response...")
+                print("[TEST_GEN] Using original tests...")
                 files = parse_file_blocks(response)
             else:
                 logger.info("[TEST_GEN] ✓ Tests validated and refined")
@@ -1872,7 +1977,7 @@ class TestDrivenAgent:
         
         # Step 3: Refine
         print("\n[STEP 3] Iterative fixing...")
-        config = RefinementConfig(max_alternatives=5)  # Fewer alternatives for FIX
+        config = RefinementConfig(max_iterations=15)  # Give enough iterations for FIX
         refinement_loop = RefinementLoop(
             self.test_manager,
             self.fix_manager,
