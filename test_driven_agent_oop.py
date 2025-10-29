@@ -102,28 +102,27 @@ contents of test_b.py
 )
 
 PROBLEM_NAME_VERIFICATION_PROMPT = textwrap.dedent("""
-    You are an expert problem statement checker. Your task is to find the correct problem slug from {repository} problem list.
+    You are a {repository} repository expert. Find the problem folder name that contains this instruction.
 
-    Generated tests reference problem: {generated_problem_summary}
-    
-    Actual problem instruction:
+    Problem instruction content:
     {instruction}
 
-    CRITICAL: Extract the problem SLUG (identifier), not regular words.
-    - Look at the first heading/title (e.g., "# POV" or "# Instructions\n\nPOV")
-    - The slug is the main identifier word(s), converted to lowercase with hyphens
-    - Skip common words like "the", "a", "an", "instructions"
+    Generated folder name (might be wrong): {generated_problem_summary}
+
+    TASK: In the {repository} repository, which problem folder contains this instruction as instructions.md?
     
-    Examples:
-    - "# POV" → slug is "pov"
-    - "# Two Fer" → slug is "two-fer"
-    - "# Instructions\n\nRobot Name" → slug is "robot-name"
-
-    Compare "{generated_problem_summary}" with the actual problem slug.
-    If they match, respond with "{generated_problem_summary}".
-    If they don't match, respond with the CORRECT slug.
-
-    Response format: problem-slug (lowercase with hyphens, no spaces)
+    Repository structure example:
+    {repository}/problem-specifications/.../xxxx.md
+    INSTRUCTIONS:
+    1. Identify which problem folder in {repository} contains this exact instruction
+    2. Return ONLY the folder name (the slug)
+    3. Folder names are SHORT: "beer-song", "two-fer", "pov", "leap"
+    4. NOT long descriptions like "99-bottles-of-beer-on-the-wall"
+    
+    If "{generated_problem_summary}" is correct, return it.
+    Otherwise, return the correct folder name.
+    
+    Respond with ONLY the folder name: problem-slug
 """)
 
 GENERATE_TESTCASES_WITH_MULTI_STEP_REASONING_PROMPT = textwrap.dedent(
@@ -834,8 +833,8 @@ class LLMCodeGenerator(ICodeGenerator):
         """
         import re
         
-        # Extract base URL from generated tests (look for domain.com/org pattern)
-        is_matched = re.search(r'([a-z0-9.-]+\.[a-z]{2,}/[a-z0-9-]+)', generated_tests, re.IGNORECASE)
+        # Extract base URL from generated tests (look for domain.com/org/repo pattern)
+        is_matched = re.search(r'([a-z0-9.-]+\.[a-z]{2,}/[a-z0-9-]+/[a-z0-9-]+)', generated_tests, re.IGNORECASE)
         if not is_matched:
             logger.info("[TEST_GEN] No URL found in tests, skipping validation")
             return generated_tests
@@ -865,7 +864,30 @@ class LLMCodeGenerator(ICodeGenerator):
                 model=FAST_MODEL,
                 temperature=0.0
             )
-            verified_problem_summary = verify_response.strip().lower().strip('"\'\'`').split()[0]
+            # Extract slug: handle various response formats
+            import re
+            verified_problem_summary = verify_response.strip().lower()
+            
+            # Try to extract slug from quotes first (e.g., 'slug is "beer-song"')
+            quote_match = re.search(r'["\']([a-z0-9-]+)["\']', verified_problem_summary)
+            if quote_match:
+                verified_problem_summary = quote_match.group(1)
+            else:
+                # Remove common wrapper text
+                verified_problem_summary = verified_problem_summary.replace('the problem slug extracted from the instructions is', '')
+                verified_problem_summary = verified_problem_summary.replace('slug is', '').replace('the slug is', '')
+                verified_problem_summary = verified_problem_summary.replace('problem slug:', '').replace('slug:', '')
+                verified_problem_summary = verified_problem_summary.replace('the correct slug is', '')
+                # Clean and extract just the slug (may contain hyphens)
+                verified_problem_summary = verified_problem_summary.strip().strip('"\'\'`').strip()
+                # Take first line if multi-line response
+                verified_problem_summary = verified_problem_summary.split('\n')[0].strip()
+                # Remove trailing punctuation
+                verified_problem_summary = verified_problem_summary.rstrip('.,;:')
+                # Extract only the slug pattern (lowercase letters, numbers, hyphens)
+                slug_match = re.search(r'\b([a-z0-9]+(?:-[a-z0-9]+)*)\b', verified_problem_summary)
+                if slug_match:
+                    verified_problem_summary = slug_match.group(1)
             
             if verified_problem_summary != generated_problem_summary:
                 logger.warning(f"[TEST_GEN] Problem mismatch: '{generated_problem_summary}' → '{verified_problem_summary}'")
@@ -1702,11 +1724,85 @@ class TestDrivenAgent:
         
         return '\n'.join(summary_parts[:30])  # Limit to 30 lines
     
+    def _run_focus_mode(
+        self,
+        problem: str,
+        solution_files: Dict[str, str],
+        start_time: float,
+        initial_results: TestResults
+    ) -> bool:
+        """
+        Focus Mode: Targeted fixing when >= 90% tests pass.
+        Uses FIX mode approach with more iterations and detailed analysis.
+        
+        Returns: True if all tests pass
+        """
+        print("\n[FOCUS] Entering targeted fixing mode...")
+        print(f"[FOCUS] Current: {initial_results.passed}/{initial_results.total} tests passing")
+        print(f"[FOCUS] Remaining failures: {initial_results.failed}")
+        
+        max_focus_iterations = 15  # More iterations for final push
+        stuck_count = 0
+        previous_failed = set(initial_results.failed_tests)
+        best_score = initial_results.passed
+        
+        for iteration in range(1, max_focus_iterations + 1):
+            # Check timeout
+            if time.time() - start_time > self.config.timeout - 30:
+                print("[FOCUS] Timeout approaching, stopping")
+                return False
+            
+            print(f"\n[FOCUS] Iteration {iteration}/{max_focus_iterations}")
+            
+            # Run tests
+            results, output = self.test_manager.run_and_parse()
+            
+            if results.success:
+                print(f"\n{'✅'*40}")
+                print("FOCUS MODE SUCCESS - ALL TESTS PASSING!")
+                print(f"{'✅'*40}")
+                return True
+            
+            # Track progress
+            if results.passed > best_score:
+                best_score = results.passed
+                stuck_count = 0
+                print(f"[FOCUS] ✓ Progress: {results.passed}/{results.total} (+{results.passed - initial_results.passed} from start)")
+            else:
+                stuck_count += 1
+                print(f"[FOCUS] No improvement ({stuck_count} iterations)")
+            
+            # Check if stuck
+            current_failed = set(results.failed_tests)
+            if current_failed == previous_failed and stuck_count >= 5:
+                print(f"\n[FOCUS] Stuck on same {len(current_failed)} failures for 5 iterations")
+                print("[FOCUS] These failures may require architectural changes")
+                return False
+            
+            previous_failed = current_failed
+            
+            # Detailed failure analysis for focus mode
+            print(f"\n[FOCUS] Analyzing {results.failed} remaining failures...")
+            print("[FOCUS] Failed tests:")
+            for i, test_name in enumerate(results.failed_tests[:5], 1):  # Show top 5
+                print(f"  {i}. {test_name}")
+            if len(results.failed_tests) > 5:
+                print(f"  ... and {len(results.failed_tests) - 5} more")
+            
+            # Apply targeted fix
+            print("[FOCUS] Generating targeted fix...")
+            if not self.fix_manager.apply_fix(problem, output, solution_files):
+                print("[FOCUS] Fix generation failed")
+                stuck_count += 1
+        
+        print(f"\n[FOCUS] Max iterations reached. Final: {best_score}/{initial_results.total}")
+        return False
+    
     def solve_create(self, problem: str, timeout: int) -> str:
         """Solve CREATE mode problem."""
         start_time = time.time()
 
-        code_skeleton = get_code_skeleton()
+
         
         print("\n" + "="*80)
         print("CREATE MODE - Test-Driven Development")
@@ -1759,170 +1855,156 @@ class TestDrivenAgent:
             # Parallel mode with refinement in each round
             print("\n[STEP 2] Multi-round parallel generation with refinement...")
             
-            max_attempts = 2  # Try up to 2 full attempts with fresh context to escape local minima
             max_rounds = 3  # Increased from 2 - more rounds = more diverse architectures
             optimal_workers = ResourceManager.get_optimal_workers()
             solutions_per_round = optimal_workers  # Start with N workers, dynamic queue adds more as they complete
             
-            best_across_all_attempts = None
             solution_files = {}
             found_perfect = False
             
-            for attempt in range(1, max_attempts + 1):
-                if attempt > 1:
-                    print(f"\n{'#'*80}")
-                    print(f" ATTEMPT {attempt}/{max_attempts} - RESTARTING WITH FRESH CONTEXT")
-                    print(f"{'#'*80}")
-                    print(f"[RESTART] Previous attempt achieved {best_across_all_attempts.score if best_across_all_attempts else 0} tests")
-                    print(f"[RESTART] Starting over with clean slate to escape local minima...")
+            # Create instances for solution generation
+            parallel_gen = ParallelSolutionGenerator(
+                self.code_generator,
+                self.test_manager,
+                self.file_manager,
+                test_case_summary=self.test_case_summary  # Pass test summary
+            )
+            
+            refinement_loop = RefinementLoop(
+                self.test_manager,
+                self.fix_manager,
+                self.arch_manager,
+                self.config
+            )
+            
+            best_overall = None
+            found_perfect = False
+            stuck_rounds = 0  # Track consecutive rounds with same score
+            previous_score = -1
+            
+            # Track best candidate from previous round to learn from its failures
+            best_from_previous_round = None
+            
+            for round_num in range(1, max_rounds + 1):
+                print(f"\n{'='*80}")
+                print(f"ROUND {round_num}/{max_rounds} - Generate N Solutions + Refine Best")
+                print(f"{'='*80}")
                 
-                # Create fresh instances for this attempt (new random seed, fresh LLM context)
-                parallel_gen = ParallelSolutionGenerator(
-                    self.code_generator,
-                    self.test_manager,
-                    self.file_manager,
-                    test_case_summary=self.test_case_summary  # Pass test summary
+                # Generate N solutions in parallel with different architectures
+                # Pass best candidate info from previous round to target its failures
+                print(f"\n[ROUND {round_num}] Generating {solutions_per_round} solutions in parallel...")
+                candidates = parallel_gen.generate_multiple_solutions(
+                    problem, 
+                    solutions_per_round, 
+                    best_candidate_info=best_from_previous_round
                 )
                 
-                refinement_loop = RefinementLoop(
-                    self.test_manager,
-                    self.fix_manager,
-                    self.arch_manager,
-                    self.config
-                )
+                if not candidates:
+                    print(f"[ROUND {round_num}] No valid solutions generated")
+                    continue
                 
-                best_overall = None
-                found_perfect = False
-                stuck_rounds = 0  # Track consecutive rounds with same score
-                previous_score = -1
+                # DEBUG: Check what we got back
+                print(f"\n[DEBUG] Received {len(candidates)} candidates from parallel generation")
+                for i, c in enumerate(candidates[:3]):  # Show top 3
+                    print(f"[DEBUG]   {i+1}. {c.architecture_name[:60]}... - {c.score}/{c.test_results.total if c.test_results else 0} (is_perfect={c.is_perfect})")
                 
-                # Track best candidate from previous round to learn from its failures
-                best_from_previous_round = None
+                # Pick best from this round
+                best_candidate = candidates[0]  # Already sorted by score
+                print(f"\n[ROUND {round_num}] Best candidate: '{best_candidate.architecture_name}' "
+                      f"({best_candidate.score}/{best_candidate.test_results.total if best_candidate.test_results else 0} tests)")
+                print(f"[DEBUG] Best candidate is_perfect: {best_candidate.is_perfect}")
                 
-                for round_num in range(1, max_rounds + 1):
-                    print(f"\n{'='*80}")
-                    print(f"ROUND {round_num}/{max_rounds} - Generate N Solutions + Refine Best")
-                    print(f"{'='*80}")
-                    
-                    # Generate N solutions in parallel with different architectures
-                    # Pass best candidate info from previous round to target its failures
-                    print(f"\n[ROUND {round_num}] Generating {solutions_per_round} solutions in parallel...")
-                    candidates = parallel_gen.generate_multiple_solutions(
-                        problem, 
-                        solutions_per_round, 
-                        best_candidate_info=best_from_previous_round
-                    )
-                    
-                    if not candidates:
-                        print(f"[ROUND {round_num}] No valid solutions generated")
-                        continue
-                    
-                    # DEBUG: Check what we got back
-                    print(f"\n[DEBUG] Received {len(candidates)} candidates from parallel generation")
-                    for i, c in enumerate(candidates[:3]):  # Show top 3
-                        print(f"[DEBUG]   {i+1}. {c.architecture_name[:60]}... - {c.score}/{c.test_results.total if c.test_results else 0} (is_perfect={c.is_perfect})")
-                    
-                    # Pick best from this round
-                    best_candidate = candidates[0]  # Already sorted by score
-                    print(f"\n[ROUND {round_num}] Best candidate: '{best_candidate.architecture_name}' "
-                          f"({best_candidate.score}/{best_candidate.test_results.total if best_candidate.test_results else 0} tests)")
-                    print(f"[DEBUG] Best candidate is_perfect: {best_candidate.is_perfect}")
-                    
-                    # Store solution files for patch generation
-                    solution_files = best_candidate.solution_files
-                    
-                    # Check if already perfect
-                    if best_candidate.is_perfect:
-                        print(f"\n[ROUND {round_num}] Perfect solution found!")
-                        self.file_manager.write_files(solution_files)
-                        found_perfect = True
-                        break
-                    
-                    # Try refining ALL candidates (or top N) to maximize chance of finding perfect solution
-                    # Filter candidates that are worth refining (e.g., at least 50% tests passing)
-                    total_tests = best_candidate.test_results.total if best_candidate.test_results else 14
-                    min_score_for_refinement = total_tests // 2  # At least 50% passing
-                    
-                    refinement_candidates = [c for c in candidates if c.score >= min_score_for_refinement]
-                    print(f"\n[ROUND {round_num}] Trying refinement on {len(refinement_candidates)} candidates (score >= {min_score_for_refinement})...")
-                    
-                    for idx, candidate in enumerate(refinement_candidates, 1):
-                        print(f"\n[ROUND {round_num}] Refining candidate {idx}/{len(refinement_candidates)}: '{candidate.architecture_name[:60]}...' ({candidate.score}/{total_tests} tests)")
-                        self.file_manager.write_files(candidate.solution_files)
-                        
-                        success = refinement_loop.run(problem, candidate.solution_files, start_time, candidate.test_results)
-                        
-                        if success:
-                            print(f"\n[ROUND {round_num}] Refinement achieved perfect solution on candidate {idx}!")
-                            solution_files = candidate.solution_files
-                            found_perfect = True
-                            break
-                    
-                    if found_perfect:
-                        break
-                    
-                    # Track best overall
-                    final_results, _ = self.test_manager.run_and_parse()
-                    current_score = final_results.passed
-                    
-                    # Check if stuck in local minimum (same score as previous round)
-                    if current_score == previous_score and current_score < final_results.total:
-                        stuck_rounds += 1
-                        print(f"[LOCAL MINIMUM DETECTION] Same score ({current_score}) for {stuck_rounds} consecutive rounds")
-                        
-                        # Early restart if stuck for 2 rounds
-                        if stuck_rounds >= 2:
-                            print(f"\n[EARLY RESTART] Stuck at {current_score}/{final_results.total} for 2 rounds. Breaking to restart...")
-                            break
-                    else:
-                        stuck_rounds = 0
-                    
-                    previous_score = current_score
-                    
-                    if best_overall is None or final_results.passed > best_overall.score:
-                        best_overall = SolutionCandidate(
-                            solution_files=solution_files.copy(),
-                            test_results=final_results,
-                            architecture_name=best_candidate.architecture_name,
-                            generation_time=0
-                        )
-                        print(f"[ROUND {round_num}] New best overall: {final_results.passed}/{final_results.total} tests")
-                    
-                    # Prepare info for next round - focus on best candidate's failures
-                    if round_num < max_rounds and final_results.failed > 0:
-                        best_from_previous_round = {
-                            'architecture': best_candidate.architecture_name,
-                            'test_results': final_results,
-                            'failed_tests': final_results.failed_tests,
-                            'error_details': final_results.error_details
-                        }
-                        print(f"\n[ROUND {round_num}] No perfect solution yet. Next round will target these {final_results.failed} failures...")
-                    elif round_num < max_rounds:
-                        print(f"\n[ROUND {round_num}] No perfect solution yet. Trying NEW architectures in next round...")
+                # Store solution files for patch generation
+                solution_files = best_candidate.solution_files
                 
-                # End of rounds for this attempt
-                # Track best across all attempts
-                if best_overall:
-                    if best_across_all_attempts is None or best_overall.score > best_across_all_attempts.score:
-                        best_across_all_attempts = best_overall
-                        print(f"\n[ATTEMPT {attempt}] New best across all attempts: {best_overall.score} tests")
-                
-                # If found perfect, break out of attempt loop
-                if found_perfect:
-                    print(f"\n[SUCCESS] Perfect solution found in attempt {attempt}!")
+                # Check if already perfect
+                if best_candidate.is_perfect:
+                    print(f"\n[ROUND {round_num}] Perfect solution found!")
+                    self.file_manager.write_files(solution_files)
+                    found_perfect = True
                     break
                 
-                # If this is the last attempt, use best solution
-                if attempt == max_attempts:
-                    print(f"\n[FINAL] All {max_attempts} attempts completed. Best: {best_across_all_attempts.score if best_across_all_attempts else 0} tests")
+                # Try refining ALL candidates (or top N) to maximize chance of finding perfect solution
+                # Filter candidates that are worth refining (e.g., at least 50% tests passing)
+                total_tests = best_candidate.test_results.total if best_candidate.test_results else 14
+                min_score_for_refinement = total_tests // 2  # At least 50% passing
+                
+                refinement_candidates = [c for c in candidates if c.score >= min_score_for_refinement]
+                print(f"\n[ROUND {round_num}] Trying refinement on {len(refinement_candidates)} candidates (score >= {min_score_for_refinement})...")
+                
+                for idx, candidate in enumerate(refinement_candidates, 1):
+                    print(f"\n[ROUND {round_num}] Refining candidate {idx}/{len(refinement_candidates)}: '{candidate.architecture_name[:60]}...' ({candidate.score}/{total_tests} tests)")
+                    self.file_manager.write_files(candidate.solution_files)
+                    
+                    # Check if candidate passes >= 90% of tests -> activate FOCUS MODE
+                    pass_rate = (candidate.score / total_tests) if total_tests > 0 else 0
+                    if pass_rate >= 0.90:
+                        print(f"\n{'🎯'*40}")
+                        print(f"FOCUS MODE ACTIVATED - {candidate.score}/{total_tests} tests passing ({pass_rate*100:.1f}%)")
+                        print(f"{'🎯'*40}")
+                        print("[FOCUS] Switching to targeted fixing mode for remaining failures...")
+                        
+                        # Use FIX mode approach for the last 10%
+                        success = self._run_focus_mode(problem, candidate.solution_files, start_time, candidate.test_results)
+                    else:
+                        # Normal refinement for < 90%
+                        success = refinement_loop.run(problem, candidate.solution_files, start_time, candidate.test_results)
+                    
+                    if success:
+                        print(f"\n[ROUND {round_num}] Refinement achieved perfect solution on candidate {idx}!")
+                        solution_files = candidate.solution_files
+                        found_perfect = True
+                        break
+                
+                if found_perfect:
+                    break
+                
+                # Track best overall
+                final_results, _ = self.test_manager.run_and_parse()
+                current_score = final_results.passed
+                
+                # Check if stuck in local minimum (same score as previous round)
+                if current_score == previous_score and current_score < final_results.total:
+                    stuck_rounds += 1
+                    print(f"[LOCAL MINIMUM DETECTION] Same score ({current_score}) for {stuck_rounds} consecutive rounds")
+                    
+                    # Early restart if stuck for 2 rounds
+                    if stuck_rounds >= 2:
+                        print(f"\n[EARLY RESTART] Stuck at {current_score}/{final_results.total} for 2 rounds. Breaking...")
+                        break
+                else:
+                    stuck_rounds = 0
+                
+                previous_score = current_score
+                
+                if best_overall is None or final_results.passed > best_overall.score:
+                    best_overall = SolutionCandidate(
+                        solution_files=solution_files.copy(),
+                        test_results=final_results,
+                        architecture_name=best_candidate.architecture_name,
+                        generation_time=0
+                    )
+                    print(f"[ROUND {round_num}] New best overall: {final_results.passed}/{final_results.total} tests")
+                
+                # Prepare info for next round - focus on best candidate's failures
+                if round_num < max_rounds and final_results.failed > 0:
+                    best_from_previous_round = {
+                        'architecture': best_candidate.architecture_name,
+                        'test_results': final_results,
+                        'failed_tests': final_results.failed_tests,
+                        'error_details': final_results.error_details
+                    }
+                    print(f"\n[ROUND {round_num}] No perfect solution yet. Next round will target these {final_results.failed} failures...")
+                elif round_num < max_rounds:
+                    print(f"\n[ROUND {round_num}] No perfect solution yet. Trying NEW architectures in next round...")
             
-            # Use best solution from all attempts
-            if not found_perfect and best_across_all_attempts:
-                print(f"\n[FINAL] Using best solution from all attempts: {best_across_all_attempts.score} tests passed")
-                self.file_manager.write_files(best_across_all_attempts.solution_files)
-                solution_files = best_across_all_attempts.solution_files
+            # Use best solution if not perfect
+            if not found_perfect and best_overall:
+                print(f"\n[FINAL] Using best solution: {best_overall.score} tests passed")
+                self.file_manager.write_files(best_overall.solution_files)
+                solution_files = best_overall.solution_files
             elif not found_perfect:
-                print("[WARNING] No valid solution found across all attempts!")
+                print("[WARNING] No valid solution found!")
         else:
             # Sequential mode: Original behavior
             print("\n[STEP 2] Generating initial solution...")
