@@ -1457,8 +1457,118 @@ class TestDrivenGuidance:
         self.trace_learner.finalize_trace(overall_success, self.problem_type, test_pass_rate)
 
 
+class StrategyOutcomeTracker:
+    """Track and learn from strategy outcomes"""
+    
+    def __init__(self, outcomes_file: str = ".strategy_outcomes.json"):
+        self.outcomes_file = outcomes_file
+        self.outcomes = self._load_outcomes()
+        
+    def _load_outcomes(self) -> List[Dict[str, Any]]:
+        """Load historical strategy outcomes"""
+        if os.path.exists(self.outcomes_file):
+            try:
+                with open(self.outcomes_file, 'r') as f:
+                    return json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError, IOError):
+                return []
+        return []
+    
+    def _save_outcomes(self):
+        """Save outcomes to disk"""
+        try:
+            with open(self.outcomes_file, 'w') as f:
+                json.dump(self.outcomes[-200:], f, indent=2)  # Keep last 200
+        except (IOError, OSError):
+            pass
+    
+    def record_outcome(self, strategy: Dict[str, Any], problem_type: str, 
+                      success: bool, test_pass_rate: float = 0.0, 
+                      steps_taken: int = 0, execution_time: float = 0.0):
+        """Record strategy execution outcome"""
+        outcome = {
+            "strategy_name": strategy.get("name", "unknown"),
+            "strategy_type": self._classify_strategy(strategy),
+            "problem_type": problem_type,
+            "success": success,
+            "test_pass_rate": test_pass_rate,
+            "steps_taken": steps_taken,
+            "execution_time": execution_time,
+            "complexity": strategy.get("complexity", "unknown"),
+            "risk": strategy.get("risk", "unknown"),
+            "timestamp": time.time()
+        }
+        self.outcomes.append(outcome)
+        self._save_outcomes()
+    
+    def _classify_strategy(self, strategy: Dict[str, Any]) -> str:
+        """Classify strategy into broad categories"""
+        name = strategy.get("name", "").lower()
+        desc = strategy.get("description", "").lower()
+        
+        if "conservative" in name or "minimal" in name or "targeted" in desc:
+            return "conservative"
+        elif "comprehensive" in name or "root cause" in desc or "thorough" in desc:
+            return "comprehensive"
+        elif "incremental" in name or "iterative" in desc:
+            return "incremental"
+        elif "refactor" in name or "redesign" in desc:
+            return "refactor"
+        else:
+            return "general"
+    
+    def get_success_rate(self, strategy_name: str, problem_type: str = None) -> float:
+        """Get historical success rate for a strategy"""
+        matching = [
+            o for o in self.outcomes
+            if o["strategy_name"] == strategy_name and 
+            (problem_type is None or o["problem_type"] == problem_type)
+        ]
+        
+        if not matching:
+            return 0.5  # Neutral prior
+        
+        return sum(o["success"] for o in matching) / len(matching)
+    
+    def get_strategy_type_performance(self, strategy_type: str, problem_type: str = None) -> Dict[str, float]:
+        """Get performance metrics for a strategy type"""
+        matching = [
+            o for o in self.outcomes
+            if o["strategy_type"] == strategy_type and
+            (problem_type is None or o["problem_type"] == problem_type)
+        ]
+        
+        if not matching:
+            return {"success_rate": 0.5, "avg_test_pass": 0.5, "avg_efficiency": 0.5}
+        
+        return {
+            "success_rate": sum(o["success"] for o in matching) / len(matching),
+            "avg_test_pass": sum(o["test_pass_rate"] for o in matching) / len(matching),
+            "avg_efficiency": sum(1.0 / max(o["steps_taken"], 1) for o in matching) / len(matching),
+            "sample_count": len(matching)
+        }
+    
+    def get_best_strategy_type(self, problem_type: str) -> str:
+        """Get historically best performing strategy type for problem type"""
+        strategy_types = ["conservative", "comprehensive", "incremental", "refactor", "general"]
+        
+        performances = {
+            st: self.get_strategy_type_performance(st, problem_type)
+            for st in strategy_types
+        }
+        
+        # Score by success rate + test pass rate
+        def score(perf):
+            if perf["sample_count"] < 3:  # Not enough data
+                return 0.5
+            return perf["success_rate"] * 0.6 + perf["avg_test_pass"] * 0.4
+        
+        best_type = max(performances.items(), key=lambda x: score(x[1]))
+        return best_type[0]
+
+
 class StrategicPlanner:
-    """Generates high-level solution strategies"""
+    """Adaptive strategic planner that learns from outcomes"""
 
     STRATEGY_PROMPT = textwrap.dedent(
         """
@@ -1470,6 +1580,8 @@ class StrategicPlanner:
             - Confidence score (0-1)
             
             Problem: {problem_statement}
+            
+            {context_hint}
             
             Respond in JSON format:
             {{
@@ -1489,12 +1601,32 @@ class StrategicPlanner:
 
     def __init__(self, model_name: str = DEEPSEEK_MODEL_NAME):
         self.model_name = model_name
+        self.outcome_tracker = StrategyOutcomeTracker()
+        self.selected_strategy = None  # Track selected strategy for later outcome recording
 
-    def generate_strategies(self, problem_statement: str) -> Dict[str, Any]:
+    def generate_strategies(self, problem_statement: str, problem_type: str = "unknown") -> Dict[str, Any]:
+        """Generate strategies with historical context"""
+        
+        # Get historical insights
+        best_strategy_type = self.outcome_tracker.get_best_strategy_type(problem_type)
+        
+        context_hint = ""
+        if best_strategy_type and best_strategy_type != "general":
+            perf = self.outcome_tracker.get_strategy_type_performance(best_strategy_type, problem_type)
+            if perf["sample_count"] >= 3:
+                context_hint = f"""
+                Historical insight: For '{problem_type}' problems, '{best_strategy_type}' strategies have 
+                {perf['success_rate']:.1%} success rate (based on {perf['sample_count']} past cases).
+                Consider including a {best_strategy_type} approach in your strategies.
+                """
+        
         try:
             messages = [
-                {"role": "system", "content": "You are a strategic planning expert."},
-                {"role": "user", "content": self.STRATEGY_PROMPT.format(problem_statement=problem_statement)}
+                {"role": "system", "content": "You are a strategic planning expert who learns from past outcomes."},
+                {"role": "user", "content": self.STRATEGY_PROMPT.format(
+                    problem_statement=problem_statement,
+                    context_hint=context_hint
+                )}
             ]
 
             response = EnhancedNetwork.make_request(messages, model=self.model_name)
@@ -1515,37 +1647,103 @@ class StrategicPlanner:
         except Exception as e:
             pass
 
-        return {
-            "strategies": [
-                {
-                    "name": "Conservative Fix",
-                    "description": "Minimal targeted changes",
-                    "steps": ["Locate issue", "Apply minimal fix", "Test"],
-                    "complexity": "low",
-                    "risk": "low",
-                    "confidence": 0.7
-                },
-                {
-                    "name": "Comprehensive Solution",
-                    "description": "Root cause analysis and fix",
-                    "steps": ["Analyze root cause", "Design solution", "Implement", "Verify"],
-                    "complexity": "high",
-                    "risk": "medium",
-                    "confidence": 0.6
-                }
-            ]
-        }
+        # Fallback: Use historically successful strategy types
+        return self._generate_fallback_strategies(problem_type)
+    
+    def _generate_fallback_strategies(self, problem_type: str) -> Dict[str, Any]:
+        """Generate fallback strategies based on historical data"""
+        best_type = self.outcome_tracker.get_best_strategy_type(problem_type)
+        
+        strategies = []
+        
+        # Always include a conservative option
+        strategies.append({
+            "name": "Conservative Fix",
+            "description": "Minimal targeted changes to address the specific issue",
+            "steps": ["Locate issue", "Apply minimal fix", "Test", "Verify no side effects"],
+            "complexity": "low",
+            "risk": "low",
+            "confidence": 0.7
+        })
+        
+        # Add the historically best strategy type
+        if best_type == "comprehensive":
+            strategies.append({
+                "name": "Comprehensive Solution",
+                "description": "Root cause analysis and thorough fix",
+                "steps": ["Analyze root cause", "Design solution", "Implement with edge cases", "Verify"],
+                "complexity": "high",
+                "risk": "medium",
+                "confidence": 0.6
+            })
+        elif best_type == "incremental":
+            strategies.append({
+                "name": "Incremental Approach",
+                "description": "Step-by-step fixes with validation at each stage",
+                "steps": ["Fix core issue", "Test", "Add edge case handling", "Test", "Finalize"],
+                "complexity": "medium",
+                "risk": "low",
+                "confidence": 0.65
+            })
+        else:
+            # Default comprehensive
+            strategies.append({
+                "name": "Comprehensive Solution",
+                "description": "Root cause analysis and fix",
+                "steps": ["Analyze root cause", "Design solution", "Implement", "Verify"],
+                "complexity": "high",
+                "risk": "medium",
+                "confidence": 0.6
+            })
+        
+        return {"strategies": strategies}
 
-    def select_best_strategy(self, strategies: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Select best strategy based on scoring"""
+    def select_best_strategy(self, strategies: List[Dict[str, Any]], problem_type: str = "unknown") -> Dict[str, Any]:
+        """Select best strategy using data-driven scoring"""
 
         def score_strategy(s):
-            confidence = s.get("confidence", 0.5)
-            risk_score = {"low": 1.0, "medium": 0.7, "high": 0.4}.get(s.get("risk", "medium"), 0.7)
-            complexity_score = {"low": 1.0, "medium": 0.8, "high": 0.6}.get(s.get("complexity", "medium"), 0.8)
-            return confidence * 0.5 + risk_score * 0.3 + complexity_score * 0.2
-
-        return max(strategies, key=score_strategy)
+            strategy_type = self.outcome_tracker._classify_strategy(s)
+            
+            # Get historical performance
+            type_performance = self.outcome_tracker.get_strategy_type_performance(strategy_type, problem_type)
+            
+            # Combine LLM confidence with historical data
+            llm_confidence = s.get("confidence", 0.5)
+            
+            # If we have enough historical data, weight it heavily
+            if type_performance["sample_count"] >= 5:
+                # Data-driven: 70% historical, 30% LLM confidence
+                historical_score = (
+                    type_performance["success_rate"] * 0.6 + 
+                    type_performance["avg_test_pass"] * 0.3 +
+                    type_performance["avg_efficiency"] * 0.1
+                )
+                final_score = historical_score * 0.7 + llm_confidence * 0.3
+            else:
+                # Limited data: use LLM confidence more heavily, adjust by risk/complexity
+                risk_score = {"low": 1.0, "medium": 0.7, "high": 0.4}.get(s.get("risk", "medium"), 0.7)
+                complexity_score = {"low": 1.0, "medium": 0.8, "high": 0.6}.get(s.get("complexity", "medium"), 0.8)
+                final_score = llm_confidence * 0.5 + risk_score * 0.3 + complexity_score * 0.2
+            
+            return final_score
+        
+        best_strategy = max(strategies, key=score_strategy)
+        self.selected_strategy = best_strategy  # Store for outcome recording
+        return best_strategy
+    
+    def record_strategy_outcome(self, problem_type: str, success: bool, 
+                               test_pass_rate: float = 0.0, steps_taken: int = 0,
+                               execution_time: float = 0.0):
+        """Record the outcome of the selected strategy"""
+        if self.selected_strategy:
+            self.outcome_tracker.record_outcome(
+                self.selected_strategy,
+                problem_type,
+                success,
+                test_pass_rate,
+                steps_taken,
+                execution_time
+            )
 
 
 class Verifier:
@@ -1657,13 +1855,22 @@ class PEVWorkflow:
             else:
                 self.guidance = None
 
-    def run_planning_phase(self, problem_statement: str) -> Dict[str, Any]:
-        """Phase 1: Strategic Planning"""
+    def run_planning_phase(self, problem_statement: str, problem_type: str = "unknown") -> Dict[str, Any]:
+        """Phase 1: Strategic Planning with outcome tracking"""
         if not self.enable_pev:
             return {"name": "Default", "description": "Standard approach"}
-        strategies = self.planner.generate_strategies(problem_statement)
-        selected = self.planner.select_best_strategy(strategies["strategies"])
+        strategies = self.planner.generate_strategies(problem_statement, problem_type)
+        selected = self.planner.select_best_strategy(strategies["strategies"], problem_type)
         return selected
+    
+    def record_strategy_outcome(self, problem_type: str, success: bool, 
+                               test_pass_rate: float = 0.0, steps_taken: int = 0,
+                               execution_time: float = 0.0):
+        """Record strategy outcome for learning"""
+        if self.enable_pev and self.planner:
+            self.planner.record_strategy_outcome(
+                problem_type, success, test_pass_rate, steps_taken, execution_time
+            )
 
     def initialize_guidance(self, problem_statement: str, problem_type: str = "unknown"):
         """Phase 2: Initialize Test-Driven Guidance"""
@@ -3968,11 +4175,17 @@ def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: s
 
     pev = PEVWorkflow(enable_pev=enable_pev, enable_test_guidance=enable_test_guidance)
 
-    strategy = pev.run_planning_phase(problem_statement)
+    # Determine problem type for strategy and guidance
+    problem_type = "bug_fix"  # Can be enhanced with problem_statement analysis
+    
+    # Run planning with problem type for better strategy selection
+    strategy = pev.run_planning_phase(problem_statement, problem_type)
     
     # Initialize test-driven guidance
-    problem_type = "bug_fix"  # Can be determined from problem_statement analysis
     pev.initialize_guidance(problem_statement, problem_type)
+    
+    # Track workflow start time for strategy outcome
+    workflow_start_time = time.time()
 
     strategy_guidance = f"\n\nStrategic Plan: {strategy.get('name', 'Default')} - {strategy.get('description', 'Standard approach')}"
 
@@ -4200,9 +4413,22 @@ def fix_task_solve_workflow(problem_statement: str, *, timeout: int, run_id_1: s
         completed_phases = [p['phase'] for p in phase_manager.phase_history]
     
     # Finalize test-driven guidance and save learned traces
+    overall_success = next_tool_name == "finish" and not cot.thoughts[-1].is_error if cot.thoughts else False
+    
     if enable_pev and enable_test_guidance and pev.guidance:
-        overall_success = next_tool_name == "finish" and not cot.thoughts[-1].is_error if cot.thoughts else False
         pev.guidance.finalize(overall_success)
+    
+    # Record strategy outcome for learning
+    if enable_pev:
+        test_pass_rate = pev.guidance.test_history[-1]['pass_rate'] if pev.guidance and pev.guidance.test_history else 0.0
+        execution_time = time.time() - workflow_start_time
+        pev.record_strategy_outcome(
+            problem_type=problem_type,
+            success=overall_success,
+            test_pass_rate=test_pass_rate,
+            steps_taken=step + 1,
+            execution_time=execution_time
+        )
     
     patch = tool_manager.get_final_git_patch()
 
