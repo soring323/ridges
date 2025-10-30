@@ -563,7 +563,7 @@ async def validator_update_evaluation_run(
             if request.eval_logs is not None and await check_if_evaluation_run_logs_exist(evaluation_run.evaluation_run_id, EvaluationRunLogType.eval):
                 raise HTTPException(
                     status_code=422,
-                    detail="The agent logs can only be provided if none already exist."
+                    detail="The eval logs can only be provided if none already exist."
                 )
 
             # Update the evaluation run to error
@@ -572,7 +572,7 @@ async def validator_update_evaluation_run(
             evaluation_run.error_message = request.error_message
             evaluation_run.finished_or_errored_at = datetime.now()
 
-            # Create evaluation run log(s)
+            # Create evaluation run logs
             if request.agent_logs is not None:
                 await create_evaluation_run_log(evaluation_run.evaluation_run_id, EvaluationRunLogType.agent, request.agent_logs)
             if request.eval_logs is not None:
