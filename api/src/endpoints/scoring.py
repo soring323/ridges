@@ -23,19 +23,33 @@ async def weights() -> Dict[str, float]:
     """
     weights: Dict[str, float] = {}
 
+    # For cases where there is no top miner, or the top miner is not registered on the subnet
+    OWNER_HOTKEY = "5EsNzkZ3DwDqCsYmSJDeGXX51dQJd5broUCH6dbDjvkTcicD"
+
+
+
+    # If we need to manually burn, set this to True.
+    BURN = True
+    if BURN:
+        weights[OWNER_HOTKEY] = 1.0
+        return weights
+
+
+
+
+
     top_agent_hotkey = await get_weight_receiving_agent_hotkey()
 
-    # For cases where there is no top miner, or the top miner is not registered on the subnet
-    owner_hotkey = "5EsNzkZ3DwDqCsYmSJDeGXX51dQJd5broUCH6dbDjvkTcicD"
+    
 
     if top_agent_hotkey is not None:
         if check_if_hotkey_is_registered(top_agent_hotkey):
             weights[top_agent_hotkey] = 1.0
         else:
-            logger.error(f"Top agent {top_agent_hotkey} not registered on subnet. Setting weight to {owner_hotkey}")
-            weights[owner_hotkey] = 1.0
+            logger.error(f"Top agent {top_agent_hotkey} not registered on subnet. Setting weight to owner hotkey ({OWNER_HOTKEY})")
+            weights[OWNER_HOTKEY] = 1.0
     else:
-        logger.info(f"No top agent found. Setting weight to {owner_hotkey}")
-        weights[owner_hotkey] = 1.0
+        logger.info(f"No top agent found. Setting weight to owner hotkey ({OWNER_HOTKEY})")
+        weights[OWNER_HOTKEY] = 1.0
 
     return weights
