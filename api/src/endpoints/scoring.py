@@ -28,11 +28,11 @@ async def weights() -> Dict[str, float]:
 
 
 
-    # If we need to manually burn, set this to True.
-    BURN = True
-    if BURN:
-        weights[OWNER_HOTKEY] = 1.0
-        return weights
+    # # If we need to manually burn, set this to True.
+    # BURN = True
+    # if BURN:
+    #     weights[OWNER_HOTKEY] = 1.0
+    #     return weights
 
 
 
