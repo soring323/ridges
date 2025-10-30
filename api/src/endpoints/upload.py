@@ -78,10 +78,10 @@ async def post_agent(
     Rate limiting may apply based on configuration.
     """
 
-    raise HTTPException(
-        status_code=503,
-        detail="Uploads have been temporarily disabled while the new problem set is being implemented."
-    )
+    # raise HTTPException(
+    #     status_code=503,
+    #     detail="Uploads have been temporarily disabled while the new problem set is being implemented."
+    # )
 
     # Extract upload attempt data for tracking
     miner_hotkey = get_miner_hotkey(file_info)
