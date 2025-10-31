@@ -739,6 +739,11 @@ def test_agent(
         agent_source_code = f.read()
 
     run_id = str(uuid.uuid4())
+    
+    # Create an event to track evaluation completion
+    import threading
+    evaluation_complete = threading.Event()
+    evaluation_started = threading.Event()
 
     def on_finish(result):
         time.sleep(0.5)
@@ -793,9 +798,16 @@ def test_agent(
                 print()
                 print()
                 print()
+                
+                # Signal that evaluation is complete
+                evaluation_complete.set()
 
+            # Start evaluation
+            evaluation_started.set()
+            console.print("\n🧪 Starting evaluation...", style="yellow")
             suite.evaluate_solution_diff(sandbox_manager, run_id, problem_name, diff, on_finish_eval, timeout=timeout)
         else:
+            # Agent failed, no evaluation to run
             print("========== ERROR ==========")
             print(result.get("error", ""))
 
@@ -807,14 +819,27 @@ def test_agent(
 
             print("========== LOGS ==========")
             print(result.get("logs", ""))
+            
+            # No evaluation to run since agent failed
+            evaluation_complete.set()
 
     try:
         suite.run_agent_in_sandbox_for_problem(sandbox_manager, run_id, problem_name, agent_source_code, on_finish, timeout=timeout, include_solution=include_solution)
 
-        # Wait for completion
+        # Wait for agent sandbox to complete
         time.sleep(1)
         while sandbox_manager.get_num_sandboxes() > 0:
             time.sleep(1)
+        
+        # Wait for evaluation to start (if agent was successful)
+        if evaluation_started.wait(timeout=5):
+            console.print("⏳ Waiting for evaluation to complete...", style="yellow")
+            # Wait for evaluation to complete (with timeout to prevent hanging)
+            if not evaluation_complete.wait(timeout=timeout or 3600):
+                console.print("⚠️  Evaluation timed out", style="yellow")
+        else:
+            # Evaluation never started (agent likely failed)
+            pass
 
     except KeyboardInterrupt:
         console.print("\n🛑 Test interrupted by user", style="yellow")
